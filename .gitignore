@@ -1,0 +1,32 @@
+client/recordings/*
+!client/recordings/.gitkeep
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime outputs
+*.log
+labels.csv
+
+# PlatformIO / embedded builds
+.pio/
+.piolibdeps/
+
+# IDE/editor
+.vscode/
+.idea/

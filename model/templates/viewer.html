@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Woodside session viewer</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='viewer.css') }}" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="panel">
+        <h1>Sessions</h1>
+        <div class="index-bar" id="session-bar"></div>
+        <p class="meta" id="session-meta"></p>
+      </header>
+
+      <section class="panel">
+        <h2>Window margins (shared)</h2>
+        <p class="meta margins-hint">
+          Pre/post pad around the target sample inside the window. Red lines mark target start and end.
+        </p>
+        <div class="row">
+          <label>
+            Pre (ms)
+            <input id="pre-ms" type="number" min="1" step="1" value="100" />
+          </label>
+          <label>
+            Post (ms)
+            <input id="post-ms" type="number" min="1" step="1" value="100" />
+          </label>
+          <button id="apply-margins" type="button">Apply</button>
+          <span class="hint" id="margin-info"></span>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="row mode-row">
+          <span class="label">Mode</span>
+          <label class="radio">
+            <input type="radio" name="mode" value="timeline" checked />
+            A — Timeline (slider)
+          </label>
+          <label class="radio">
+            <input type="radio" name="mode" value="events" />
+            B — Events (indexed)
+          </label>
+        </div>
+      </section>
+
+      <section class="panel" id="timeline-panel">
+        <h2>Timeline</h2>
+        <div class="row" id="window-panel">
+          <label>
+            Window (ms)
+            <input id="window-ms" type="number" min="1" step="1" value="200" />
+          </label>
+        </div>
+        <div class="row">
+          <label class="grow">
+            Target sample
+            <input id="timeline-slider" type="range" min="0" max="0" value="0" />
+          </label>
+        </div>
+        <p class="meta" id="timeline-info"></p>
+      </section>
+
+      <section class="panel hidden" id="events-panel">
+        <h2>Events</h2>
+        <p class="meta events-hint">Window length is each event sample span; pre/post pad around it.</p>
+        <div class="row events-row">
+          <div class="index-bar" id="event-bar"></div>
+          <div class="nav">
+            <button id="event-prev" type="button">◀ Prev</button>
+            <button id="event-next" type="button">Next ▶</button>
+            <label>
+              Jump
+              <input id="event-jump" type="number" min="0" step="1" />
+            </label>
+            <button id="event-go" type="button">Go</button>
+          </div>
+        </div>
+        <p class="meta" id="event-info"></p>
+      </section>
+
+      <main class="plot-area">
+        <h2 class="plot-title" id="plot-title"></h2>
+        <div class="plot-scroll" id="plot-scroll">
+          <div class="plot-grid" id="plot-grid"></div>
+        </div>
+      </main>
+    </div>
+    <script src="{{ url_for('static', filename='viewer.js') }}"></script>
+  </body>
+</html>

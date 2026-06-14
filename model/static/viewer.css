@@ -1,0 +1,213 @@
+:root {
+  --bg: #1a1b1e;
+  --panel: #25262b;
+  --text: #e8e8e8;
+  --muted: #9aa0a6;
+  --accent: #4c8bf5;
+  --accent-active: #2f6fed;
+  --marker: #dc3545;
+  --trace: #4c8bf5;
+  --channel-h: 6.75rem;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  padding: 0.75rem;
+  gap: 0.5rem;
+}
+
+.panel {
+  background: var(--panel);
+  border-radius: 8px;
+  padding: 0.65rem 0.85rem;
+}
+
+.panel h1,
+.panel h2 {
+  margin: 0 0 0.5rem;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.mode-row .label {
+  font-weight: 600;
+}
+
+.grow {
+  flex: 1;
+  min-width: 12rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+input[type="number"],
+input[type="range"] {
+  accent-color: var(--accent);
+}
+
+input[type="number"] {
+  width: 5rem;
+  padding: 0.25rem 0.4rem;
+  border-radius: 4px;
+  border: 1px solid #3d3f45;
+  background: #1a1b1e;
+  color: var(--text);
+}
+
+button {
+  padding: 0.35rem 0.7rem;
+  border-radius: 4px;
+  border: 1px solid #3d3f45;
+  background: #2c2e33;
+  color: var(--text);
+  cursor: pointer;
+}
+
+button:hover {
+  background: #363840;
+}
+
+button.active {
+  background: var(--accent-active);
+  border-color: var(--accent);
+}
+
+.meta,
+.hint {
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin: 0.35rem 0 0;
+}
+
+.hint.error {
+  color: #f08080;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.margins-hint,
+.events-hint {
+  margin: 0 0 0.5rem;
+}
+
+#margin-panel {
+  margin-bottom: 0.5rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid #3d3f45;
+}
+
+.index-bar {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 0.25rem;
+  overflow-x: auto;
+  padding-bottom: 0.25rem;
+}
+
+.events-row {
+  align-items: flex-start;
+}
+
+.events-row .index-bar {
+  flex: 1;
+  min-width: 0;
+}
+
+.nav {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.radio {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--text);
+}
+
+.plot-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--panel);
+  border-radius: 8px;
+  padding: 0.65rem;
+}
+
+.plot-title {
+  margin: 0 0 0.5rem;
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+
+.plot-scroll {
+  flex: 1;
+  overflow: auto;
+  min-height: 12rem;
+}
+
+.plot-grid {
+  display: grid;
+  gap: 0.35rem;
+  width: max(100%, var(--plot-width));
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+}
+
+.plot-grid.wide {
+  grid-template-columns: 1fr;
+}
+
+.channel-cell {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.channel-cell h3 {
+  margin: 0;
+  font-size: 0.7rem;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.channel-cell canvas {
+  width: 100%;
+  height: var(--channel-h);
+  display: block;
+  background: #1a1b1e;
+  border-radius: 4px;
+}

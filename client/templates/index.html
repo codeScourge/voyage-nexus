@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Woodside Silent Speech Collection</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='monitor.css') }}" />
+  </head>
+  <body>
+    <header class="top-bar">
+      <div id="status-text" class="status-text">Connecting…</div>
+      <div id="rail-text" class="rail-text rail-waiting">Rail warning: waiting for data</div>
+      <div id="trial-text" class="trial-text">Collection: start recording</div>
+    </header>
+
+    <section class="controls-row">
+      <span class="page-label">32-channel monitor</span>
+      <button type="button" id="btn-scale">Scale: Auto</button>
+      <select id="scale-profile" disabled>
+        <option value="">Custom</option>
+        <option value="100">EEG ±100 µV</option>
+        <option value="500">EMG ±500 µV</option>
+        <option value="1000">Wide ±1000 µV</option>
+      </select>
+      <input type="number" id="fixed-scale" min="1" max="5000" step="1" value="150" disabled />
+      <span class="unit-label">µV</span>
+      <button type="button" id="btn-record" class="primary">Start Session Recording</button>
+      <button type="button" id="btn-validate">Validate Session</button>
+    </section>
+
+    <section id="collect-panel" class="collect-panel hidden">
+      <p class="collect-hint" id="collect-hint">Choose a word to collect (7 repetitions each)</p>
+      <div id="word-buttons" class="word-buttons"></div>
+      <div class="scramble-row">
+        <button type="button" id="btn-scramble" class="scramble-btn">Scramble</button>
+        <label class="scramble-slider">
+          <span>set</span>
+          <input type="range" id="scramble-set" min="1" max="20" value="5" />
+          <output id="scramble-set-val" for="scramble-set">5</output>
+        </label>
+        <label class="scramble-slider">
+          <span>rep</span>
+          <input type="range" id="scramble-rep" min="1" max="20" value="7" />
+          <output id="scramble-rep-val" for="scramble-rep">7</output>
+        </label>
+      </div>
+    </section>
+
+    <div id="collect-prompt" class="collect-prompt hidden" aria-live="polite">
+      <div id="collect-prompt-word" class="collect-prompt-word"></div>
+      <div id="collect-prompt-main" class="collect-prompt-main"></div>
+      <div id="collect-prompt-sub" class="collect-prompt-sub"></div>
+    </div>
+
+    <main id="plot-area" class="plot-area">
+      <div class="plot-columns">
+        <section class="plot-column" id="col-eeg">
+          <h3>EEG (µV vs time)</h3>
+          <div class="plot-stack" id="stack-eeg"></div>
+          <div class="column-x-label">Time (s)</div>
+        </section>
+        <section class="plot-column" id="col-emg">
+          <h3>EMG (µV vs time)</h3>
+          <div class="plot-stack" id="stack-emg"></div>
+          <div class="column-x-label">Time (s)</div>
+        </section>
+      </div>
+    </main>
+    <div id="toast" class="toast hidden"></div>
+
+    <script src="{{ url_for('static', filename='monitor.js') }}"></script>
+  </body>
+</html>
