@@ -16,8 +16,10 @@ constexpr uint32_t kSyntheticStartAfterMs = 1000;
 constexpr bool kEnableSyntheticFallback = true;
 constexpr bool kBypassAdsForBringup = false;
 
+#   
+
 constexpr float kAdsVrefVolts = 4.5f;
-constexpr uint8_t kEegGain = 1;
+constexpr uint8_t kEegGain = 6;
 constexpr uint8_t kEmgGain = 1;
 
 // EEG bus (FSPI, two ADS1299 chips in daisy chain with shared CS)

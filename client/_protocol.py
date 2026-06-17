@@ -13,8 +13,8 @@ FRAME_FORMAT = "<IHHQQ32ii"
 FRAME_SIZE = struct.calcsize(FRAME_FORMAT)
 CHECKSUM_SEED = 0xA5A55A5A
 
-EEG_GAIN = 12.0
-EMG_GAIN = 12.0
+EEG_GAIN = 6.0
+EMG_GAIN = 1.0
 ADS_VREF_VOLTS = 4.5
 SWAP_EEG_DAISY_HALVES = True
 
@@ -56,12 +56,11 @@ def ads_calibration_metadata() -> dict[str, float | str]:
 
 def codes_to_uv(channels_i32: np.ndarray) -> np.ndarray:
     """Convert ADS1299 signed codes to microvolts (single conversion path)."""
-    out = np.asarray(channels_i32, dtype=np.float32)
+    out = np.asarray(channels_i32, dtype=np.float64)   # was float32
     if out.shape != (CHANNEL_COUNT,):
         raise ValueError(f"Expected {CHANNEL_COUNT} channels, got shape {out.shape}")
-    out = out.copy()
-    out[:16] *= np.float32(EEG_LSB_UV)
-    out[16:] *= np.float32(EMG_LSB_UV)
+    out[:16] *= EEG_LSB_UV          # plain Python floats are float64
+    out[16:] *= EMG_LSB_UV
     return out
 
 

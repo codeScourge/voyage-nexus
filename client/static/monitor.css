@@ -84,6 +84,26 @@ body {
   flex-shrink: 0;
 }
 
+.amplitude-slider {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.amplitude-slider input[type="range"] {
+  width: 9rem;
+  accent-color: var(--accent);
+}
+
+.amplitude-slider output {
+  min-width: 4.5rem;
+  font-weight: 600;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
 .trial-panel {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -170,11 +190,71 @@ button.primary {
 }
 
 .plot-column h3 {
-  margin: 0 0 0.15rem;
+  margin: 0;
   font-size: 0.75rem;
   color: var(--muted);
   font-weight: 600;
   flex-shrink: 0;
+}
+
+.column-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.15rem;
+  flex-shrink: 0;
+  min-width: 0;
+}
+
+.band-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.6rem;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.58rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.legend-swatch {
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 1px;
+  flex-shrink: 0;
+}
+
+.column-subheads {
+  display: grid;
+  grid-template-columns: 3.25rem 1fr 1fr 1fr;
+  gap: 0.25rem;
+  margin-bottom: 0.1rem;
+  flex-shrink: 0;
+}
+
+.column-subheads span {
+  font-size: 0.58rem;
+  color: var(--axis);
+  text-align: center;
+}
+
+.column-subheads .subhead-raw {
+  grid-column: 2;
+}
+
+.column-subheads .subhead-filtered {
+  grid-column: 3;
+}
+
+.column-subheads .subhead-bands {
+  grid-column: 4;
 }
 
 .plot-stack {
@@ -189,7 +269,7 @@ button.primary {
   flex: 1 1 0;
   min-height: 0;
   display: grid;
-  grid-template-columns: 3.25rem 1fr;
+  grid-template-columns: 3.25rem 1fr 1fr 1fr;
   gap: 0.25rem;
   align-items: stretch;
 }
@@ -313,32 +393,87 @@ button.primary {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 0.5rem;
+  gap: 0.75rem;
   background: rgba(8, 10, 16, 0.88);
   pointer-events: none;
 }
 
 .collect-prompt-word {
-  font-size: 1.25rem;
+  font-size: clamp(1.75rem, 5vw, 2.5rem);
   color: var(--muted);
   text-transform: uppercase;
-  letter-spacing: 0.12em;
+  letter-spacing: 0.14em;
+  font-weight: 700;
 }
 
 .collect-prompt-main {
-  font-size: clamp(3rem, 12vw, 6rem);
+  font-size: clamp(4.5rem, 18vw, 9rem);
   font-weight: 800;
   color: var(--text);
-  line-height: 1;
+  line-height: 0.95;
+  letter-spacing: -0.02em;
 }
 
 .collect-prompt-main.say-it {
   color: #7ee787;
+  font-size: clamp(4rem, 16vw, 8rem);
 }
 
 .collect-prompt-sub {
-  font-size: 1.1rem;
+  font-size: clamp(1.25rem, 3.5vw, 1.85rem);
   color: var(--muted);
+  font-weight: 600;
+}
+
+.collect-prompt.word-switch .collect-prompt-word {
+  font-size: clamp(2rem, 6vw, 3rem);
+  color: #ffb4b4;
+}
+
+.collect-prompt.word-switch .collect-prompt-main {
+  font-size: clamp(5.5rem, 22vw, 11rem);
+  color: #ffffff;
+  text-shadow: 0 0 40px rgba(255, 82, 82, 0.55);
+}
+
+.collect-prompt.word-switch .collect-prompt-sub {
+  font-size: clamp(1.5rem, 4vw, 2.25rem);
+  color: #ffd0d0;
+}
+
+.word-switch-flash {
+  position: fixed;
+  inset: 0;
+  z-index: 25;
+  pointer-events: none;
+  opacity: 0;
+  background:
+    linear-gradient(to bottom, rgba(255, 40, 40, 1), transparent 32%),
+    linear-gradient(to top, rgba(255, 40, 40, 1), transparent 32%),
+    linear-gradient(to right, rgba(255, 40, 40, 1), transparent 26%),
+    linear-gradient(to left, rgba(255, 40, 40, 1), transparent 26%);
+  box-shadow:
+    inset 0 0 120px 40px rgba(255, 60, 60, 0.9),
+    inset 0 0 220px 80px rgba(255, 30, 30, 0.45);
+}
+
+.word-switch-flash.active {
+  animation: word-switch-flash 1.15s ease-out;
+}
+
+@keyframes word-switch-flash {
+  0% {
+    opacity: 0;
+  }
+  8% {
+    opacity: 1;
+  }
+  62% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
 }
 
 .toast {
@@ -361,6 +496,123 @@ button.primary {
 
 .toast.error {
   border-color: var(--danger);
+}
+
+.alignment-prompt {
+  z-index: 31;
+}
+
+.alignment-prompt .collect-prompt-main.blink-it {
+  color: #7ee787;
+  font-size: clamp(3.5rem, 14vw, 7rem);
+}
+
+.alignment-result {
+  flex-shrink: 0;
+  margin: 0 0.5rem 0.35rem;
+  padding: 0.5rem 0.65rem;
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  max-height: 52vh;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.alignment-result.hidden {
+  display: none;
+}
+
+.alignment-result-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  flex-shrink: 0;
+}
+
+.alignment-result-head h2 {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+
+.alignment-result-meta {
+  margin: 0;
+  flex: 1;
+  font-size: 0.8rem;
+  color: var(--muted);
+  min-width: 12rem;
+}
+
+.alignment-result-hint {
+  margin: 0.25rem 0 0.35rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.alignment-result-plots {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.alignment-trace-header,
+.alignment-trace-row {
+  display: grid;
+  grid-template-columns: 3.5rem 1fr 1fr;
+  gap: 0.35rem;
+  align-items: stretch;
+}
+
+.alignment-trace-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding-bottom: 0.15rem;
+  background: var(--panel);
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--muted);
+  text-align: center;
+}
+
+.alignment-trace-header span:first-child {
+  text-align: right;
+}
+
+.alignment-trace-row {
+  min-height: 4.5rem;
+}
+
+.alignment-trace-label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding-right: 0.15rem;
+}
+
+.alignment-trace-wrap {
+  position: relative;
+  min-height: 4.5rem;
+  height: 4.5rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #161920;
+}
+
+.alignment-trace-wrap canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 
 @media (max-width: 900px) {

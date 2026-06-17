@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Woodside Silent Speech Collection</title>
+    <title>Voyage is king</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='monitor.css') }}" />
   </head>
   <body>
@@ -16,16 +16,13 @@
     <section class="controls-row">
       <span class="page-label">32-channel monitor</span>
       <button type="button" id="btn-scale">Scale: Auto</button>
-      <select id="scale-profile" disabled>
-        <option value="">Custom</option>
-        <option value="100">EEG ±100 µV</option>
-        <option value="500">EMG ±500 µV</option>
-        <option value="1000">Wide ±1000 µV</option>
-      </select>
-      <input type="number" id="fixed-scale" min="1" max="5000" step="1" value="150" disabled />
-      <span class="unit-label">µV</span>
+      <label class="amplitude-slider">
+        <span>Amplitude</span>
+        <input type="range" id="amplitude-slider" min="50" max="2000" step="10" value="150" disabled />
+        <output id="amplitude-val" for="amplitude-slider">per graph</output>
+      </label>
       <button type="button" id="btn-record" class="primary">Start Session Recording</button>
-      <button type="button" id="btn-validate">Validate Session</button>
+      <button type="button" id="btn-alignment-test">Alignment Test</button>
     </section>
 
     <section id="collect-panel" class="collect-panel hidden">
@@ -52,15 +49,49 @@
       <div id="collect-prompt-sub" class="collect-prompt-sub"></div>
     </div>
 
+    <div id="alignment-prompt" class="collect-prompt alignment-prompt hidden" aria-live="polite">
+      <div id="alignment-prompt-word" class="collect-prompt-word">Alignment test</div>
+      <div id="alignment-prompt-main" class="collect-prompt-main"></div>
+      <div id="alignment-prompt-sub" class="collect-prompt-sub"></div>
+    </div>
+
+    <section id="alignment-result" class="alignment-result hidden" aria-live="polite">
+      <div class="alignment-result-head">
+        <h2>Labeled blink window</h2>
+        <p id="alignment-result-meta" class="alignment-result-meta"></p>
+        <button type="button" id="btn-alignment-dismiss">Dismiss</button>
+      </div>
+      <p class="alignment-result-hint">Shaded region = backend label (same timing as collection “say” window). Blink artifacts should appear inside it.</p>
+      <div id="alignment-result-plots" class="alignment-result-plots"></div>
+    </section>
+
+    <div id="word-switch-flash" class="word-switch-flash" aria-hidden="true"></div>
+
     <main id="plot-area" class="plot-area">
       <div class="plot-columns">
         <section class="plot-column" id="col-eeg">
-          <h3>EEG (µV vs time)</h3>
+          <div class="column-head">
+            <h3>EEG</h3>
+            <div id="legend-eeg" class="band-legend"></div>
+          </div>
+          <div class="column-subheads">
+            <span class="subhead-raw">Raw µV</span>
+            <span class="subhead-filtered">Filtered µV</span>
+            <span class="subhead-bands">Band power</span>
+          </div>
           <div class="plot-stack" id="stack-eeg"></div>
           <div class="column-x-label">Time (s)</div>
         </section>
         <section class="plot-column" id="col-emg">
-          <h3>EMG (µV vs time)</h3>
+          <div class="column-head">
+            <h3>EMG</h3>
+            <div id="legend-emg" class="band-legend"></div>
+          </div>
+          <div class="column-subheads">
+            <span class="subhead-raw">Raw µV</span>
+            <span class="subhead-filtered">Filtered µV</span>
+            <span class="subhead-bands">Band power</span>
+          </div>
           <div class="plot-stack" id="stack-emg"></div>
           <div class="column-x-label">Time (s)</div>
         </section>

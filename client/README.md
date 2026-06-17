@@ -123,7 +123,7 @@ Requirements for speech:
 Generate aligned windows and event tables:
 
 ```bash
-python export_session.py recordings/session_YYYYMMDD_HHMMSS
+python export_session.py recordings/session_a3f8b2c1_2026-06-15_21-27-46
 ```
 
 Outputs in the session directory:

@@ -6,6 +6,7 @@ import json
 import queue
 import random
 import struct
+import sys
 import threading
 import time
 import uuid
@@ -21,6 +22,16 @@ import serial
 from flask import Flask, jsonify, render_template, request
 from serial.tools import list_ports
 
+_MODEL_ROOT = Path(__file__).resolve().parent.parent / "model"
+if _MODEL_ROOT.is_dir() and str(_MODEL_ROOT) not in sys.path:
+    sys.path.insert(0, str(_MODEL_ROOT))
+
+from _preprocessors import (
+    DEFAULT_EEG_BANDPASS_CONFIG,
+    DEFAULT_EMG_BANDPASS_CONFIG,
+    DEFAULT_LINE_NOISE_CONFIG,
+    preprocess_session_channels,
+)
 from _protocol import (
     CHANNEL_COUNT,
     CHANNEL_UNITS,
@@ -45,6 +56,7 @@ except ImportError:  # pragma: no cover
 
 SAMPLE_RATE_HZ = 1000
 WINDOW_SECONDS = 2
+FILTER_BUFFER_SECONDS = 4
 UPDATE_HZ = 30
 CHANNELS_PER_PAGE = 8
 PLOT_POINTS = 400
@@ -58,6 +70,8 @@ COLLECTION_REPETITIONS = 7
 COLLECTION_BEFORE_S = 1.0
 COLLECTION_BETWEEN_S = 0.4
 COLLECTION_SAY_S = 1.6
+ALIGNMENT_TEST_PAD_S = 0.3
+ALIGNMENT_TEST_DISPLAY_CHANNELS = tuple(range(8))
 DEFAULT_SCRAMBLE_SET = 5
 DEFAULT_SCRAMBLE_REP = 7
 SCRAMBLE_SET_MIN = 1
@@ -71,7 +85,25 @@ RAIL_WINDOW_FRAMES = 1000
 RAIL_WARN_PERCENT = 10.0
 DEFAULT_FIXED_SCALE_UV = 150.0
 DEFAULT_HTTP_PORT = 5050
-EEG_SWAP_HALVES = True
+EEG_SWAP_HALVES = False
+BAND_FRAME_SAMPLES = 512
+BAND_HOP_SAMPLES = 128
+BAND_PLOT_POINTS = 80
+
+EEG_BANDS: tuple[dict[str, Any], ...] = (
+    {"name": "Delta", "range": "0.5–4 Hz", "low_hz": 0.5, "high_hz": 4.0, "color": "#9b59b6"},
+    {"name": "Theta", "range": "4–8 Hz", "low_hz": 4.0, "high_hz": 8.0, "color": "#3498db"},
+    {"name": "Alpha", "range": "8–13 Hz", "low_hz": 8.0, "high_hz": 13.0, "color": "#2ecc71"},
+    {"name": "Beta", "range": "13–30 Hz", "low_hz": 13.0, "high_hz": 30.0, "color": "#f1c40f"},
+    {"name": "Gamma", "range": "30–100 Hz", "low_hz": 30.0, "high_hz": 100.0, "color": "#e67e22"},
+    {"name": "High Gamma", "range": ">100 Hz", "low_hz": 100.0, "high_hz": None, "color": "#e74c3c"},
+)
+
+EMG_BANDS: tuple[dict[str, Any], ...] = (
+    {"name": "Low", "range": "20–60 Hz", "low_hz": 20.0, "high_hz": 60.0, "color": "#5dade2"},
+    {"name": "Mid", "range": "60–150 Hz", "low_hz": 60.0, "high_hz": 150.0, "color": "#58d68d"},
+    {"name": "High", "range": "150–500 Hz", "low_hz": 150.0, "high_hz": 500.0, "color": "#f5b041"},
+)
 
 
 def channel_name(channel_idx: int) -> str:
@@ -82,6 +114,128 @@ def channel_name(channel_idx: int) -> str:
 
 def channel_order_dict(channel_count: int) -> dict[str, str]:
     return {str(i): channel_name(i) for i in range(channel_count)}
+
+
+def new_session_dir_name(now: datetime | None = None) -> str:
+    """e.g. session_a3f8b2c1_2026-06-15_21-27-46"""
+    when = now or datetime.now()
+    uid = uuid.uuid4().hex[:8]
+    stamp = when.strftime("%Y-%m-%d_%H-%M-%S")
+    return f"session_{uid}_{stamp}"
+
+
+def bands_for_channel(channel_idx: int) -> tuple[dict[str, Any], ...]:
+    return EEG_BANDS if channel_idx < 16 else EMG_BANDS
+
+
+def _ordered_buffer_view(buffer_uv: np.ndarray, write_idx: int) -> np.ndarray:
+    """Return ring buffer contents in chronological order (oldest sample first)."""
+    if write_idx == 0:
+        return buffer_uv
+    return np.concatenate(
+        (buffer_uv[:, write_idx:], buffer_uv[:, :write_idx]),
+        axis=1,
+    )
+
+
+def _preprocess_monitor_window(view: np.ndarray, sample_rate_hz: float) -> np.ndarray:
+    """Apply the same preprocessing as model/data.load_session_channels (line notch + band-pass)."""
+    block = np.asarray(view, dtype=np.float32).T  # (time, channels)
+    filtered = preprocess_session_channels(
+        block,
+        sample_rate_hz,
+        line_noise=DEFAULT_LINE_NOISE_CONFIG,
+        eeg=DEFAULT_EEG_BANDPASS_CONFIG,
+        emg=DEFAULT_EMG_BANDPASS_CONFIG,
+    )
+    return filtered.T
+
+
+def _band_power_series(
+    signal: np.ndarray,
+    sample_rate_hz: float,
+    bands: tuple[dict[str, Any], ...],
+    *,
+    frame_samples: int = BAND_FRAME_SAMPLES,
+    hop_samples: int = BAND_HOP_SAMPLES,
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    """Short-time band power over the trailing window (one value per hop)."""
+    n = int(signal.shape[0])
+    if n < frame_samples:
+        empty_t = np.linspace(-WINDOW_SECONDS, 0, 1, dtype=np.float32)
+        empty_bands = [{"name": b["name"], "color": b["color"], "y": [0.0]} for b in bands]
+        return empty_t, empty_bands
+
+    window = np.hanning(frame_samples).astype(np.float64)
+    freqs = np.fft.rfftfreq(frame_samples, d=1.0 / sample_rate_hz)
+    nyquist = sample_rate_hz / 2.0
+    starts = np.arange(0, n - frame_samples + 1, hop_samples, dtype=np.int64)
+    if starts.size == 0:
+        starts = np.array([0], dtype=np.int64)
+
+    band_powers: list[list[float]] = [[] for _ in bands]
+    for start in starts:
+        segment = signal[start : start + frame_samples].astype(np.float64)
+        spectrum = np.fft.rfft(segment * window)
+        power = (np.abs(spectrum) ** 2) / frame_samples
+        for band_idx, band in enumerate(bands):
+            low_hz = float(band["low_hz"])
+            high_hz = band.get("high_hz")
+            high_cut = nyquist if high_hz is None else min(float(high_hz), nyquist)
+            mask = (freqs >= low_hz) & (freqs < high_cut)
+            if not np.any(mask):
+                band_powers[band_idx].append(0.0)
+            else:
+                band_powers[band_idx].append(float(power[mask].sum()))
+
+    end_sample = int(starts[-1] + frame_samples)
+    time_s = (starts.astype(np.float64) + frame_samples * 0.5 - end_sample) / sample_rate_hz
+    series = [
+        {"name": band["name"], "color": band["color"], "y": powers}
+        for band, powers in zip(bands, band_powers, strict=True)
+    ]
+    return time_s.astype(np.float32), series
+
+
+def _format_band_debug(channel_idx: int, signal: np.ndarray, series: list[dict[str, Any]]) -> str:
+    sig = np.asarray(signal, dtype=np.float64)
+    lines = [
+        (
+            f"[BANDS] {channel_name(channel_idx)} "
+            f"(preprocessed) mean={sig.mean():.1f} std={sig.std():.1f} "
+            f"min={sig.min():.1f} max={sig.max():.1f} µV "
+            f"({sig.size} samples)"
+        )
+    ]
+    for band in series:
+        y = np.asarray(band["y"], dtype=np.float64)
+        latest = float(y[-1]) if y.size else 0.0
+        lines.append(
+            f"  {band['name']:11s} min={y.min():.3g} max={y.max():.3g} latest={latest:.3g}"
+        )
+    return "\n".join(lines)
+
+
+def _downsample_band_series(
+    time_s: np.ndarray,
+    series: list[dict[str, Any]],
+    max_points: int = BAND_PLOT_POINTS,
+) -> tuple[list[float], list[dict[str, Any]]]:
+    n = int(time_s.shape[0])
+    if n <= max_points:
+        return time_s.astype(np.float32).tolist(), [
+            {"name": s["name"], "color": s["color"], "y": [float(v) for v in s["y"]]} for s in series
+        ]
+    step = max(1, n // max_points)
+    idx = np.arange(0, n, step, dtype=np.int64)
+    return time_s[idx].astype(np.float32).tolist(), [
+        {
+            "name": s["name"],
+            "color": s["color"],
+            "y": [float(s["y"][i]) for i in idx],
+        }
+        for s in series
+    ]
 
 
 class SerialReader(threading.Thread):
@@ -234,11 +388,11 @@ class SessionRecorder:
                 return self._session_dir
 
             base_dir.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            session_dir = base_dir / f"session_{stamp}"
+            base_name = new_session_dir_name()
+            session_dir = base_dir / base_name
             suffix = 1
             while session_dir.exists():
-                session_dir = base_dir / f"session_{stamp}_{suffix:02d}"
+                session_dir = base_dir / f"{base_name}_{suffix:02d}"
                 suffix += 1
             session_dir.mkdir(parents=True, exist_ok=False)
 
@@ -415,8 +569,11 @@ class AcquisitionService:
         serial_port: Optional[str] = None,
         baudrate: int = DEFAULT_BAUD,
         test_mode: bool = False,
+        debug_bands: bool = False,
     ) -> None:
         self._test_mode = test_mode
+        self._debug_bands = debug_bands
+        self._band_debug_last_print_ns = 0
         self._queue: queue.Queue[RxFrame] = queue.Queue(maxsize=20_000)
         if test_mode:
             self._reader: SerialReader | TestReader = TestReader(out_queue=self._queue)
@@ -453,11 +610,22 @@ class AcquisitionService:
         self._collect_prev_word = ""
         self._collect_block_id: Optional[str] = None
         self._collect_deadline_ns: Optional[int] = None
+        self._collect_countdown_word_switch = False
+
+        self._align_test_phase = "idle"
+        self._align_test_deadline_ns: Optional[int] = None
+        self._align_test_say_start_idx: Optional[int] = None
+        self._align_test_say_start_float: Optional[float] = None
+        self._align_test_say_end_idx: Optional[int] = None
+        self._align_test_say_end_float: Optional[float] = None
+        self._align_test_method = ""
+        self._align_test_result: Optional[dict[str, Any]] = None
 
         self._latest_sample_index = -1
         self._total_frames = 0
-        self._window_samples = WINDOW_SECONDS * SAMPLE_RATE_HZ
-        self._buffer_uv = np.zeros((CHANNEL_COUNT, self._window_samples), dtype=np.float32)
+        self._buffer_samples = FILTER_BUFFER_SECONDS * SAMPLE_RATE_HZ
+        self._display_samples = WINDOW_SECONDS * SAMPLE_RATE_HZ
+        self._buffer_uv = np.zeros((CHANNEL_COUNT, self._buffer_samples), dtype=np.float32)
         self._write_idx = 0
         self._rail_history = np.zeros((CHANNEL_COUNT, RAIL_WINDOW_FRAMES), dtype=np.uint8)
         self._rail_counts = np.zeros(CHANNEL_COUNT, dtype=np.int32)
@@ -476,10 +644,12 @@ class AcquisitionService:
             except queue.Empty:
                 self._tick_countdown()
                 self._tick_collect()
+                self._tick_alignment_test()
                 continue
             self._push_frame(rx_frame)
             self._tick_countdown()
             self._tick_collect()
+            self._tick_alignment_test()
 
     def shutdown(self) -> None:
         self._pump_stop.set()
@@ -502,7 +672,7 @@ class AcquisitionService:
         railed = (np.abs(frame.channels_i32) >= RAIL_CODE_WARN).astype(np.uint8)
         with self._lock:
             self._buffer_uv[:, self._write_idx] = uv
-            self._write_idx = (self._write_idx + 1) % self._window_samples
+            self._write_idx = (self._write_idx + 1) % self._buffer_samples
             self._latest_sample_index = frame.sample_index
             self._total_frames += 1
             old = self._rail_history[:, self._rail_history_idx]
@@ -583,12 +753,17 @@ class AcquisitionService:
         return max(0.0, (self._collect_deadline_ns - time.perf_counter_ns()) / 1e9)
 
     @staticmethod
-    def _countdown_seconds(*, new_label: bool) -> float:
-        return COLLECTION_BEFORE_S if new_label else COLLECTION_BETWEEN_S
+    def _countdown_seconds(*, new_label: bool, word_switch: bool = False) -> float:
+        if not new_label:
+            return COLLECTION_BETWEEN_S
+        if word_switch:
+            return COLLECTION_BEFORE_S
+        return COLLECTION_BEFORE_S
 
-    def _begin_collect_countdown(self, *, new_label: bool) -> None:
+    def _begin_collect_countdown(self, *, new_label: bool, word_switch: bool = False) -> None:
         self._collect_phase = "countdown"
-        countdown_s = self._countdown_seconds(new_label=new_label)
+        self._collect_countdown_word_switch = word_switch
+        countdown_s = self._countdown_seconds(new_label=new_label, word_switch=word_switch)
         self._collect_deadline_ns = time.perf_counter_ns() + int(countdown_s * 1_000_000_000)
 
     def _pick_scramble_word(self) -> str:
@@ -611,7 +786,9 @@ class AcquisitionService:
             "words": list(COLLECTION_WORDS),
             "before_s": COLLECTION_BEFORE_S,
             "between_s": COLLECTION_BETWEEN_S,
+            "word_switch_s": COLLECTION_BEFORE_S,
             "say_s": COLLECTION_SAY_S,
+            "word_switch": self._collect_countdown_word_switch if self._collect_phase == "countdown" else False,
             "default_scramble_set": DEFAULT_SCRAMBLE_SET,
             "default_scramble_rep": DEFAULT_SCRAMBLE_REP,
             "scramble_set_min": SCRAMBLE_SET_MIN,
@@ -631,6 +808,7 @@ class AcquisitionService:
         self._collect_prev_word = ""
         self._collect_block_id = None
         self._collect_deadline_ns = None
+        self._collect_countdown_word_switch = False
 
     def _finish_collect_block(self) -> None:
         finished_word = self._collect_word
@@ -645,6 +823,7 @@ class AcquisitionService:
         self._collect_prev_word = ""
         self._collect_block_id = None
         self._collect_deadline_ns = None
+        self._collect_countdown_word_switch = False
         self._collect_mode = "single"
         if finished_block and self._recorder.enabled:
             _event_host_ns, aligned_float, aligned_idx, method = self._aligned_sample_now()
@@ -671,6 +850,7 @@ class AcquisitionService:
 
         if self._collect_phase == "countdown":
             self._collect_phase = "say"
+            self._collect_countdown_word_switch = False
             self._collect_deadline_ns = time.perf_counter_ns() + int(COLLECTION_SAY_S * 1_000_000_000)
             self._log_silent_speech_rep()
             return
@@ -685,7 +865,7 @@ class AcquisitionService:
             self._collect_set_idx += 1
             self._collect_word = self._pick_scramble_word()
             self._collect_rep = 1
-            self._begin_collect_countdown(new_label=True)
+            self._begin_collect_countdown(new_label=True, word_switch=True)
             self._log_scramble_word()
             return
 
@@ -814,6 +994,173 @@ class AcquisitionService:
         )
         self._log_scramble_word()
 
+    def _alignment_test_busy(self) -> bool:
+        return self._align_test_phase in ("countdown", "blink")
+
+    def _reset_alignment_test(self) -> None:
+        self._align_test_phase = "idle"
+        self._align_test_deadline_ns = None
+        self._align_test_say_start_idx = None
+        self._align_test_say_start_float = None
+        self._align_test_say_end_idx = None
+        self._align_test_say_end_float = None
+        self._align_test_method = ""
+        self._align_test_result = None
+
+    def _alignment_test_phase_remaining_s(self) -> Optional[float]:
+        if self._align_test_phase not in ("countdown", "blink"):
+            return None
+        if self._align_test_deadline_ns is None:
+            return None
+        return max(0.0, (self._align_test_deadline_ns - time.perf_counter_ns()) / 1e9)
+
+    def _alignment_test_status(self) -> dict[str, Any]:
+        return {
+            "phase": self._align_test_phase,
+            "phase_remaining_s": self._alignment_test_phase_remaining_s(),
+            "before_s": COLLECTION_BEFORE_S,
+            "say_s": COLLECTION_SAY_S,
+            "has_result": self._align_test_result is not None,
+        }
+
+    def _extract_samples_by_index_range(
+        self,
+        start_idx: int,
+        end_idx: int,
+    ) -> Optional[tuple[np.ndarray, int]]:
+        with self._lock:
+            latest = self._latest_sample_index
+            filled = min(self._total_frames, self._buffer_samples)
+            if filled <= 0 or latest < 0:
+                return None
+            oldest_idx = latest - filled + 1
+            if end_idx < oldest_idx or start_idx > latest:
+                return None
+            clip_start = max(start_idx, oldest_idx)
+            clip_end = min(end_idx, latest)
+            view = _ordered_buffer_view(self._buffer_uv, self._write_idx)
+            i0 = clip_start - oldest_idx
+            i1 = clip_end - oldest_idx + 1
+            return view[:, i0:i1].copy(), clip_start
+
+    def _build_alignment_test_result(self) -> dict[str, Any]:
+        if self._align_test_say_start_float is None or self._align_test_say_start_idx is None:
+            return {"error": "alignment test missing label start"}
+
+        say_start_f = float(self._align_test_say_start_float)
+        say_start_i = int(self._align_test_say_start_idx)
+        say_end_f = say_start_f + COLLECTION_SAY_S * SAMPLE_RATE_HZ
+        say_end_i = TimeAligner.quantize_sample_index(say_end_f) or int(round(say_end_f))
+
+        pad_samples = int(round(ALIGNMENT_TEST_PAD_S * SAMPLE_RATE_HZ))
+        display_start = say_start_i - pad_samples
+        display_end = say_end_i + pad_samples
+        extracted = self._extract_samples_by_index_range(display_start, display_end)
+        if extracted is None:
+            return {
+                "error": "labeled window is no longer in the ring buffer",
+                "sample_index_start": say_start_i,
+                "sample_index_end": say_end_i,
+                "sample_index_start_float": say_start_f,
+                "sample_index_end_float": say_end_f,
+                "alignment_method": self._align_test_method,
+            }
+
+        raw, clip_start = extracted
+        filtered = _preprocess_monitor_window(raw, SAMPLE_RATE_HZ)
+        n = int(raw.shape[1])
+        # Seconds ago relative to the newest sample in the clip (0 = now), same as live waveform plots.
+        time_s = (np.arange(n, dtype=np.float32) + (clip_start - display_end)) / SAMPLE_RATE_HZ
+        label_t0_s = (say_start_i - display_end) / SAMPLE_RATE_HZ
+        label_t1_s = (say_end_i - display_end) / SAMPLE_RATE_HZ
+
+        step = max(1, n // PLOT_POINTS)
+        time_ds = time_s[::step]
+        traces: list[dict[str, Any]] = []
+        for channel_idx in ALIGNMENT_TEST_DISPLAY_CHANNELS:
+            traces.append(
+                {
+                    "index": channel_idx,
+                    "name": channel_name(channel_idx),
+                    "y": raw[channel_idx, ::step].astype(np.float32).tolist(),
+                    "y_filtered": filtered[channel_idx, ::step].astype(np.float32).tolist(),
+                }
+            )
+
+        return {
+            "sample_index_start": say_start_i,
+            "sample_index_end": say_end_i,
+            "sample_index_start_float": say_start_f,
+            "sample_index_end_float": say_end_f,
+            "alignment_method": self._align_test_method,
+            "label_t0_s": float(label_t0_s),
+            "label_t1_s": float(label_t1_s),
+            "time_s": time_ds.astype(np.float32).tolist(),
+            "traces": traces,
+            "before_s": COLLECTION_BEFORE_S,
+            "say_s": COLLECTION_SAY_S,
+            "pad_s": ALIGNMENT_TEST_PAD_S,
+        }
+
+    def _tick_alignment_test(self) -> None:
+        if self._align_test_phase not in ("countdown", "blink"):
+            return
+        deadline = self._align_test_deadline_ns
+        if deadline is None or time.perf_counter_ns() < deadline:
+            return
+
+        if self._align_test_phase == "countdown":
+            _event_host_ns, start_float, start_idx, method = self._aligned_sample_now()
+            if start_idx is None:
+                self._reset_alignment_test()
+                return
+            self._align_test_say_start_float = start_float
+            self._align_test_say_start_idx = start_idx
+            self._align_test_method = method
+            self._align_test_phase = "blink"
+            self._align_test_deadline_ns = time.perf_counter_ns() + int(COLLECTION_SAY_S * 1_000_000_000)
+            return
+
+        _event_host_ns, end_float, end_idx, method = self._aligned_sample_now()
+        if end_idx is not None:
+            self._align_test_say_end_float = end_float
+            self._align_test_say_end_idx = end_idx
+            if method:
+                self._align_test_method = method
+        self._align_test_deadline_ns = None
+        self._align_test_phase = "result"
+        self._align_test_result = self._build_alignment_test_result()
+
+    def start_alignment_test(self) -> None:
+        if self._recorder.enabled:
+            raise RuntimeError("Stop session recording before running alignment test")
+        if self._trial_state != TrialState.IDLE:
+            raise RuntimeError("Finish the active trial before running alignment test")
+        if self._collect_phase not in ("disabled", "pick_word"):
+            raise RuntimeError("Finish collection before running alignment test")
+        if self._alignment_test_busy():
+            raise RuntimeError("Alignment test already running")
+        _event_host_ns, aligned_float, aligned_idx, method = self._aligned_sample_now()
+        if aligned_idx is None:
+            raise RuntimeError("No samples yet; wait for EEG stream")
+
+        self._align_test_result = None
+        self._align_test_say_start_idx = None
+        self._align_test_say_start_float = None
+        self._align_test_say_end_idx = None
+        self._align_test_say_end_float = None
+        self._align_test_method = method
+        self._align_test_phase = "countdown"
+        self._align_test_deadline_ns = time.perf_counter_ns() + int(COLLECTION_BEFORE_S * 1_000_000_000)
+
+    def clear_alignment_test(self) -> None:
+        self._reset_alignment_test()
+
+    def alignment_test_result(self) -> dict[str, Any]:
+        if self._align_test_phase != "result" or self._align_test_result is None:
+            raise RuntimeError("No alignment test result available")
+        return self._align_test_result
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             latest_sample = self._latest_sample_index
@@ -838,6 +1185,7 @@ class AcquisitionService:
             "update_hz": UPDATE_HZ,
             "default_fixed_scale_uv": DEFAULT_FIXED_SCALE_UV,
             "collect": self._collect_status(),
+            "alignment_test": self._alignment_test_status(),
         }
 
     def waveform(
@@ -848,17 +1196,22 @@ class AcquisitionService:
         single_channel: int = 0,
     ) -> dict[str, Any]:
         with self._lock:
-            if self._write_idx == 0:
-                view = self._buffer_uv
-            else:
-                view = np.concatenate(
-                    (self._buffer_uv[:, self._write_idx :], self._buffer_uv[:, : self._write_idx]),
-                    axis=1,
-                )
+            raw_view = _ordered_buffer_view(self._buffer_uv, self._write_idx)
 
-        step = max(1, view.shape[1] // PLOT_POINTS)
-        view_ds = view[:, ::step]
-        time_s = np.linspace(-WINDOW_SECONDS, 0, view_ds.shape[1], dtype=np.float32)
+        raw_display = raw_view
+        if raw_display.shape[1] > self._display_samples:
+            raw_display = raw_view[:, -self._display_samples :]
+
+        # Filter the full look-back buffer, then keep only the trailing display window so
+        # edge transients stay in the discarded prefix (filtered waveform + band power only).
+        filtered_view = _preprocess_monitor_window(raw_view, SAMPLE_RATE_HZ)
+        if filtered_view.shape[1] > self._display_samples:
+            filtered_view = filtered_view[:, -self._display_samples :]
+
+        step = max(1, raw_display.shape[1] // PLOT_POINTS)
+        raw_ds = raw_display[:, ::step]
+        filtered_ds = filtered_view[:, ::step]
+        time_s = np.linspace(-WINDOW_SECONDS, 0, raw_ds.shape[1], dtype=np.float32)
 
         if mode == "single":
             indices = [single_channel % CHANNEL_COUNT]
@@ -868,15 +1221,38 @@ class AcquisitionService:
             indices = [page_start + i for i in range(CHANNELS_PER_PAGE) if page_start + i < CHANNEL_COUNT]
 
         traces: list[dict[str, Any]] = []
+        debug_lines: list[str] = []
         for channel_idx in indices:
+            channel_signal = filtered_view[channel_idx]
+            band_time_s, band_series = _band_power_series(
+                channel_signal,
+                SAMPLE_RATE_HZ,
+                bands_for_channel(channel_idx),
+            )
+            if self._debug_bands and channel_idx in (0, 9, 15, 16):
+                debug_lines.append(_format_band_debug(channel_idx, channel_signal, band_series))
+            band_time_ds, band_series_ds = _downsample_band_series(band_time_s, band_series)
             traces.append(
                 {
                     "index": channel_idx,
                     "name": channel_name(channel_idx),
-                    "y": view_ds[channel_idx].astype(np.float32).tolist(),
+                    "y": raw_ds[channel_idx].astype(np.float32).tolist(),
+                    "y_filtered": filtered_ds[channel_idx].astype(np.float32).tolist(),
+                    "bands": band_series_ds,
+                    "band_time_s": band_time_ds,
                 }
             )
-        return {"time_s": time_s.astype(np.float32).tolist(), "traces": traces}
+        if self._debug_bands and debug_lines:
+            now_ns = time.perf_counter_ns()
+            if now_ns - self._band_debug_last_print_ns >= 1_000_000_000:
+                self._band_debug_last_print_ns = now_ns
+                print("\n".join(debug_lines), flush=True)
+        return {
+            "time_s": time_s.astype(np.float32).tolist(),
+            "traces": traces,
+            "eeg_bands": list(EEG_BANDS),
+            "emg_bands": list(EMG_BANDS),
+        }
 
     def dashboard(
         self,
@@ -895,6 +1271,8 @@ class AcquisitionService:
         }
 
     def start_recording(self, base_dir: Path) -> Path:
+        if self._alignment_test_busy():
+            raise RuntimeError("Wait for alignment test to finish before recording")
         _event_host_ns, aligned_float, aligned_idx, method = self._aligned_sample_now()
         session_dir = self._recorder.start(base_dir)
         self._last_session_dir = session_dir
@@ -1136,48 +1514,6 @@ class AcquisitionService:
                     },
                 )
 
-    def validate_session_dir(self, session_dir: Path) -> tuple[list[str], list[str], list[tuple[str, Any]]]:
-        errors: list[str] = []
-        warnings: list[str] = []
-        stats: list[tuple[str, Any]] = []
-        meta_path = session_dir / "session_meta.json"
-        eeg_path = session_dir / "eeg_frames.bin"
-        events_path = session_dir / "events.csv"
-        for required in (meta_path, eeg_path, events_path):
-            if not required.exists():
-                errors.append(f"Missing required file: {required.name}")
-        if errors:
-            return errors, warnings, stats
-        try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            stats.append(("sample_rate_hz", meta.get("sample_rate_hz", "unknown")))
-            stats.append(("channel_count", meta.get("channel_count", "unknown")))
-            stats.append(("channel_units", meta.get("channel_units", "unknown")))
-            stats.append(("eeg_record_format", meta.get("eeg_record_format", "unknown")))
-        except Exception as exc:  # pylint: disable=broad-except
-            errors.append(f"Failed to parse session_meta.json: {exc}")
-            return errors, warnings, stats
-
-        eeg_size = eeg_path.stat().st_size
-        record_format = str(meta.get("eeg_record_format", EEG_RECORD_FORMAT))
-        try:
-            record_size = struct.calcsize(record_format)
-        except struct.error as exc:
-            errors.append(f"Invalid eeg_record_format in metadata: {exc}")
-            return errors, warnings, stats
-        if eeg_size == 0:
-            errors.append("eeg_frames.bin is empty")
-        elif eeg_size % record_size != 0:
-            errors.append(f"eeg_frames.bin size {eeg_size} is not divisible by record size {record_size}")
-        else:
-            stats.append(("eeg_frame_count", eeg_size // record_size))
-
-        with events_path.open("r", encoding="utf-8", newline="") as handle:
-            event_rows = list(csv.DictReader(handle))
-        stats.append(("event_count", len(event_rows)))
-        return errors, warnings, stats
-
-
 def create_app(service: AcquisitionService) -> Flask:
     app = Flask(__name__, template_folder="templates", static_folder="static")
 
@@ -1233,6 +1569,20 @@ def create_app(service: AcquisitionService) -> Flask:
         service.start_collect_scramble(set_count=set_count, rep_count=rep_count)
         return jsonify(service.status()["collect"])
 
+    @app.post("/alignment-test/start")
+    def start_alignment_test() -> Any:
+        service.start_alignment_test()
+        return jsonify(service.status()["alignment_test"])
+
+    @app.post("/alignment-test/clear")
+    def clear_alignment_test() -> Any:
+        service.clear_alignment_test()
+        return jsonify(service.status()["alignment_test"])
+
+    @app.get("/alignment-test/result")
+    def alignment_test_result() -> Any:
+        return jsonify(service.alignment_test_result())
+
     @app.post("/events/marker")
     def marker() -> Any:
         payload = request.get_json(silent=True) or {}
@@ -1265,22 +1615,6 @@ def create_app(service: AcquisitionService) -> Flask:
         block_id = service.stop_speech_block()
         return jsonify({"speech_block_id": block_id, "state": "idle"})
 
-    @app.post("/session/validate")
-    def validate_session() -> Any:
-        payload = request.get_json(silent=True) or {}
-        session_dir_value = payload.get("session_dir") or service.status().get("session_dir")
-        if not session_dir_value:
-            return jsonify({"error": "No session_dir provided and no active session"}), 400
-        errors, warnings, stats = service.validate_session_dir(Path(session_dir_value))
-        return jsonify(
-            {
-                "ok": len(errors) == 0,
-                "errors": errors,
-                "warnings": warnings,
-                "stats": [{"key": k, "value": v} for k, v in stats],
-            }
-        )
-
     @app.errorhandler(RuntimeError)
     def handle_runtime_error(exc: RuntimeError) -> Any:
         return jsonify({"error": str(exc)}), 400
@@ -1308,24 +1642,35 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_HTTP_PORT,
         help="Flask bind port (avoid 5000 on macOS — often used by AirPlay)",
     )
+    parser.add_argument(
+        "--debug-bands",
+        action="store_true",
+        help="Print EEG/EMG band power diagnostics to the console once per second",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     if args.test:
-        service = AcquisitionService(test_mode=True)
+        service = AcquisitionService(test_mode=True, debug_bands=args.debug_bands)
     else:
         serial_port = args.port or pick_default_port() or "/dev/tty.usbmodem1101"
         if not serial_port:
             print("No serial ports found. Pass --port explicitly or use --test.")
             return 1
-        service = AcquisitionService(serial_port=serial_port, baudrate=args.baud)
+        service = AcquisitionService(
+            serial_port=serial_port,
+            baudrate=args.baud,
+            debug_bands=args.debug_bands,
+        )
     app = create_app(service)
     url = f"http://127.0.0.1:{args.http_port}/"
     print(f"Woodside monitor GUI: {url}")
     if args.test:
         print("Test mode: streaming synthetic sine waves (no USB).")
+    if args.debug_bands:
+        print("Band debug: printing power values for EEG1, EEG10, EEG16, EMG1 once per second.")
     print("(On macOS, port 5000 is often AirPlay and returns HTTP 403 — use the URL above.)")
     try:
         app.run(host=args.host, port=args.http_port, threaded=True, use_reloader=False)
