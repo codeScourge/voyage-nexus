@@ -222,6 +222,21 @@ button.primary {
   font-size: 0.58rem;
   color: var(--muted);
   white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+
+.legend-item:has(.legend-toggle:not(:checked)) {
+  opacity: 0.45;
+}
+
+.legend-toggle {
+  margin: 0;
+  width: 0.7rem;
+  height: 0.7rem;
+  flex-shrink: 0;
+  accent-color: #8ab4ff;
+  cursor: pointer;
 }
 
 .legend-swatch {

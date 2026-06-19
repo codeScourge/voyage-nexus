@@ -64,7 +64,7 @@ DEFAULT_BAUD = 2_000_000
 DEFAULT_RECORDINGS_DIR = "recordings"
 ALIGNMENT_WINDOW_FRAMES = 512
 THINKING_COUNTDOWN_SECONDS = 3
-COLLECTION_WORDS = ("apple", "gear", "happy", "table", "girl")
+COLLECTION_WORDS = ("highlight", "bullshit", "gogogo")
 COLLECTION_REPETITIONS = 7
 # Collection timing hyperparameters (seconds) — edit these to tune the protocol
 COLLECTION_BEFORE_S = 1.0
@@ -91,18 +91,19 @@ BAND_HOP_SAMPLES = 128
 BAND_PLOT_POINTS = 80
 
 EEG_BANDS: tuple[dict[str, Any], ...] = (
-    {"name": "Delta", "range": "0.5–4 Hz", "low_hz": 0.5, "high_hz": 4.0, "color": "#9b59b6"},
-    {"name": "Theta", "range": "4–8 Hz", "low_hz": 4.0, "high_hz": 8.0, "color": "#3498db"},
-    {"name": "Alpha", "range": "8–13 Hz", "low_hz": 8.0, "high_hz": 13.0, "color": "#2ecc71"},
-    {"name": "Beta", "range": "13–30 Hz", "low_hz": 13.0, "high_hz": 30.0, "color": "#f1c40f"},
-    {"name": "Gamma", "range": "30–100 Hz", "low_hz": 30.0, "high_hz": 100.0, "color": "#e67e22"},
-    {"name": "High Gamma", "range": ">100 Hz", "low_hz": 100.0, "high_hz": None, "color": "#e74c3c"},
+    {"id": "delta", "name": "Delta", "range": "0.5–4 Hz", "low_hz": 0.5, "high_hz": 4.0, "color": "#9b59b6"},
+    {"id": "theta", "name": "Theta", "range": "4–8 Hz", "low_hz": 4.0, "high_hz": 8.0, "color": "#3498db"},
+    {"id": "mu", "name": "Mu", "range": "8–12 Hz", "low_hz": 8.0, "high_hz": 12.0, "color": "#1abc9c"},
+    {"id": "alpha", "name": "Alpha", "range": "8–13 Hz", "low_hz": 8.0, "high_hz": 13.0, "color": "#2ecc71"},
+    {"id": "beta", "name": "Beta", "range": "13–30 Hz", "low_hz": 13.0, "high_hz": 30.0, "color": "#f1c40f"},
+    {"id": "gamma", "name": "Gamma", "range": "30–100 Hz", "low_hz": 30.0, "high_hz": 100.0, "color": "#e67e22"},
+    {"id": "high_gamma", "name": "High Gamma", "range": ">100 Hz", "low_hz": 100.0, "high_hz": None, "color": "#e74c3c"},
 )
 
 EMG_BANDS: tuple[dict[str, Any], ...] = (
-    {"name": "Low", "range": "20–60 Hz", "low_hz": 20.0, "high_hz": 60.0, "color": "#5dade2"},
-    {"name": "Mid", "range": "60–150 Hz", "low_hz": 60.0, "high_hz": 150.0, "color": "#58d68d"},
-    {"name": "High", "range": "150–500 Hz", "low_hz": 150.0, "high_hz": 500.0, "color": "#f5b041"},
+    {"id": "low", "name": "Low", "range": "20–60 Hz", "low_hz": 20.0, "high_hz": 60.0, "color": "#5dade2"},
+    {"id": "mid", "name": "Mid", "range": "60–150 Hz", "low_hz": 60.0, "high_hz": 150.0, "color": "#58d68d"},
+    {"id": "high", "name": "High", "range": "150–500 Hz", "low_hz": 150.0, "high_hz": 500.0, "color": "#f5b041"},
 )
 
 
@@ -163,7 +164,10 @@ def _band_power_series(
     n = int(signal.shape[0])
     if n < frame_samples:
         empty_t = np.linspace(-WINDOW_SECONDS, 0, 1, dtype=np.float32)
-        empty_bands = [{"name": b["name"], "color": b["color"], "y": [0.0]} for b in bands]
+        empty_bands = [
+            {"id": b["id"], "name": b["name"], "range": b["range"], "color": b["color"], "y": [0.0]}
+            for b in bands
+        ]
         return empty_t, empty_bands
 
     window = np.hanning(frame_samples).astype(np.float64)
@@ -191,7 +195,13 @@ def _band_power_series(
     end_sample = int(starts[-1] + frame_samples)
     time_s = (starts.astype(np.float64) + frame_samples * 0.5 - end_sample) / sample_rate_hz
     series = [
-        {"name": band["name"], "color": band["color"], "y": powers}
+        {
+            "id": band["id"],
+            "name": band["name"],
+            "range": band["range"],
+            "color": band["color"],
+            "y": powers,
+        }
         for band, powers in zip(bands, band_powers, strict=True)
     ]
     return time_s.astype(np.float32), series
@@ -224,13 +234,22 @@ def _downsample_band_series(
     n = int(time_s.shape[0])
     if n <= max_points:
         return time_s.astype(np.float32).tolist(), [
-            {"name": s["name"], "color": s["color"], "y": [float(v) for v in s["y"]]} for s in series
+            {
+                "id": s["id"],
+                "name": s["name"],
+                "range": s["range"],
+                "color": s["color"],
+                "y": [float(v) for v in s["y"]],
+            }
+            for s in series
         ]
     step = max(1, n // max_points)
     idx = np.arange(0, n, step, dtype=np.int64)
     return time_s[idx].astype(np.float32).tolist(), [
         {
+            "id": s["id"],
             "name": s["name"],
+            "range": s["range"],
             "color": s["color"],
             "y": [float(s["y"][i]) for i in idx],
         }

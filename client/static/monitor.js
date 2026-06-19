@@ -15,6 +15,8 @@ const state = {
   alignmentResult: null,
   statusPollTimer: null,
   alignmentResultFetchKey: null,
+  visibleEegBands: new Set(),
+  visibleEmgBands: new Set(),
 };
 
 const els = {
@@ -318,6 +320,27 @@ function drawAlignmentTrace(canvas, trace, timeS, { labelT0, labelT1, showXAxis 
   ctx.stroke();
 }
 
+function bandId(band) {
+  return band.id || band.name;
+}
+
+function visibleBandSet(channelIdx) {
+  return channelIdx < 16 ? state.visibleEegBands : state.visibleEmgBands;
+}
+
+function ensureBandVisibility(bands, channelIdx) {
+  const visible = visibleBandSet(channelIdx);
+  for (const band of bands || []) {
+    const id = bandId(band);
+    if (!visible.has(id)) visible.add(id);
+  }
+}
+
+function filterVisibleBands(bands, channelIdx) {
+  const visible = visibleBandSet(channelIdx);
+  return (bands || []).filter((band) => visible.has(bandId(band)));
+}
+
 function bandYRange(bands, channelIdx) {
   if (!state.autoScale) {
     return [0, fixedBandMax(channelIdx)];
@@ -432,14 +455,27 @@ function formatBandPower(v) {
   return v.toFixed(2);
 }
 
-function renderBandLegend(container, bands) {
+function renderBandLegend(container, bands, channelIdx) {
   if (!container || !bands?.length) return;
-  const key = bands.map((b) => `${b.name}:${b.range || ""}:${b.color}`).join("|");
+  ensureBandVisibility(bands, channelIdx);
+  const key = bands.map((b) => `${bandId(b)}:${b.range || ""}:${b.color}`).join("|");
   if (container.dataset.built === key) return;
   container.innerHTML = "";
   for (const band of bands) {
-    const item = document.createElement("span");
+    const id = bandId(band);
+    const item = document.createElement("label");
     item.className = "legend-item";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.className = "legend-toggle";
+    checkbox.checked = visibleBandSet(channelIdx).has(id);
+    checkbox.addEventListener("change", () => {
+      const visible = visibleBandSet(channelIdx);
+      if (checkbox.checked) visible.add(id);
+      else visible.delete(id);
+      redrawIfReady();
+    });
+    item.appendChild(checkbox);
     const swatch = document.createElement("span");
     swatch.className = "legend-swatch";
     swatch.style.background = band.color;
@@ -519,8 +555,8 @@ function renderWaveform(waveform) {
   if (!traces.length) return;
   ensureChannelRows(traces);
   const timeS = waveform.time_s || [];
-  renderBandLegend(els.legendEeg, waveform.eeg_bands);
-  renderBandLegend(els.legendEmg, waveform.emg_bands);
+  renderBandLegend(els.legendEeg, waveform.eeg_bands, 0);
+  renderBandLegend(els.legendEmg, waveform.emg_bands, 16);
   els.plotArea.querySelectorAll("canvas[data-channel]").forEach((canvas) => {
     const row = canvas.closest(".plot-row");
     const idx = Number(canvas.dataset.channel);
@@ -528,7 +564,8 @@ function renderWaveform(waveform) {
     if (!trace) return;
     const showXAxis = row?.dataset.showX === "1";
     if (canvas.dataset.role === "bands") {
-      drawBandPlot(canvas, trace.bands || [], trace.band_time_s || [], showXAxis, idx);
+      const visibleBands = filterVisibleBands(trace.bands || [], idx);
+      drawBandPlot(canvas, visibleBands, trace.band_time_s || [], showXAxis, idx);
     } else if (canvas.dataset.role === "filtered") {
       drawTrace(canvas, { ...trace, y: trace.y_filtered || trace.y }, timeS, showXAxis);
     } else {

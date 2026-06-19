@@ -274,13 +274,31 @@ void ConfigureChipCommon(SPIClass &spi, uint8_t cs_pin, bool daisy_enable, bool 
   }
 }
 
+uint8_t EegBiasSenspMaskForChip(uint8_t chip_index) {
+  constexpr bool enabled[cfg::kEegChannels] = {
+      cfg::kEeg1BiasSensp,  cfg::kEeg2BiasSensp,  cfg::kEeg3BiasSensp,  cfg::kEeg4BiasSensp,
+      cfg::kEeg5BiasSensp,  cfg::kEeg6BiasSensp,  cfg::kEeg7BiasSensp,  cfg::kEeg8BiasSensp,
+      cfg::kEeg9BiasSensp,  cfg::kEeg10BiasSensp, cfg::kEeg11BiasSensp, cfg::kEeg12BiasSensp,
+      cfg::kEeg13BiasSensp, cfg::kEeg14BiasSensp, cfg::kEeg15BiasSensp, cfg::kEeg16BiasSensp,
+  };
+  uint8_t mask = 0;
+  const uint8_t base = chip_index * cfg::kAdsChannelsPerChip;
+  for (uint8_t i = 0; i < cfg::kAdsChannelsPerChip; ++i) {
+    if (enabled[base + i]) {
+      mask |= static_cast<uint8_t>(1u << i);
+    }
+  }
+  return mask;
+}
+
 void ConfigureEegDaisyPair() {
   // Datasheet: DAISY_EN=0 selects daisy-chain mode.
   uint8_t config1 = ads1299::kConfig1Base | ads1299::kRate1000Sps;
   const uint8_t common_registers[] = {config1, ads1299::kConfig2InternalRef,
                                       ads1299::kConfig3InternalRefBuffer};
   const uint8_t misc1 = ads1299::kMisc1Srb1Enable;
-  const uint8_t bias_sensp_mask = 0xFF;
+  const uint8_t bias_sensp_chip_a = EegBiasSenspMaskForChip(0);
+  const uint8_t bias_sensp_chip_b = EegBiasSenspMaskForChip(1);
   const uint8_t bias_sensn_mask = 0x00;
   const uint8_t eeg_gain_code = AdsGainCodeFromValue(cfg::kEegGain);
 
@@ -305,9 +323,8 @@ void ConfigureEegDaisyPair() {
                              sizeof(common_registers), cfg::kEegChipCount);
   SpiWriteRegistersDaisySame(eeg_spi, cfg::kEegCsPin, ads1299::kRegMisc1, &misc1, 1,
                              cfg::kEegChipCount);
-  SpiWriteRegistersDaisySame(eeg_spi, cfg::kEegCsPin, ads1299::kRegBiasSensp, &bias_sensp_mask,
-                             1,
-                             cfg::kEegChipCount);
+  SpiWriteRegistersDaisyDual(eeg_spi, cfg::kEegCsPin, ads1299::kRegBiasSensp, &bias_sensp_chip_a,
+                             &bias_sensp_chip_b, 1);
   SpiWriteRegistersDaisySame(eeg_spi, cfg::kEegCsPin, ads1299::kRegBiasSensn, &bias_sensn_mask,
                              1,
                              cfg::kEegChipCount);

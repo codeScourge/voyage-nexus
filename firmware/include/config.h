@@ -16,7 +16,23 @@ constexpr uint32_t kSyntheticStartAfterMs = 1000;
 constexpr bool kEnableSyntheticFallback = true;
 constexpr bool kBypassAdsForBringup = false;
 
-#   
+// Per-channel BIAS_SENSP enable (true = channel contributes to bias drive).
+constexpr bool kEeg1BiasSensp = true;
+constexpr bool kEeg2BiasSensp = true;
+constexpr bool kEeg3BiasSensp = true;
+constexpr bool kEeg4BiasSensp = true;
+constexpr bool kEeg5BiasSensp = true;
+constexpr bool kEeg6BiasSensp = true;
+constexpr bool kEeg7BiasSensp = true;
+constexpr bool kEeg8BiasSensp = true;
+constexpr bool kEeg9BiasSensp = true;
+constexpr bool kEeg10BiasSensp = true;
+constexpr bool kEeg11BiasSensp = true;
+constexpr bool kEeg12BiasSensp = true;
+constexpr bool kEeg13BiasSensp = true;
+constexpr bool kEeg14BiasSensp = true;
+constexpr bool kEeg15BiasSensp = true;
+constexpr bool kEeg16BiasSensp = true;
 
 constexpr float kAdsVrefVolts = 4.5f;
 constexpr uint8_t kEegGain = 6;
