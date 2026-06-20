@@ -15,6 +15,8 @@ const state = {
   alignmentResult: null,
   statusPollTimer: null,
   alignmentResultFetchKey: null,
+  modelTestResult: null,
+  modelTestResultFetchKey: null,
   visibleEegBands: new Set(),
   visibleEmgBands: new Set(),
 };
@@ -52,6 +54,14 @@ const els = {
   alignmentResult: document.getElementById("alignment-result"),
   alignmentResultMeta: document.getElementById("alignment-result-meta"),
   alignmentResultPlots: document.getElementById("alignment-result-plots"),
+  modelTestBtn: document.getElementById("btn-model-test"),
+  modelTestDismiss: document.getElementById("btn-model-test-dismiss"),
+  modelTestPrompt: document.getElementById("model-test-prompt"),
+  modelTestPromptMain: document.getElementById("model-test-prompt-main"),
+  modelTestPromptSub: document.getElementById("model-test-prompt-sub"),
+  modelTestResult: document.getElementById("model-test-result"),
+  modelTestResultMeta: document.getElementById("model-test-result-meta"),
+  modelTestResultRows: document.getElementById("model-test-result-rows"),
 };
 
 const MARGIN = { left: 44, right: 6, top: 3, bottom: 16 };
@@ -727,7 +737,9 @@ function updateAlignmentUi(status) {
     !recording &&
     !busy &&
     status.trial_state === "idle" &&
-    (status.collect?.phase === "disabled" || status.collect?.phase === "pick_word");
+    (status.collect?.phase === "disabled" || status.collect?.phase === "pick_word") &&
+    status.model_test?.phase !== "countdown" &&
+    status.model_test?.phase !== "say";
 
   if (els.alignmentBtn) {
     els.alignmentBtn.disabled = !canStart;
@@ -809,9 +821,175 @@ async function fetchAlignmentResult() {
   renderAlignmentResult(result);
 }
 
+function updateModelTestUi(status) {
+  const model = status.model_test || {
+    phase: "idle",
+    before_s: 1,
+    say_s: 1.6,
+    trials_total: 3,
+    has_result: false,
+  };
+  const recording = status.recording_enabled;
+  const phase = model.phase;
+  const busy = phase === "countdown" || phase === "say";
+  const canStart =
+    !recording &&
+    !busy &&
+    status.trial_state === "idle" &&
+    (status.collect?.phase === "disabled" || status.collect?.phase === "pick_word") &&
+    status.alignment_test?.phase !== "countdown" &&
+    status.alignment_test?.phase !== "blink";
+
+  if (els.modelTestBtn) {
+    els.modelTestBtn.disabled = !canStart;
+    els.modelTestBtn.textContent = busy ? "Model test…" : "Test Model";
+  }
+
+  els.modelTestPrompt?.classList.toggle("hidden", !busy);
+  if (busy && els.modelTestPromptMain && els.modelTestPromptSub) {
+    const remaining = model.phase_remaining_s ?? 0;
+    const beforeS = model.before_s ?? 1;
+    const sayS = model.say_s ?? 1.6;
+    const trial = model.trial ?? 1;
+    const total = model.trials_total ?? 3;
+    if (phase === "countdown") {
+      els.modelTestPromptMain.textContent = remaining.toFixed(1);
+      els.modelTestPromptMain.classList.remove("say-it");
+      els.modelTestPromptSub.textContent = `Trial ${trial}/${total} — get ready (${beforeS}s new-word countdown)`;
+    } else {
+      els.modelTestPromptMain.textContent = "SAY IT";
+      els.modelTestPromptMain.classList.add("say-it");
+      els.modelTestPromptSub.textContent = `Trial ${trial}/${total} — say any word (${sayS}s)`;
+    }
+  }
+
+  if (phase === "result" && model.has_result && state.modelTestResultFetchKey !== "pending") {
+    if (!state.modelTestResult) {
+      state.modelTestResultFetchKey = "pending";
+      fetchModelTestResult().catch((err) => showToast(err.message, true));
+    }
+  } else if (phase !== "result") {
+    state.modelTestResultFetchKey = null;
+  }
+
+  const showResult = phase === "result" && !!state.modelTestResult;
+  els.modelTestResult?.classList.toggle("hidden", !showResult);
+  if (showResult) {
+    renderModelTestResult(state.modelTestResult);
+  }
+}
+
+function formatPct(probability) {
+  const pct = Number(probability) * 100;
+  if (!Number.isFinite(pct)) return "—";
+  if (pct > 0 && pct < 0.01) return "<0.01%";
+  return `${pct.toFixed(2)}%`;
+}
+
+function barWidthPct(probability) {
+  const pct = Number(probability) * 100;
+  if (!Number.isFinite(pct) || pct <= 0) return 0;
+  // Keep tiny non-zero probs visible on the bar chart.
+  return Math.max(pct, 0.4);
+}
+
+function renderModelTestResult(result) {
+  if (!els.modelTestResultMeta || !els.modelTestResultRows) return;
+  const checkpoint = result.checkpoint || "";
+  const ckptName = checkpoint.split("/").pop() || checkpoint;
+  els.modelTestResultMeta.textContent = checkpoint ? `checkpoint: ${ckptName}` : "";
+  els.modelTestResultRows.replaceChildren();
+
+  for (const trial of result.trials || []) {
+    const row = document.createElement("div");
+    row.className = "model-test-trial";
+
+    const head = document.createElement("div");
+    head.className = "model-test-trial-head";
+    const title = document.createElement("strong");
+    title.textContent = `Trial ${trial.trial}`;
+    head.appendChild(title);
+
+    if (trial.error) {
+      const err = document.createElement("span");
+      err.className = "model-test-error";
+      err.textContent = trial.error;
+      head.appendChild(err);
+    } else if (trial.predicted_label) {
+      const guess = document.createElement("span");
+      guess.className = "model-test-guess";
+      guess.textContent = `→ ${trial.predicted_label} (${formatPct(trial.predicted_probability)})`;
+      head.appendChild(guess);
+    }
+    row.appendChild(head);
+
+    const labelRows = trial.predictions_by_label || trial.predictions || [];
+    if (!trial.error && labelRows.length) {
+      const bars = document.createElement("div");
+      bars.className = "model-test-bars";
+      for (const pred of labelRows) {
+        const item = document.createElement("div");
+        item.className = "model-test-bar-row";
+
+        const label = document.createElement("span");
+        label.className = "model-test-bar-label";
+        label.textContent = pred.label;
+
+        const track = document.createElement("div");
+        track.className = "model-test-bar-track";
+        const fill = document.createElement("div");
+        fill.className = "model-test-bar-fill";
+        if (pred.label === trial.predicted_label) {
+          fill.classList.add("is-top");
+        }
+        fill.style.width = `${Math.min(100, barWidthPct(pred.probability))}%`;
+        track.appendChild(fill);
+
+        const pct = document.createElement("span");
+        pct.className = "model-test-bar-pct";
+        pct.textContent = formatPct(pred.probability);
+
+        item.append(label, track, pct);
+        bars.appendChild(item);
+      }
+      row.appendChild(bars);
+    }
+
+    if (trial.probs_by_label && typeof trial.probs_by_label === "object") {
+      const summary = document.createElement("div");
+      summary.className = "model-test-debug";
+      summary.textContent = Object.entries(trial.probs_by_label)
+        .map(([label, prob]) => `${label} ${formatPct(prob)}`)
+        .join(" · ");
+      row.appendChild(summary);
+    } else if (Array.isArray(trial.logits) && trial.logits.length) {
+      const debug = document.createElement("div");
+      debug.className = "model-test-debug";
+      debug.textContent = `logits: [${trial.logits.map((v) => Number(v).toFixed(3)).join(", ")}]`;
+      row.appendChild(debug);
+    }
+
+    els.modelTestResultRows.appendChild(row);
+  }
+}
+
+async function fetchModelTestResult() {
+  const result = await api("/model-test/result");
+  state.modelTestResult = result;
+  state.modelTestResultFetchKey = "done";
+  renderModelTestResult(result);
+}
+
 function syncAlignmentStatusPolling(status) {
-  const phase = status.alignment_test?.phase;
-  const fast = phase === "countdown" || phase === "blink";
+  const align = status.alignment_test || {};
+  const model = status.model_test || {};
+  const phase = align.phase;
+  const modelPhase = model.phase;
+  const fast =
+    phase === "countdown" ||
+    phase === "blink" ||
+    modelPhase === "countdown" ||
+    modelPhase === "say";
   const hz = fast ? 20 : 0;
   if (hz > 0) {
     if (state.statusPollTimer) return;
@@ -821,7 +999,15 @@ function syncAlignmentStatusPolling(status) {
         updateStatusBar(next);
         updateControls(next);
         updateAlignmentUi(next);
-        if (next.alignment_test?.phase !== "countdown" && next.alignment_test?.phase !== "blink") {
+        updateModelTestUi(next);
+        const alignNext = next.alignment_test?.phase;
+        const modelNext = next.model_test?.phase;
+        if (
+          alignNext !== "countdown" &&
+          alignNext !== "blink" &&
+          modelNext !== "countdown" &&
+          modelNext !== "say"
+        ) {
           window.clearInterval(state.statusPollTimer);
           state.statusPollTimer = null;
         }
@@ -848,6 +1034,7 @@ function updateControls(status) {
 
   updateCollectUi(status);
   updateAlignmentUi(status);
+  updateModelTestUi(status);
   syncAlignmentStatusPolling(status);
 }
 
@@ -1008,6 +1195,40 @@ if (els.alignmentDismiss) {
       state.alignmentResult = null;
       state.alignmentResultFetchKey = null;
       els.alignmentResult?.classList.add("hidden");
+      await refreshStatus();
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
+}
+
+if (els.modelTestBtn) {
+  els.modelTestBtn.addEventListener("click", async () => {
+    els.modelTestBtn.disabled = true;
+    state.modelTestResult = null;
+    state.modelTestResultFetchKey = null;
+    els.modelTestResult?.classList.add("hidden");
+    try {
+      await post("/model-test/start");
+      await refreshStatus();
+    } catch (err) {
+      showToast(err.message, true);
+      try {
+        await refreshStatus();
+      } catch (_) {
+        /* keep existing UI */
+      }
+    }
+  });
+}
+
+if (els.modelTestDismiss) {
+  els.modelTestDismiss.addEventListener("click", async () => {
+    try {
+      await post("/model-test/clear");
+      state.modelTestResult = null;
+      state.modelTestResultFetchKey = null;
+      els.modelTestResult?.classList.add("hidden");
       await refreshStatus();
     } catch (err) {
       showToast(err.message, true);

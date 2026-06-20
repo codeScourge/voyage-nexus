@@ -1,12 +1,16 @@
 [project]
-name = "host"
+name = "voyage-nexus"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "flask",
+    "matplotlib",
     "numpy",
     "pyserial",
-    "scipy>=1.11",
+    "scipy",
+    "sounddevice>=0.5.5",
+    "torch",
+    "tqdm",
 ]

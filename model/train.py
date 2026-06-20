@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import random
 import re
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -13,12 +14,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 from _preprocessors import EEG_CHANNELS, EMG_CHANNELS
 from data import load_dataset_splits
 
 # ---
 SEED = 42
+TORCH_DETERMINISTIC = False
+RUN_DIR_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}")
+
 
 def seed_everything(seed: int = 0, deterministic: bool = True) -> None:
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -224,17 +229,20 @@ def construct_model(splits):
     n_eeg, T = eeg0.shape[1], eeg0.shape[2]
     n_emg = emg0.shape[1]
 
-    print(eeg0.shape, emg0.shape, eeg0, emg0)
+    print("\n\n")
+    print("--- example sample ---")
+    print("eeg: ", eeg0)
+    print("\n")
+    print("emg: ", emg0)
+    print("------")
+    print("\n\n")
 
     model = IntermediateFusionEEGNet(
         n_eeg=n_eeg, n_emg=n_emg, n_classes=n_classes, T=T,
+        p_drop=0.5
     ).to(device)
 
     return model, label_to_idx, {"n_eeg": n_eeg, "n_emg": n_emg, "n_classes": n_classes, "T": T}
-
-
-RUN_DIR_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}")
-
 
 def new_run_dir_name(now: datetime | None = None) -> str:
     """e.g. 2026-06-20_01-44-45_run_a3f8b2c1 (mirrors client recording folders)."""
@@ -310,12 +318,14 @@ def save_checkpoint(
         },
         path,
     )
+
+    print("\n")
     print(f"saved checkpoint ({kind}, epoch {epoch}) -> {path}")
+    print("\n")
 
 
 def plot_training_history(history: dict[str, list[float]], path: Path) -> None:
-    import matplotlib.pyplot as plt
-
+    
     epochs = range(1, len(history["train_loss"]) + 1)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -354,20 +364,19 @@ def train(
     batch_size=32,
     lr=1e-3,
     *,
-    run_dir: Path | None = None,
+    run_dir: Path,
     save_interval: int = CHECKPOINT_SAVE_INTERVAL,
+    num_workers=0,
+    pin_memory=False,
 ):
     n_classes = len(label_to_idx)
-
     model = model.to(device)
-    run_dir = run_dir or create_run_dir()
-    print(f"run dir: {run_dir}")
 
     train_ds = FusionDataset(splits.dataset, splits.train.indices, label_to_idx)
     val_ds = FusionDataset(splits.dataset, splits.val.indices, label_to_idx)
 
-    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
-    val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=num_workers, pin_memory=pin_memory)
+    val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
 
     # class weights for imbalance (inverse frequency)
     counts = torch.zeros(n_classes)
@@ -423,6 +432,7 @@ def train(
 
     epoch_bar = tqdm(range(epochs), desc="epochs", unit="epoch")
     for epoch in epoch_bar:
+        epoch_start = time.perf_counter()
         model.train()
         running = 0.0
         train_correct = train_total = 0
@@ -441,19 +451,21 @@ def train(
         train_loss = running / len(train_ds)
         train_acc = train_correct / train_total if train_total else 0.0
 
+        
         model.eval()
-        val_running = 0.0
-        correct = total = 0
-        for eeg, emg, y in tqdm(val_dl, desc="val", leave=False):
-            eeg, emg, y = eeg.to(device), emg.to(device), y.to(device)
-            with torch.no_grad():
+        with torch.no_grad():
+            val_running = 0.0
+            correct = total = 0
+            for eeg, emg, y in tqdm(val_dl, desc="val", leave=False):
+                eeg, emg, y = eeg.to(device), emg.to(device), y.to(device)
                 logits = model(eeg, emg)
                 val_running += crit(logits, y).item() * y.size(0)
                 pred = logits.argmax(1)
-            correct += (pred == y).sum().item()
-            total += y.size(0)
-        val_loss = val_running / len(val_ds) if len(val_ds) else 0.0
-        acc = correct / total if total else 0.0
+                correct += (pred == y).sum().item()
+                total += y.size(0)
+            val_loss = val_running / len(val_ds) if len(val_ds) else 0.0
+            acc = correct / total if total else 0.0
+
         epoch_num = epoch + 1
 
         history["train_loss"].append(train_loss)
@@ -493,12 +505,14 @@ def train(
                 val_acc=acc,
             )
 
+        epoch_time = time.perf_counter() - epoch_start
         epoch_bar.set_postfix(
             train_loss=f"{train_loss:.4f}",
             val_loss=f"{val_loss:.4f}",
             train_acc=f"{train_acc:.4f}",
             val_acc=f"{acc:.4f}",
             best=f"{best_acc:.4f}",
+            epoch_s=f"{epoch_time:.1f}s",
         )
 
     write_checkpoint(
@@ -533,12 +547,19 @@ def train(
 
 if __name__ == "__main__":
     SPLITS_DIR = Path(__file__).resolve().parent / "splits"
-    seed_everything(SEED)
+    seed_everything(SEED, TORCH_DETERMINISTIC)
     splits = load_dataset_splits(SPLITS_DIR)
     # print(splits)
 
-    print(f"device: {device}")
+    run_dir = create_run_dir()
     untrained_model, label_to_idx, model_config = construct_model(splits)
     print(f"window T={model_config['T']} samples, classes={model_config['n_classes']}")
-    model, history, run_dir = train(untrained_model, splits, label_to_idx, model_config)
-    print(f"artifacts saved under {run_dir}")
+
+    print("\n\n")
+    print(f"starting training on device {device} at {run_dir}")
+    print("\n")
+
+    model, history, run_dir = train(untrained_model, splits, label_to_idx, model_config, run_dir=run_dir)
+
+    print("\n")
+    print(f"'artifacts saved under {run_dir}")

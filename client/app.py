@@ -27,6 +27,9 @@ _MODEL_ROOT = Path(__file__).resolve().parent.parent / "model"
 if _MODEL_ROOT.is_dir() and str(_MODEL_ROOT) not in sys.path:
     sys.path.insert(0, str(_MODEL_ROOT))
 
+from train import default_checkpoint_path, get_device
+from val import load_checkpoint
+from infer import fix_window_length, predict_fusion_batch
 from _preprocessors import (
     DEFAULT_EEG_BANDPASS_CONFIG,
     DEFAULT_EMG_BANDPASS_CONFIG,
@@ -45,15 +48,13 @@ from _protocol import (
     ads_calibration_metadata,
 )
 
-try:
-    import sounddevice as sd
-except ImportError:  # pragma: no cover
-    sd = None
+import sounddevice as sd
+import torch
 
 try:
     import whisper
-except ImportError:  # pragma: no cover
-    whisper = None
+except:
+    whiper = None
 
 SAMPLE_RATE_HZ = 1000
 WINDOW_SECONDS = 2
@@ -73,6 +74,7 @@ COLLECTION_BETWEEN_S = 0.4
 COLLECTION_SAY_S = 1.6
 ALIGNMENT_TEST_PAD_S = 0.3
 ALIGNMENT_TEST_DISPLAY_CHANNELS = tuple(range(8))
+MODEL_TEST_TRIALS = 3
 DEFAULT_SCRAMBLE_SET = 5
 DEFAULT_SCRAMBLE_REP = 7
 SCRAMBLE_SET_MIN = 1
@@ -648,6 +650,21 @@ class AcquisitionService:
         self._align_test_method = ""
         self._align_test_result: Optional[dict[str, Any]] = None
 
+        self._model_test_phase = "idle"
+        self._model_test_deadline_ns: Optional[int] = None
+        self._model_test_trial = 0
+        self._model_test_trials_total = MODEL_TEST_TRIALS
+        self._model_test_captures: list[dict[str, Any]] = []
+        self._model_test_result: Optional[dict[str, Any]] = None
+        self._model_test_say_start_idx: Optional[int] = None
+        self._model_test_say_start_float: Optional[float] = None
+        self._model_test_nn = None
+        self._model_test_label_to_idx: Optional[dict[str, int]] = None
+        self._model_test_idx_to_label: Optional[dict[int, str]] = None
+        self._model_test_checkpoint: Optional[str] = None
+        self._model_test_model_config: Optional[dict[str, Any]] = None
+        self._model_test_device = None
+
         self._latest_sample_index = -1
         self._total_frames = 0
         self._buffer_samples = FILTER_BUFFER_SECONDS * SAMPLE_RATE_HZ
@@ -674,11 +691,13 @@ class AcquisitionService:
                 self._tick_countdown()
                 self._tick_collect()
                 self._tick_alignment_test()
+                self._tick_model_test()
                 continue
             self._push_frame(rx_frame)
             self._tick_countdown()
             self._tick_collect()
             self._tick_alignment_test()
+            self._tick_model_test()
 
         while True:
             try:
@@ -1202,6 +1221,8 @@ class AcquisitionService:
             raise RuntimeError("Finish collection before running alignment test")
         if self._alignment_test_busy():
             raise RuntimeError("Alignment test already running")
+        if self._model_test_busy():
+            raise RuntimeError("Finish model test before running alignment test")
         _event_host_ns, aligned_float, aligned_idx, method = self._aligned_sample_now()
         if aligned_idx is None:
             raise RuntimeError("No samples yet; wait for EEG stream")
@@ -1222,6 +1243,254 @@ class AcquisitionService:
         if self._align_test_phase != "result" or self._align_test_result is None:
             raise RuntimeError("No alignment test result available")
         return self._align_test_result
+
+    def _model_test_busy(self) -> bool:
+        return self._model_test_phase in ("countdown", "say")
+
+    def _reset_model_test(self) -> None:
+        self._model_test_phase = "idle"
+        self._model_test_deadline_ns = None
+        self._model_test_trial = 0
+        self._model_test_captures = []
+        self._model_test_result = None
+        self._model_test_say_start_idx = None
+        self._model_test_say_start_float = None
+
+    def _model_test_phase_remaining_s(self) -> Optional[float]:
+        if self._model_test_phase not in ("countdown", "say"):
+            return None
+        if self._model_test_deadline_ns is None:
+            return None
+        return max(0.0, (self._model_test_deadline_ns - time.perf_counter_ns()) / 1e9)
+
+    def _model_test_status(self) -> dict[str, Any]:
+        return {
+            "phase": self._model_test_phase,
+            "trial": self._model_test_trial if self._model_test_busy() else None,
+            "trials_total": self._model_test_trials_total,
+            "phase_remaining_s": self._model_test_phase_remaining_s(),
+            "before_s": COLLECTION_BEFORE_S,
+            "say_s": COLLECTION_SAY_S,
+            "has_result": self._model_test_result is not None,
+            "checkpoint": self._model_test_checkpoint,
+        }
+
+    def _extract_training_aligned_window(self, start_idx: int, end_idx: int) -> Optional[np.ndarray]:
+        """Filter the full ring buffer, then crop the event span — same order as data.build_event_windows."""
+        if self._model_test_model_config is None:
+            return None
+        target_len = int(self._model_test_model_config["T"])
+        with self._lock:
+            latest = self._latest_sample_index
+            filled = min(self._total_frames, self._buffer_samples)
+            if filled <= 0 or latest < 0:
+                return None
+            oldest_idx = latest - filled + 1
+            if end_idx < oldest_idx or start_idx > latest:
+                return None
+            view = _ordered_buffer_view(self._buffer_uv, self._write_idx)
+
+        block_tc = np.asarray(view.T, dtype=np.float32)
+        filtered_tc = preprocess_session_channels(
+            block_tc,
+            float(SAMPLE_RATE_HZ),
+            line_noise=DEFAULT_LINE_NOISE_CONFIG,
+            eeg=DEFAULT_EEG_BANDPASS_CONFIG,
+            emg=DEFAULT_EMG_BANDPASS_CONFIG,
+        )
+        i0 = max(0, start_idx - oldest_idx)
+        i1 = min(filled, end_idx - oldest_idx + 1)
+        if i1 <= i0:
+            return None
+        return fix_window_length(filtered_tc[i0:i1, :], target_len)
+
+    def _load_model_for_test(self) -> None:
+        if self._model_test_nn is not None:
+            return
+        if torch is None:
+            raise RuntimeError("PyTorch is not installed")
+
+        path = default_checkpoint_path("best")
+        if not path.exists():
+            raise RuntimeError(f"No checkpoint found at {path}")
+        device = get_device()
+        model, label_to_idx, meta = load_checkpoint(path, device)
+        self._model_test_nn = model
+        self._model_test_label_to_idx = label_to_idx
+        self._model_test_idx_to_label = {idx: label for label, idx in label_to_idx.items()}
+        self._model_test_checkpoint = str(path.resolve())
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        self._model_test_model_config = dict(ckpt["model_config"])
+        self._model_test_device = device
+
+    def _capture_model_test_window(self) -> dict[str, Any]:
+        trial = self._model_test_trial
+        if self._model_test_say_start_idx is None or self._model_test_say_start_float is None:
+            return {"trial": trial, "error": "missing say window start"}
+
+        say_start_i = int(self._model_test_say_start_idx)
+        say_start_f = float(self._model_test_say_start_float)
+        say_end_f = say_start_f + COLLECTION_SAY_S * SAMPLE_RATE_HZ
+        say_end_i = TimeAligner.quantize_sample_index(say_end_f) or int(round(say_end_f))
+        window_tc = self._extract_training_aligned_window(say_start_i, say_end_i)
+        if window_tc is None:
+            return {
+                "trial": trial,
+                "error": "labeled window is no longer in the ring buffer",
+                "sample_index_start": say_start_i,
+                "sample_index_end": say_end_i,
+            }
+
+        return {
+            "trial": trial,
+            "sample_index_start": say_start_i,
+            "sample_index_end": say_end_i,
+            "window_tc": window_tc,
+            "window_len": int(window_tc.shape[0]),
+        }
+
+    def _predict_model_test_batch(self, captures: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if self._model_test_nn is None:
+            raise RuntimeError("Model not loaded")
+        idx_to_label = self._model_test_idx_to_label or {}
+
+        trial_rows: list[dict[str, Any]] = []
+        windows_tc: list[np.ndarray] = []
+        batch_row_indices: list[int] = []
+
+        for capture in captures:
+            row: dict[str, Any] = {
+                "trial": capture.get("trial"),
+                "sample_index_start": capture.get("sample_index_start"),
+                "sample_index_end": capture.get("sample_index_end"),
+                "window_len": capture.get("window_len"),
+            }
+            if capture.get("error"):
+                row["error"] = capture["error"]
+                trial_rows.append(row)
+                continue
+            window_tc = capture.get("window_tc")
+            if window_tc is None:
+                row["error"] = "missing window"
+                trial_rows.append(row)
+                continue
+            batch_row_indices.append(len(trial_rows))
+            trial_rows.append(row)
+            windows_tc.append(np.asarray(window_tc, dtype=np.float32))
+
+        if windows_tc:
+            preds = predict_fusion_batch(
+                self._model_test_nn,
+                windows_tc,
+                device=self._model_test_device,
+                idx_to_label=idx_to_label,
+            )
+            for batch_idx, row_idx in enumerate(batch_row_indices):
+                pred = preds[batch_idx]
+                trial_rows[row_idx].update(pred)
+                labeled_probs = {
+                    idx_to_label[i]: round(float(pred["probs"][i]), 4)
+                    for i in range(len(pred["probs"]))
+                }
+                print(
+                    f"[model-test] trial {trial_rows[row_idx]['trial']}: "
+                    f"logits={[round(v, 4) for v in pred['logits']]} "
+                    f"probs={labeled_probs} "
+                    f"pred={pred['predicted_label']} ({pred['predicted_probability']:.4f})",
+                    flush=True,
+                )
+
+        return trial_rows
+
+    def _finalize_model_test(self) -> None:
+        try:
+            trial_results = self._predict_model_test_batch(self._model_test_captures)
+        except Exception as exc:  # pylint: disable=broad-except
+            trial_results = [
+                {
+                    "trial": capture.get("trial"),
+                    "sample_index_start": capture.get("sample_index_start"),
+                    "sample_index_end": capture.get("sample_index_end"),
+                    "error": str(exc),
+                }
+                for capture in self._model_test_captures
+            ]
+
+        label_order = (
+            sorted(self._model_test_label_to_idx.keys())
+            if self._model_test_label_to_idx
+            else []
+        )
+        self._model_test_result = {
+            "checkpoint": self._model_test_checkpoint,
+            "trials_total": self._model_test_trials_total,
+            "label_order": label_order,
+            "trials": trial_results,
+        }
+        self._model_test_captures = []
+        self._model_test_phase = "result"
+
+    def _tick_model_test(self) -> None:
+        if self._model_test_phase not in ("countdown", "say"):
+            return
+        deadline = self._model_test_deadline_ns
+        if deadline is None or time.perf_counter_ns() < deadline:
+            return
+
+        if self._model_test_phase == "countdown":
+            _event_host_ns, start_float, start_idx, _method = self._aligned_sample_now()
+            if start_idx is None:
+                self._reset_model_test()
+                return
+            self._model_test_say_start_float = start_float
+            self._model_test_say_start_idx = start_idx
+            self._model_test_phase = "say"
+            self._model_test_deadline_ns = time.perf_counter_ns() + int(COLLECTION_SAY_S * 1_000_000_000)
+            return
+
+        capture = self._capture_model_test_window()
+        self._model_test_captures.append(capture)
+        self._model_test_say_start_idx = None
+        self._model_test_say_start_float = None
+
+        if self._model_test_trial < self._model_test_trials_total:
+            self._model_test_trial += 1
+            self._model_test_phase = "countdown"
+            self._model_test_deadline_ns = time.perf_counter_ns() + int(COLLECTION_BEFORE_S * 1_000_000_000)
+            return
+
+        self._model_test_deadline_ns = None
+        self._finalize_model_test()
+
+    def start_model_test(self) -> None:
+        if self._recorder.enabled:
+            raise RuntimeError("Stop session recording before running model test")
+        if self._trial_state != TrialState.IDLE:
+            raise RuntimeError("Finish the active trial before running model test")
+        if self._collect_phase not in ("disabled", "pick_word"):
+            raise RuntimeError("Finish collection before running model test")
+        if self._alignment_test_busy():
+            raise RuntimeError("Finish alignment test before running model test")
+        if self._model_test_busy():
+            raise RuntimeError("Model test already running")
+        _event_host_ns, aligned_float, aligned_idx, _method = self._aligned_sample_now()
+        if aligned_idx is None:
+            raise RuntimeError("No samples yet; wait for EEG stream")
+
+        self._load_model_for_test()
+        self._reset_model_test()
+        self._model_test_trials_total = MODEL_TEST_TRIALS
+        self._model_test_trial = 1
+        self._model_test_phase = "countdown"
+        self._model_test_deadline_ns = time.perf_counter_ns() + int(COLLECTION_BEFORE_S * 1_000_000_000)
+
+    def clear_model_test(self) -> None:
+        self._reset_model_test()
+
+    def model_test_result(self) -> dict[str, Any]:
+        if self._model_test_phase != "result" or self._model_test_result is None:
+            raise RuntimeError("No model test result available")
+        return self._model_test_result
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -1248,6 +1517,7 @@ class AcquisitionService:
             "default_fixed_scale_uv": DEFAULT_FIXED_SCALE_UV,
             "collect": self._collect_status(),
             "alignment_test": self._alignment_test_status(),
+            "model_test": self._model_test_status(),
         }
 
     def waveform(
@@ -1335,6 +1605,8 @@ class AcquisitionService:
     def start_recording(self, base_dir: Path) -> Path:
         if self._alignment_test_busy():
             raise RuntimeError("Wait for alignment test to finish before recording")
+        if self._model_test_busy():
+            raise RuntimeError("Wait for model test to finish before recording")
         _event_host_ns, aligned_float, aligned_idx, method = self._aligned_sample_now()
         session_dir = self._recorder.start(base_dir)
         self._last_session_dir = session_dir
@@ -1644,6 +1916,20 @@ def create_app(service: AcquisitionService) -> Flask:
     @app.get("/alignment-test/result")
     def alignment_test_result() -> Any:
         return jsonify(service.alignment_test_result())
+
+    @app.post("/model-test/start")
+    def start_model_test() -> Any:
+        service.start_model_test()
+        return jsonify(service.status()["model_test"])
+
+    @app.post("/model-test/clear")
+    def clear_model_test() -> Any:
+        service.clear_model_test()
+        return jsonify(service.status()["model_test"])
+
+    @app.get("/model-test/result")
+    def model_test_result() -> Any:
+        return jsonify(service.model_test_result())
 
     @app.post("/events/marker")
     def marker() -> Any:

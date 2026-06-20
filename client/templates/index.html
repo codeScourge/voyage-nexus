@@ -23,6 +23,7 @@
       </label>
       <button type="button" id="btn-record" class="primary">Start Session Recording</button>
       <button type="button" id="btn-alignment-test">Alignment Test</button>
+      <button type="button" id="btn-model-test">Test Model</button>
     </section>
 
     <section id="collect-panel" class="collect-panel hidden">
@@ -55,6 +56,12 @@
       <div id="alignment-prompt-sub" class="collect-prompt-sub"></div>
     </div>
 
+    <div id="model-test-prompt" class="collect-prompt model-test-prompt hidden" aria-live="polite">
+      <div id="model-test-prompt-word" class="collect-prompt-word">Model test</div>
+      <div id="model-test-prompt-main" class="collect-prompt-main"></div>
+      <div id="model-test-prompt-sub" class="collect-prompt-sub"></div>
+    </div>
+
     <section id="alignment-result" class="alignment-result hidden" aria-live="polite">
       <div class="alignment-result-head">
         <h2>Labeled blink window</h2>
@@ -63,6 +70,15 @@
       </div>
       <p class="alignment-result-hint">Shaded region = backend label (same timing as collection “say” window). Blink artifacts should appear inside it.</p>
       <div id="alignment-result-plots" class="alignment-result-plots"></div>
+    </section>
+
+    <section id="model-test-result" class="model-test-result hidden" aria-live="polite">
+      <div class="model-test-result-head">
+        <h2>Model predictions</h2>
+        <p id="model-test-result-meta" class="model-test-result-meta"></p>
+        <button type="button" id="btn-model-test-dismiss">Dismiss</button>
+      </div>
+      <div id="model-test-result-rows" class="model-test-result-rows"></div>
     </section>
 
     <div id="word-switch-flash" class="word-switch-flash" aria-hidden="true"></div>
