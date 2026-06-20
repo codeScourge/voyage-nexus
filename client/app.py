@@ -5,6 +5,7 @@ import csv
 import json
 import queue
 import random
+import signal
 import struct
 import sys
 import threading
@@ -118,11 +119,11 @@ def channel_order_dict(channel_count: int) -> dict[str, str]:
 
 
 def new_session_dir_name(now: datetime | None = None) -> str:
-    """e.g. session_a3f8b2c1_2026-06-15_21-27-46"""
+    """e.g. 2026-06-15_21-27-46_session_a3f8b2c1"""
     when = now or datetime.now()
     uid = uuid.uuid4().hex[:8]
     stamp = when.strftime("%Y-%m-%d_%H-%M-%S")
-    return f"session_{uid}_{stamp}"
+    return f"{stamp}_session_{uid}"
 
 
 def bands_for_channel(channel_idx: int) -> tuple[dict[str, Any], ...]:
@@ -376,6 +377,13 @@ class TimeAligner:
         if sample_float is None:
             return None
         return int(round(sample_float))
+
+
+def say_window_sample_end(start_idx: int, start_float: float) -> tuple[int, float]:
+    """End sample for a collection say window (COLLECTION_SAY_S at SAMPLE_RATE_HZ)."""
+    end_float = start_float + COLLECTION_SAY_S * SAMPLE_RATE_HZ
+    end_idx = TimeAligner.quantize_sample_index(end_float) or int(round(end_float))
+    return end_idx, end_float
 
 
 class SessionRecorder:
@@ -651,6 +659,8 @@ class AcquisitionService:
         self._rail_history_idx = 0
         self._rail_history_filled = 0
         self._lock = threading.Lock()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_done = False
 
         self._pump_thread = threading.Thread(target=self._pump, daemon=True)
         self._pump_thread.start()
@@ -670,13 +680,43 @@ class AcquisitionService:
             self._tick_collect()
             self._tick_alignment_test()
 
-    def shutdown(self) -> None:
-        self._pump_stop.set()
-        self._reader.stop()
-        self._speech_recorder.stop()
+        while True:
+            try:
+                rx_frame = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            self._push_frame(rx_frame)
+
+    def _finalize_recording_on_shutdown(self, reason: str) -> None:
+        if not self._recorder.enabled:
+            return
+        _event_host_ns, aligned_float, aligned_idx, method = self._aligned_sample_now()
+        self._recorder.log_event(
+            event_type="forced_shutdown",
+            sample_index_start=aligned_idx,
+            sample_index_start_float=aligned_float,
+            alignment_method=method,
+            payload={"source": "host", "reason": reason},
+        )
+        session_dir = self._recorder.session_dir
         self._recorder.stop()
+        self._reset_collect()
+        if session_dir:
+            self._last_session_dir = session_dir
+
+    def shutdown(self, *, recording_shutdown_reason: str = "shutdown") -> None:
+        with self._shutdown_lock:
+            if self._shutdown_done:
+                return
+            self._shutdown_done = True
+
+        self._reader.stop()
+        self._pump_stop.set()
+        self._pump_thread.join(timeout=2.0)
+        self._speech_recorder.stop()
+        if self._recorder.enabled:
+            self._finalize_recording_on_shutdown(recording_shutdown_reason)
         self._reader.join(timeout=1.0)
-        self._pump_thread.join(timeout=1.0)
 
     def _aligned_sample_now(self) -> tuple[int, Optional[float], Optional[int], str]:
         event_host_ns = time.perf_counter_ns()
@@ -896,11 +936,14 @@ class AcquisitionService:
         _event_host_ns, aligned_float, aligned_idx, method = self._aligned_sample_now()
         if aligned_idx is None:
             return
+        end_idx, end_float = say_window_sample_end(aligned_idx, aligned_float)
         self._recorder.log_event(
             event_type="silent_speech_word",
             label_text=self._collect_word,
             sample_index_start=aligned_idx,
             sample_index_start_float=aligned_float,
+            sample_index_end=end_idx,
+            sample_index_end_float=end_float,
             alignment_method=method,
             payload={
                 "collection_block_id": self._collect_block_id,
@@ -1669,6 +1712,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _install_shutdown_handlers(service: AcquisitionService) -> None:
+    def _on_signal(signum: int, _frame: Any) -> None:
+        try:
+            sig_name = signal.Signals(signum).name
+        except ValueError:
+            sig_name = str(signum)
+        service.shutdown(recording_shutdown_reason=sig_name)
+        raise SystemExit(128 + signum if signum != signal.SIGINT else 130)
+
+    for sig in (signal.SIGINT, getattr(signal, "SIGTERM", None)):
+        if sig is not None:
+            signal.signal(sig, _on_signal)
+
+
 def main() -> int:
     args = parse_args()
     if args.test:
@@ -1684,6 +1741,7 @@ def main() -> int:
             debug_bands=args.debug_bands,
         )
     app = create_app(service)
+    _install_shutdown_handlers(service)
     url = f"http://127.0.0.1:{args.http_port}/"
     print(f"Woodside monitor GUI: {url}")
     if args.test:

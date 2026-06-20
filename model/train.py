@@ -1,351 +1,544 @@
-"""Load labelled session windows and build train / val / test splits.
-
-Val uses only sessions that never appear in train. Test mixes held-out events
-from train sessions with samples from new sessions that are not used for val.
-"""
-
 from __future__ import annotations
 
-import argparse
-from collections import defaultdict
-from dataclasses import dataclass
+import os
+import random
+import re
+import uuid
+from datetime import datetime
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
-from scipy import stats
-from torch.utils.data import Subset
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
-from _viewer_core import discover_sessions
-from data import SessionEventDataset, load_session_channels
+from _preprocessors import EEG_CHANNELS, EMG_CHANNELS
+from data import load_dataset_splits
 
+# ---
+SEED = 42
 
-@dataclass(frozen=True, slots=True)
-class DatasetSplits:
-    dataset: SessionEventDataset
-    train: Subset
-    val: Subset
-    test: Subset
-    train_indices: np.ndarray
-    val_indices: np.ndarray
-    test_indices: np.ndarray
-    train_sessions: tuple[Path, ...]
-    val_sessions: tuple[Path, ...]
-    test_new_sessions: tuple[Path, ...]
+def seed_everything(seed: int = 0, deterministic: bool = True) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
 
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    if torch.backends.mps.is_available():
+        torch.mps.manual_seed(seed)
 
-def split_sample_indices(
-    sessions: list[Path],
-    per_sample_sessions: Sequence[Path],
-    *,
-    seed: int = 42,
-    train_session_fraction: float = 0.6,
-    val_session_fraction_of_new: float = 0.5,
-    test_event_fraction: float = 0.15,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[Path, ...], tuple[Path, ...], tuple[Path, ...]]:
-    """Return train/val/test sample indices and the session groups used for each."""
-    if not sessions:
-        raise ValueError("At least one session is required")
-    if not (0.0 < train_session_fraction < 1.0):
-        raise ValueError("train_session_fraction must be between 0 and 1")
-    if not (0.0 < val_session_fraction_of_new <= 1.0):
-        raise ValueError("val_session_fraction_of_new must be between 0 and 1")
-    if not (0.0 < test_event_fraction < 1.0):
-        raise ValueError("test_event_fraction must be between 0 and 1")
-
-    session_to_indices: dict[Path, list[int]] = defaultdict(list)
-    for index, session_dir in enumerate(per_sample_sessions):
-        session_to_indices[Path(session_dir)].append(index)
-
-    rng = np.random.default_rng(seed)
-    session_order = rng.permutation(len(sessions))
-
-    n_train_sessions = int(round(len(sessions) * train_session_fraction))
-    if len(sessions) > 1:
-        n_train_sessions = max(1, min(n_train_sessions, len(sessions) - 1))
-    else:
-        n_train_sessions = 1
-
-    train_sessions = {sessions[int(i)] for i in session_order[:n_train_sessions]}
-    new_sessions = [sessions[int(i)] for i in session_order[n_train_sessions:]]
-
-    val_sessions: set[Path] = set()
-    test_new_sessions: set[Path] = set()
-    if new_sessions:
-        n_val_sessions = max(1, int(round(len(new_sessions) * val_session_fraction_of_new)))
-        n_val_sessions = min(n_val_sessions, len(new_sessions))
-        val_sessions = set(new_sessions[:n_val_sessions])
-        test_new_sessions = set(new_sessions[n_val_sessions:])
-
-    train_indices: list[int] = []
-    val_indices: list[int] = []
-    test_indices: list[int] = []
-
-    for session_dir in sorted(val_sessions):
-        val_indices.extend(session_to_indices[session_dir])
-
-    for session_dir in sorted(test_new_sessions):
-        test_indices.extend(session_to_indices[session_dir])
-
-    for session_dir in sorted(train_sessions):
-        indices = session_to_indices.get(session_dir, [])
-        if not indices:
-            continue
-        if len(indices) == 1:
-            train_indices.extend(indices)
-            continue
-
-        event_order = rng.permutation(len(indices))
-        n_test = max(1, int(round(len(indices) * test_event_fraction)))
-        n_test = min(n_test, len(indices) - 1)
-        test_indices.extend(indices[int(i)] for i in event_order[:n_test])
-        train_indices.extend(indices[int(i)] for i in event_order[n_test:])
-
-    return (
-        np.asarray(train_indices, dtype=np.int64),
-        np.asarray(val_indices, dtype=np.int64),
-        np.asarray(test_indices, dtype=np.int64),
-        tuple(sorted(train_sessions)),
-        tuple(sorted(val_sessions)),
-        tuple(sorted(test_new_sessions)),
-    )
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True)
+        if torch.cuda.is_available():
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 
-def load_dataset_splits(
-    recordings_path: Path,
-    *,
-    pre_ms: float = 300.0,
-    post_ms: float = 700.0,
-    seed: int = 42,
-    train_session_fraction: float = 0.6,
-    val_session_fraction_of_new: float = 0.5,
-    test_event_fraction: float = 0.15,
-) -> DatasetSplits:
-    sessions = discover_sessions(recordings_path)
-    dataset = SessionEventDataset(
-        sessions,
-        pre_ms=pre_ms,
-        post_ms=post_ms,
-    )
-    (
-        train_indices,
-        val_indices,
-        test_indices,
-        train_sessions,
-        val_sessions,
-        test_new_sessions,
-    ) = split_sample_indices(
-        sessions,
-        dataset._session_dirs,
-        seed=seed,
-        train_session_fraction=train_session_fraction,
-        val_session_fraction_of_new=val_session_fraction_of_new,
-        test_event_fraction=test_event_fraction,
-    )
-    return DatasetSplits(
-        dataset=dataset,
-        train=Subset(dataset, train_indices.tolist()),
-        val=Subset(dataset, val_indices.tolist()),
-        test=Subset(dataset, test_indices.tolist()),
-        train_indices=train_indices,
-        val_indices=val_indices,
-        test_indices=test_indices,
-        train_sessions=train_sessions,
-        val_sessions=val_sessions,
-        test_new_sessions=test_new_sessions,
-    )
+def get_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
-def print_split_summary(splits: DatasetSplits) -> None:
-    print(f"train: {len(splits.train)} samples from {len(splits.train_sessions)} sessions")
-    print(f"val:   {len(splits.val)} samples from {len(splits.val_sessions)} new sessions")
-    print(
-        f"test:  {len(splits.test)} samples "
-        f"({len(splits.test_new_sessions)} new sessions + held-out events from train sessions)"
-    )
+# --- setup
+device = get_device()
+CHECKPOINT_DIR = Path(__file__).resolve().parent / "checkpoints"
+CHECKPOINT_SAVE_INTERVAL = 30
 
 
-def window_amplitude_features(window: np.ndarray) -> dict[str, float]:
-    """Simple per-window amplitude stats averaged across channels."""
-    return {
-        "rms": float(np.sqrt(np.mean(window**2))),
-        "mean_abs": float(np.mean(np.abs(window))),
-        "peak_to_peak": float(np.mean(np.ptp(window, axis=0))),
-        "std": float(np.mean(np.std(window, axis=0))),
-    }
+# --- architecture
+class ModalityBranch(nn.Module):
+    """EEGNet Block 1: temporal conv -> depthwise spatial conv.
 
+    Input:  (B, 1, C, T)
+    Output: (B, D*F1, 1, T)   -- spatial axis collapsed, time preserved
+    """
 
-def _outside_window_starts(
-    n_rows: int,
-    window_len: int,
-    inside_mask: np.ndarray,
-) -> np.ndarray:
-    """Row indices where a window of length window_len lies entirely outside events."""
-    if window_len > n_rows:
-        return np.array([], dtype=np.int64)
-    starts: list[int] = []
-    for start in range(n_rows - window_len + 1):
-        if not inside_mask[start : start + window_len].any():
-            starts.append(start)
-    return np.asarray(starts, dtype=np.int64)
-
-
-def collect_inside_outside_features(
-    dataset: SessionEventDataset,
-    *,
-    seed: int = 42,
-) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-    """Collect per-window amplitude features inside labelled windows vs outside them."""
-    batch = dataset.batch
-    window_len = batch.window_len
-    pre_samples = dataset.pre_samples
-    post_samples = dataset.post_samples
-
-    inside_by_feature: dict[str, list[float]] = defaultdict(list)
-    outside_by_feature: dict[str, list[float]] = defaultdict(list)
-
-    for window in batch.x:
-        for name, value in window_amplitude_features(window).items():
-            inside_by_feature[name].append(value)
-
-    indices_by_session: dict[Path, list[int]] = defaultdict(list)
-    for index, session_dir in enumerate(dataset._session_dirs):
-        indices_by_session[Path(session_dir)].append(index)
-
-    rng = np.random.default_rng(seed)
-    for session_dir, sample_indices in indices_by_session.items():
-        session = load_session_channels(session_dir)
-        index_to_row = {
-            int(sample_idx): row for row, sample_idx in enumerate(session.sample_indices)
-        }
-
-        inside_mask = np.zeros(session.frame_count, dtype=bool)
-        for sample_index in batch.center_sample_index[sample_indices]:
-            row_idx = index_to_row.get(int(sample_index))
-            if row_idx is None:
-                continue
-            start = row_idx - pre_samples
-            end = row_idx + post_samples + 1
-            if start < 0 or end > session.frame_count:
-                continue
-            inside_mask[start:end] = True
-
-        starts = _outside_window_starts(session.frame_count, window_len, inside_mask)
-        if starts.size == 0:
-            continue
-
-        n_outside = len(sample_indices)
-        chosen = rng.choice(starts, size=n_outside, replace=starts.size < n_outside)
-        for start in chosen:
-            window = session.channels[int(start) : int(start) + window_len, :]
-            for name, value in window_amplitude_features(window).items():
-                outside_by_feature[name].append(value)
-
-    return {
-        name: (
-            np.asarray(inside_by_feature[name], dtype=np.float64),
-            np.asarray(outside_by_feature.get(name, []), dtype=np.float64),
+    def __init__(self, n_channels: int, F1: int, D: int, kernel_length: int):
+        super().__init__()
+        # temporal conv: 'same' padding so T is preserved. one shared kernel
+        # across all channels, F1 of them.
+        self.temporal = nn.Conv2d(
+            1, F1, (1, kernel_length),
+            padding=(0, kernel_length // 2), bias=False,
         )
-        for name in inside_by_feature
+        self.bn1 = nn.BatchNorm2d(F1)
+
+        # depthwise spatial conv: kernel (C, 1), valid padding -> collapses
+        # channel axis to 1. groups=F1 ties each spatial filter to one temporal
+        # map. depth multiplier D via out_channels = D*F1.
+        self.spatial = nn.Conv2d(
+            F1, D * F1, (n_channels, 1),
+            groups=F1, bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(D * F1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.bn1(self.temporal(x))          # (B, F1, C, T)
+        x = self.bn2(self.spatial(x))           # (B, D*F1, 1, T)
+        x = F.elu(x)
+        return x
+
+
+class TimeAvgPool(nn.Module):
+    """Pool along the time axis to a fixed length without AdaptiveAvgPool2d.
+
+    MPS does not implement adaptive pooling when input length is not divisible
+    by the target length (pytorch#96056). Trim trailing samples if needed, then
+    use fixed-kernel average pooling.
+    """
+
+    def __init__(self, out_len: int):
+        super().__init__()
+        self.out_len = out_len
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, 1, T)
+        t = x.shape[-1]
+        out = self.out_len
+        if t == out:
+            return x
+        if t < out:
+            return F.interpolate(x, size=(1, out), mode="linear", align_corners=False)
+
+        trim = t - (t % out)
+        x = x[..., :trim]
+        stride = trim // out
+        return F.avg_pool2d(x, kernel_size=(1, stride), stride=(1, stride))
+
+
+class IntermediateFusionEEGNet(nn.Module):
+    """Two EEGNet Block-1 branches (EEG, EMG) fused before the separable conv.
+
+    Fusion = concat along feature-map axis once both branches are
+    (B, D*F1, 1, T). The shared separable conv then learns cross-modal
+    temporal summaries and mixes EEG+EMG feature maps together.
+    """
+
+    def __init__(
+        self,
+        n_eeg: int,
+        n_emg: int,
+        n_classes: int,
+        T: int,
+        F1: int = 8,
+        D: int = 2,
+        F2: int = 16,
+        kern_eeg: int = 64,   # half the sampling rate per the paper
+        kern_emg: int = 64,   # tune: EMG carries higher-freq content
+        sep_kernel: int = 16,
+        p_drop: float = 0.5,
+    ):
+        super().__init__()
+        self.eeg_branch = ModalityBranch(n_eeg, F1, D, kern_eeg)
+        self.emg_branch = ModalityBranch(n_emg, F1, D, kern_emg)
+
+        fused_maps = 2 * (D * F1)  # concat of both branches
+
+        pool1_out = max(1, T // 4)
+        pool2_out = max(1, pool1_out // 8)
+        self.pool1_out = pool1_out
+        self.pool2_out = pool2_out
+
+        # fixed pools handle short windows and avoid MPS adaptive-pool limits
+        self.pool1 = TimeAvgPool(pool1_out)
+        self.drop1 = nn.Dropout(p_drop)
+
+        # --- Block 2: separable conv on the FUSED maps ---
+        # depthwise temporal part: per-map (1, sep_kernel) summary, 'same' pad
+        self.sep_depth = nn.Conv2d(
+            fused_maps, fused_maps, (1, sep_kernel),
+            padding=(0, sep_kernel // 2), groups=fused_maps, bias=False,
+        )
+        # pointwise: mix all fused maps -> F2 (this is where EEG and EMG
+        # feature maps actually combine)
+        self.sep_point = nn.Conv2d(fused_maps, F2, (1, 1), bias=False)
+        self.bn3 = nn.BatchNorm2d(F2)
+        self.pool2 = TimeAvgPool(pool2_out)
+        self.drop2 = nn.Dropout(p_drop)
+
+        self.classifier = nn.Linear(F2 * pool2_out, n_classes)
+
+    def forward(self, eeg: torch.Tensor, emg: torch.Tensor) -> torch.Tensor:
+        e = self.eeg_branch(eeg)   # (B, D*F1, 1, T)
+        m = self.emg_branch(emg)   # (B, D*F1, 1, T)
+
+        # align time length in case kernels/padding differ by a sample
+        t = min(e.shape[-1], m.shape[-1])
+        e, m = e[..., :t], m[..., :t]
+
+        x = torch.cat([e, m], dim=1)   # (B, 2*D*F1, 1, T) <-- intermediate fusion
+        x = self.drop1(self.pool1(x))
+
+        x = self.sep_point(self.sep_depth(x))
+        x = F.elu(self.bn3(x))
+        x = self.drop2(self.pool2(x))
+
+        x = torch.flatten(x, 1)
+        return self.classifier(x)
+
+
+# --- dataset adapter
+class FusionDataset(torch.utils.data.Dataset):
+    """Wraps the split so __getitem__ returns (eeg, emg, label) batched-ready."""
+
+    def __init__(self, base_dataset, indices, label_to_idx):
+        self.base = base_dataset
+        self.indices = list(indices)
+        self.label_to_idx = label_to_idx
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, i: int):
+        sample = self.base[self.indices[i]]
+        x = sample["x"]
+        x = (x - x.mean(dim=0, keepdim=True)) / (x.std(dim=0, keepdim=True) + 1e-6)
+                                
+        eeg = x[:, EEG_CHANNELS].T.unsqueeze(0)  # (1, C_eeg, T)
+        emg = x[:, EMG_CHANNELS].T.unsqueeze(0)  # (1, C_emg, T)
+        y = self.label_to_idx[sample["label"]]
+        return eeg, emg, torch.tensor(y, dtype=torch.long)
+
+
+def build_label_map(base_dataset, indices) -> dict:
+    labels = sorted({base_dataset[i]["label"] for i in indices})
+    return {lab: idx for idx, lab in enumerate(labels)}
+
+
+# --- train
+def construct_model(splits):
+    label_to_idx = build_label_map(splits.dataset, splits.train.indices)
+    n_classes = len(label_to_idx)
+
+    # infer shapes from one sample
+    eeg0, emg0, _ = FusionDataset(splits.dataset, splits.train.indices, label_to_idx)[0]
+    n_eeg, T = eeg0.shape[1], eeg0.shape[2]
+    n_emg = emg0.shape[1]
+
+    print(eeg0.shape, emg0.shape, eeg0, emg0)
+
+    model = IntermediateFusionEEGNet(
+        n_eeg=n_eeg, n_emg=n_emg, n_classes=n_classes, T=T,
+    ).to(device)
+
+    return model, label_to_idx, {"n_eeg": n_eeg, "n_emg": n_emg, "n_classes": n_classes, "T": T}
+
+
+RUN_DIR_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}")
+
+
+def new_run_dir_name(now: datetime | None = None) -> str:
+    """e.g. 2026-06-20_01-44-45_run_a3f8b2c1 (mirrors client recording folders)."""
+    when = now or datetime.now()
+    uid = uuid.uuid4().hex[:8]
+    stamp = when.strftime("%Y-%m-%d_%H-%M-%S")
+    return f"{stamp}_run_{uid}"
+
+
+def create_run_dir(root: Path = CHECKPOINT_DIR) -> Path:
+    base_name = new_run_dir_name()
+    run_dir = root / base_name
+    suffix = 2
+    while run_dir.exists():
+        run_dir = root / f"{base_name}_{suffix:02d}"
+        suffix += 1
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def latest_run_dir(root: Path = CHECKPOINT_DIR) -> Path | None:
+    runs = [p for p in root.iterdir() if p.is_dir() and RUN_DIR_NAME_RE.match(p.name)]
+    if not runs:
+        return None
+    return max(runs, key=lambda p: p.name)
+
+
+def default_checkpoint_path(kind: str = "best", root: Path = CHECKPOINT_DIR) -> Path:
+    run_dir = latest_run_dir(root)
+    if run_dir is not None:
+        path = run_dir / f"{kind}.pt"
+        if path.exists():
+            return path
+    legacy = root / "fusion_eegnet.pt"
+    return legacy if legacy.exists() else (run_dir / f"{kind}.pt" if run_dir else legacy)
+
+
+# Legacy alias for scripts that import CHECKPOINT_PATH.
+CHECKPOINT_PATH = default_checkpoint_path("best")
+
+
+def save_checkpoint(
+    path: Path,
+    model: nn.Module,
+    label_to_idx: dict,
+    model_config: dict,
+    *,
+    epoch: int,
+    train_loss: float,
+    train_acc: float,
+    val_loss: float,
+    val_acc: float,
+    best_acc: float,
+    total_epochs: int,
+    kind: str,
+    state_dict: dict | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state_dict": state_dict if state_dict is not None else model.state_dict(),
+            "label_to_idx": label_to_idx,
+            "model_config": model_config,
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "train_acc": train_acc,
+            "val_loss": val_loss,
+            "val_acc": val_acc,
+            "best_acc": best_acc,
+            "epochs": total_epochs,
+            "kind": kind,
+            "device": str(device),
+        },
+        path,
+    )
+    print(f"saved checkpoint ({kind}, epoch {epoch}) -> {path}")
+
+
+def plot_training_history(history: dict[str, list[float]], path: Path) -> None:
+    import matplotlib.pyplot as plt
+
+    epochs = range(1, len(history["train_loss"]) + 1)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    fig, (ax_loss, ax_acc) = plt.subplots(1, 2, figsize=(12, 5))
+
+    ax_loss.plot(epochs, history["train_loss"], label="train loss")
+    ax_loss.plot(epochs, history["val_loss"], label="val loss")
+    ax_loss.set_xlabel("epoch")
+    ax_loss.set_ylabel("loss")
+    ax_loss.set_title("Training and validation loss")
+    ax_loss.legend()
+    ax_loss.grid(True, alpha=0.3)
+
+    ax_acc.plot(epochs, history["train_acc"], label="train acc")
+    ax_acc.plot(epochs, history["val_acc"], label="val acc")
+    ax_acc.set_xlabel("epoch")
+    ax_acc.set_ylabel("accuracy")
+    ax_acc.set_title("Training and validation accuracy")
+    ax_acc.set_ylim(0.0, 1.0)
+    ax_acc.legend()
+    ax_acc.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"saved training plot -> {path}")
+
+
+
+def train(
+    model,
+    splits,
+    label_to_idx,
+    model_config,
+    epochs=100,
+    batch_size=32,
+    lr=1e-3,
+    *,
+    run_dir: Path | None = None,
+    save_interval: int = CHECKPOINT_SAVE_INTERVAL,
+):
+    n_classes = len(label_to_idx)
+
+    model = model.to(device)
+    run_dir = run_dir or create_run_dir()
+    print(f"run dir: {run_dir}")
+
+    train_ds = FusionDataset(splits.dataset, splits.train.indices, label_to_idx)
+    val_ds = FusionDataset(splits.dataset, splits.val.indices, label_to_idx)
+
+    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
+    val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+
+    # class weights for imbalance (inverse frequency)
+    counts = torch.zeros(n_classes)
+    for i in train_ds.indices:
+        counts[label_to_idx[splits.dataset[i]["label"]]] += 1
+    weights = (counts.sum() / (counts * n_classes)).to(device)
+
+    crit = nn.CrossEntropyLoss(weight=weights)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+
+    best_acc = 0.0
+    best_state: dict | None = None
+    best_metrics = {
+        "epoch": 0,
+        "train_loss": 0.0,
+        "train_acc": 0.0,
+        "val_loss": 0.0,
+        "val_acc": 0.0,
+    }
+    history: dict[str, list[float]] = {
+        "train_loss": [],
+        "val_loss": [],
+        "train_acc": [],
+        "val_acc": [],
     }
 
+    def write_checkpoint(
+        path: Path,
+        *,
+        kind: str,
+        epoch_num: int,
+        train_loss: float,
+        train_acc: float,
+        val_loss: float,
+        val_acc: float,
+        state_dict: dict | None = None,
+    ) -> None:
+        save_checkpoint(
+            path,
+            model,
+            label_to_idx,
+            model_config,
+            epoch=epoch_num,
+            train_loss=train_loss,
+            train_acc=train_acc,
+            val_loss=val_loss,
+            val_acc=val_acc,
+            best_acc=best_acc,
+            total_epochs=epochs,
+            kind=kind,
+            state_dict=state_dict,
+        )
 
-@dataclass(frozen=True, slots=True)
-class AmplitudeStatResult:
-    feature: str
-    inside_mean: float
-    outside_mean: float
-    cohens_d: float
-    welch_t_p: float
-    mannwhitney_p: float
+    epoch_bar = tqdm(range(epochs), desc="epochs", unit="epoch")
+    for epoch in epoch_bar:
+        model.train()
+        running = 0.0
+        train_correct = train_total = 0
+        for eeg, emg, y in tqdm(train_dl, desc="train", leave=False):
+            eeg, emg, y = eeg.to(device), emg.to(device), y.to(device)
+            opt.zero_grad()
+            logits = model(eeg, emg)
+            loss = crit(logits, y)
+            loss.backward()
+            opt.step()
+            running += loss.item() * y.size(0)
+            pred = logits.argmax(1)
+            train_correct += (pred == y).sum().item()
+            train_total += y.size(0)
 
+        train_loss = running / len(train_ds)
+        train_acc = train_correct / train_total if train_total else 0.0
 
-def _cohens_d(a: np.ndarray, b: np.ndarray) -> float:
-    if a.size < 2 or b.size < 2:
-        return float("nan")
-    pooled = np.sqrt(((a.size - 1) * a.var(ddof=1) + (b.size - 1) * b.var(ddof=1)) / (a.size + b.size - 2))
-    if pooled == 0:
-        return 0.0
-    return float((a.mean() - b.mean()) / pooled)
+        model.eval()
+        val_running = 0.0
+        correct = total = 0
+        for eeg, emg, y in tqdm(val_dl, desc="val", leave=False):
+            eeg, emg, y = eeg.to(device), emg.to(device), y.to(device)
+            with torch.no_grad():
+                logits = model(eeg, emg)
+                val_running += crit(logits, y).item() * y.size(0)
+                pred = logits.argmax(1)
+            correct += (pred == y).sum().item()
+            total += y.size(0)
+        val_loss = val_running / len(val_ds) if len(val_ds) else 0.0
+        acc = correct / total if total else 0.0
+        epoch_num = epoch + 1
 
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["train_acc"].append(train_acc)
+        history["val_acc"].append(acc)
 
-def run_amplitude_stat_tests(
-    inside_outside: dict[str, tuple[np.ndarray, np.ndarray]],
-) -> list[AmplitudeStatResult]:
-    results: list[AmplitudeStatResult] = []
-    for feature, (inside, outside) in inside_outside.items():
-        if inside.size == 0 or outside.size == 0:
-            continue
-        _, welch_p = stats.ttest_ind(inside, outside, equal_var=False)
-        _, mw_p = stats.mannwhitneyu(inside, outside, alternative="two-sided")
-        results.append(
-            AmplitudeStatResult(
-                feature=feature,
-                inside_mean=float(inside.mean()),
-                outside_mean=float(outside.mean()),
-                cohens_d=_cohens_d(inside, outside),
-                welch_t_p=float(welch_p),
-                mannwhitney_p=float(mw_p),
+        if acc >= best_acc:
+            best_acc = acc
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_metrics = {
+                "epoch": epoch_num,
+                "train_loss": train_loss,
+                "train_acc": train_acc,
+                "val_loss": val_loss,
+                "val_acc": acc,
+            }
+            write_checkpoint(
+                run_dir / "best.pt",
+                kind="best",
+                epoch_num=epoch_num,
+                train_loss=train_loss,
+                train_acc=train_acc,
+                val_loss=val_loss,
+                val_acc=acc,
+                state_dict=best_state,
             )
+
+        if save_interval > 0 and epoch_num % save_interval == 0:
+            write_checkpoint(
+                run_dir / f"epoch_{epoch_num:04d}.pt",
+                kind="epoch",
+                epoch_num=epoch_num,
+                train_loss=train_loss,
+                train_acc=train_acc,
+                val_loss=val_loss,
+                val_acc=acc,
+            )
+
+        epoch_bar.set_postfix(
+            train_loss=f"{train_loss:.4f}",
+            val_loss=f"{val_loss:.4f}",
+            train_acc=f"{train_acc:.4f}",
+            val_acc=f"{acc:.4f}",
+            best=f"{best_acc:.4f}",
         )
-    return results
 
-
-def print_amplitude_stat_tests(results: Sequence[AmplitudeStatResult]) -> None:
-    if not results:
-        print("No amplitude stat tests (missing inside or outside windows).")
-        return
-
-    print("\nInside labelled windows vs outside (per-window amplitude features):")
-    print(
-        f"{'feature':<14} {'inside':>10} {'outside':>10} {'d':>8} "
-        f"{'welch_p':>10} {'mw_p':>10}"
+    write_checkpoint(
+        run_dir / "last.pt",
+        kind="last",
+        epoch_num=epochs,
+        train_loss=history["train_loss"][-1],
+        train_acc=history["train_acc"][-1],
+        val_loss=history["val_loss"][-1],
+        val_acc=history["val_acc"][-1],
     )
-    for row in results:
-        print(
-            f"{row.feature:<14} "
-            f"{row.inside_mean:10.3f} {row.outside_mean:10.3f} {row.cohens_d:8.3f} "
-            f"{row.welch_t_p:10.4g} {row.mannwhitney_p:10.4g}"
+
+    if best_state is not None:
+        write_checkpoint(
+            run_dir / "best.pt",
+            kind="best",
+            epoch_num=best_metrics["epoch"],
+            train_loss=best_metrics["train_loss"],
+            train_acc=best_metrics["train_acc"],
+            val_loss=best_metrics["val_loss"],
+            val_acc=best_metrics["val_acc"],
+            state_dict=best_state,
         )
+        model.load_state_dict(best_state)
+
+    plot_training_history(history, run_dir / "training_history.png")
+
+    return model, history, run_dir
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Load EEG event windows and build train/val/test splits.")
-    parser.add_argument(
-        "recordings",
-        nargs="?",
-        type=Path,
-        default=Path("../client/recordings"),
-        help="Session directory or parent folder containing session_* dirs",
-    )
-    parser.add_argument("--pre-ms", type=float, default=300.0)
-    parser.add_argument("--post-ms", type=float, default=700.0)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--train-session-fraction", type=float, default=0.6)
-    parser.add_argument("--val-session-fraction-of-new", type=float, default=0.5)
-    parser.add_argument("--test-event-fraction", type=float, default=0.15)
-    parser.add_argument(
-        "--stat-tests",
-        action="store_true",
-        help="Compare amplitude features inside labelled windows vs background EEG",
-    )
-    args = parser.parse_args()
-
-    splits = load_dataset_splits(
-        args.recordings,
-        pre_ms=args.pre_ms,
-        post_ms=args.post_ms,
-        seed=args.seed,
-        train_session_fraction=args.train_session_fraction,
-        val_session_fraction_of_new=args.val_session_fraction_of_new,
-        test_event_fraction=args.test_event_fraction,
-    )
-    print_split_summary(splits)
-
-    if args.stat_tests:
-        features = collect_inside_outside_features(splits.dataset, seed=args.seed)
-        print_amplitude_stat_tests(run_amplitude_stat_tests(features))
-
+# --- main
 
 if __name__ == "__main__":
-    main()
+    SPLITS_DIR = Path(__file__).resolve().parent / "splits"
+    seed_everything(SEED)
+    splits = load_dataset_splits(SPLITS_DIR)
+    # print(splits)
+
+    print(f"device: {device}")
+    untrained_model, label_to_idx, model_config = construct_model(splits)
+    print(f"window T={model_config['T']} samples, classes={model_config['n_classes']}")
+    model, history, run_dir = train(untrained_model, splits, label_to_idx, model_config)
+    print(f"artifacts saved under {run_dir}")

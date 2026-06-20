@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import csv
 import json
+import os
+import random
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
 
 from _preprocessors import (
     BandpassConfig,
@@ -21,6 +24,9 @@ from _preprocessors import (
 
 EEG_RECORD_FORMAT = "<QQ32f"
 EEG_RECORD_FORMAT_CODES_LEGACY = "<QQ32i"
+
+# Match client/app.py — duration of each silent_speech_word "say" window.
+COLLECTION_SAY_S = 1.6
 
 EEG_RECORD_DTYPE = np.dtype(
     [
@@ -200,22 +206,27 @@ class EventWindowBatch:
     def channel_count(self) -> int:
         return int(self.x.shape[2]) if self.x.ndim == 3 else 32
 
-
 def build_event_windows(
     session_dir: Path,
     *,
-    pre_ms: float = 300.0,
-    post_ms: float = 700.0,
+    pre_ms: float = 0.0,
+    post_ms: float = 0.0,
+    target_len: Optional[int] = None,
+    pad_value: float = 0.0,
     event_types: Optional[set[str]] = None,
     line_noise: Optional[LineNoiseConfig] = DEFAULT_LINE_NOISE_CONFIG,
     eeg_bandpass: Optional[BandpassConfig] = DEFAULT_EEG_BANDPASS_CONFIG,
     emg_bandpass: Optional[BandpassConfig] = DEFAULT_EMG_BANDPASS_CONFIG,
     filter_order: int = 4,
 ) -> EventWindowBatch:
-    """Cut fixed-length windows from session EEG aligned to event start samples."""
+    """Build fixed-length windows from labelled events.
+
+    Events with sample_index_end use the start..end span (+ optional pre/post padding).
+    When end is missing, infer start + COLLECTION_SAY_S using the session sample rate.
+    All windows are center-cropped/padded to a common target_len.
+    """
     session_dir = Path(session_dir)
     meta = load_session_meta(session_dir)
-    frames = load_eeg_frames(session_dir)
     events = load_events(session_dir)
 
     session_channels = load_session_channels(
@@ -228,11 +239,12 @@ def build_event_windows(
     fs = session_channels.sample_rate_hz
     channels = session_channels.channels
     sample_indices = session_channels.sample_indices
-    pre_samples, post_samples, window_len = window_sample_counts(fs, pre_ms, post_ms)
+    pre_samples = int(round((pre_ms / 1000.0) * fs))
+    post_samples = int(round((post_ms / 1000.0) * fs))
 
     index_to_row = {int(idx): row for row, idx in enumerate(sample_indices)}
 
-    x_windows: list[np.ndarray] = []
+    raw_windows: list[np.ndarray] = []
     labels: list[str] = []
     event_type_list: list[str] = []
     event_ids: list[str] = []
@@ -244,35 +256,75 @@ def build_event_windows(
         if event_types is not None and event_type not in event_types:
             continue
 
-        sample_text = event.get("sample_index_start", "")
-        if not sample_text:
-            continue
-        sample_idx = int(sample_text)
-        row_idx = index_to_row.get(sample_idx)
-        if row_idx is None:
+        label = event.get("label_text", "")
+        if not label:
             skipped += 1
             continue
-        start = row_idx - pre_samples
-        end = row_idx + post_samples + 1
+
+        start_text = event.get("sample_index_start", "")
+        if not start_text:
+            skipped += 1
+            continue
+
+        start_idx = int(start_text)
+        start_row = index_to_row.get(start_idx)
+        if start_row is None:
+            skipped += 1
+            continue
+
+        end_text = event.get("sample_index_end", "")
+        if end_text:
+            end_idx = int(end_text)
+            end_row = index_to_row.get(end_idx)
+            if end_row is None:
+                end_row = start_row + max(0, end_idx - start_idx)
+        else:
+            duration_samples = int(round(COLLECTION_SAY_S * fs))
+            end_idx = start_idx + duration_samples
+            end_row = start_row + duration_samples
+
+        if end_row < start_row:
+            skipped += 1
+            continue
+
+        start = start_row - pre_samples
+        end = end_row + post_samples + 1
         if start < 0 or end > channels.shape[0]:
             skipped += 1
             continue
 
         window = channels[start:end, :]
-        if window.shape[0] != window_len:
+        if window.shape[0] == 0:
             skipped += 1
             continue
 
-        x_windows.append(window)
-        labels.append(event.get("label_text", ""))
+        raw_windows.append(window)
+        labels.append(label)
         event_type_list.append(event_type)
         event_ids.append(event.get("event_id", ""))
-        center_samples.append(sample_idx)
+        center_samples.append(start_idx)
 
-    if x_windows:
-        x = np.stack(x_windows, axis=0).astype(np.float32)
+    if raw_windows:
+        if target_len is None:
+            # median is more robust than max when lengths vary slightly
+            target_len = int(np.median([w.shape[0] for w in raw_windows]))
+            target_len = max(target_len, 1)
+        n_ch = channels.shape[1]
+        fixed = np.full((len(raw_windows), target_len, n_ch), pad_value, dtype=np.float32)
+        for i, w in enumerate(raw_windows):
+            L = w.shape[0]
+            if L >= target_len:
+                # center-crop: trim equally from both ends
+                off = (L - target_len) // 2
+                fixed[i] = w[off:off + target_len, :]
+            else:
+                # center-pad: place window in the middle, pad both sides
+                off = (target_len - L) // 2
+                fixed[i, off:off + L, :] = w
+        x = fixed
     else:
-        x = np.zeros((0, window_len, channels.shape[1]), dtype=np.float32)
+        target_len = target_len or 1
+        x = np.zeros((0, target_len, channels.shape[1]), dtype=np.float32)
 
     return EventWindowBatch(
         x=x,
@@ -286,7 +338,6 @@ def build_event_windows(
         post_samples=post_samples,
         skipped=skipped,
     )
-
 
 def _merge_batches(batches: Sequence[EventWindowBatch]) -> EventWindowBatch:
     if not batches:
@@ -418,3 +469,325 @@ class SessionEventDataset(Dataset):
                 raise KeyError(f"Unknown label '{label}'")
             item["label_idx"] = self._label_to_idx[label]
         return item
+
+    @classmethod
+    def from_batch(
+        cls,
+        batch: EventWindowBatch,
+        *,
+        per_sample_session_dirs: Sequence[Union[Path, str]],
+        label_to_idx: Optional[dict[str, int]] = None,
+        dtype: torch.dtype = torch.float32,
+        channel_first: bool = False,
+    ) -> SessionEventDataset:
+        dataset = cls.__new__(cls)
+        dataset._batch = batch
+        dataset._session_dirs = tuple(Path(path) for path in per_sample_session_dirs)
+        dataset._label_to_idx = label_to_idx
+        dataset._dtype = dtype
+        dataset._channel_first = channel_first
+        return dataset
+
+
+SPLITS_MANIFEST_NAME = "splits_manifest.json"
+SPLITS_WINDOWS_NAME = "splits_windows.npz"
+SPLIT_SEED = 42
+
+
+def seed_everything(seed: int = 0, deterministic: bool = True) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True)
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+
+_rng = np.random.default_rng(SPLIT_SEED)
+
+
+def set_split_seed(seed: int) -> None:
+    global _rng, SPLIT_SEED
+    SPLIT_SEED = seed
+    _rng = np.random.default_rng(seed)
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetSplits:
+    dataset: SessionEventDataset
+    train: Subset
+    val: Subset
+    test: Subset
+    train_indices: np.ndarray
+    val_indices: np.ndarray
+    test_indices: np.ndarray
+    train_sessions: tuple[Path, ...]
+    val_sessions: tuple[Path, ...]
+    recordings_path: Path
+    pre_ms: float
+    post_ms: float
+    extra_session_test_split: float
+    intra_session_test_split: float
+
+
+def split_sample_indices(
+    sessions: list[Path],
+    per_sample_sessions: Sequence[Path],
+    *,
+    extra_session_test_split: float = 0.2,
+    intra_session_test_split: float = 0.15,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[Path, ...], tuple[Path, ...]]:
+    """Return disjoint train, val, and test sample indices.
+
+    train = events from train sessions not assigned to test
+    val   = all events from held-out extra sessions
+    test  = held-out intra-session events from train sessions
+    """
+    if not sessions:
+        raise ValueError("At least one session is required")
+    if not (0.0 <= extra_session_test_split < 1.0):
+        raise ValueError("extra_session_test_split must be between 0 and 1")
+    if not (0.0 <= intra_session_test_split < 1.0):
+        raise ValueError("intra_session_test_split must be between 0 and 1")
+
+    session_to_indices: dict[Path, list[int]] = defaultdict(list)
+    for index, session_dir in enumerate(per_sample_sessions):
+        session_to_indices[Path(session_dir)].append(index)
+
+    session_order = _rng.permutation(len(sessions))
+
+    n_val_sessions = int(round(len(sessions) * extra_session_test_split))
+    if len(sessions) > 1:
+        n_val_sessions = min(n_val_sessions, len(sessions) - 1)
+    else:
+        n_val_sessions = 0
+
+    val_sessions = {sessions[int(i)] for i in session_order[:n_val_sessions]}
+    remaining_sessions = [sessions[int(i)] for i in session_order[n_val_sessions:]]
+
+    train_indices: list[int] = []
+    val_indices: list[int] = []
+    test_indices: list[int] = []
+
+    for session_dir in sorted(val_sessions):
+        val_indices.extend(session_to_indices[session_dir])
+
+    for session_dir in remaining_sessions:
+        indices = session_to_indices.get(session_dir, [])
+        if not indices:
+            continue
+        if len(indices) == 1 or intra_session_test_split == 0.0:
+            train_indices.extend(indices)
+            continue
+
+        event_order = _rng.permutation(len(indices))
+        n_test = max(1, int(round(len(indices) * intra_session_test_split)))
+        n_test = min(n_test, len(indices) - 1)
+        test_indices.extend(indices[int(i)] for i in event_order[:n_test])
+        train_indices.extend(indices[int(i)] for i in event_order[n_test:])
+
+    return (
+        np.asarray(train_indices, dtype=np.int64),
+        np.asarray(val_indices, dtype=np.int64),
+        np.asarray(test_indices, dtype=np.int64),
+        tuple(sorted(set(remaining_sessions))),
+        tuple(sorted(val_sessions)),
+    )
+
+
+def build_dataset_splits(
+    recordings_path: Path,
+    *,
+    pre_ms: float = 300.0,
+    post_ms: float = 700.0,
+    extra_session_test_split: float = 0.2,
+    intra_session_test_split: float = 0.15,
+) -> DatasetSplits:
+    from _viewer_core import discover_sessions
+
+    recordings_path = Path(recordings_path)
+    sessions = discover_sessions(recordings_path)
+    dataset = SessionEventDataset(
+        sessions,
+        pre_ms=pre_ms,
+        post_ms=post_ms,
+    )
+    (
+        train_indices,
+        val_indices,
+        test_indices,
+        train_sessions,
+        val_sessions,
+    ) = split_sample_indices(
+        sessions,
+        dataset._session_dirs,
+        extra_session_test_split=extra_session_test_split,
+        intra_session_test_split=intra_session_test_split,
+    )
+    return DatasetSplits(
+        dataset=dataset,
+        train=Subset(dataset, train_indices.tolist()),
+        val=Subset(dataset, val_indices.tolist()),
+        test=Subset(dataset, test_indices.tolist()),
+        train_indices=train_indices,
+        val_indices=val_indices,
+        test_indices=test_indices,
+        train_sessions=train_sessions,
+        val_sessions=val_sessions,
+        recordings_path=recordings_path,
+        pre_ms=pre_ms,
+        post_ms=post_ms,
+        extra_session_test_split=extra_session_test_split,
+        intra_session_test_split=intra_session_test_split,
+    )
+
+
+def save_dataset_splits(output_dir: Path, splits: DatasetSplits) -> None:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    batch = splits.dataset.batch
+    np.savez_compressed(
+        output_dir / SPLITS_WINDOWS_NAME,
+        x=batch.x,
+        center_sample_index=batch.center_sample_index,
+    )
+
+    manifest = {
+        "version": 2,
+        "seed": SPLIT_SEED,
+        "recordings_path": str(splits.recordings_path.resolve()),
+        "pre_ms": splits.pre_ms,
+        "post_ms": splits.post_ms,
+        "extra_session_test_split": splits.extra_session_test_split,
+        "intra_session_test_split": splits.intra_session_test_split,
+        "sample_rate_hz": batch.sample_rate_hz,
+        "pre_samples": batch.pre_samples,
+        "post_samples": batch.post_samples,
+        "skipped": batch.skipped,
+        "labels": list(batch.labels),
+        "event_types": list(batch.event_types),
+        "event_ids": list(batch.event_ids),
+        "session_dirs": [str(path) for path in splits.dataset._session_dirs],
+        "train_indices": splits.train_indices.tolist(),
+        "val_indices": splits.val_indices.tolist(),
+        "test_indices": splits.test_indices.tolist(),
+        "train_sessions": [str(path) for path in splits.train_sessions],
+        "val_sessions": [str(path) for path in splits.val_sessions],
+    }
+    (output_dir / SPLITS_MANIFEST_NAME).write_text(
+        json.dumps(manifest, indent=2),
+        encoding="utf-8",
+    )
+
+
+def load_dataset_splits(splits_dir: Path) -> DatasetSplits:
+    splits_dir = Path(splits_dir)
+    manifest_path = splits_dir / SPLITS_MANIFEST_NAME
+    windows_path = splits_dir / SPLITS_WINDOWS_NAME
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Missing split manifest: {manifest_path}")
+    if not windows_path.exists():
+        raise FileNotFoundError(f"Missing split windows: {windows_path}")
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    windows = np.load(windows_path)
+
+    batch = EventWindowBatch(
+        x=windows["x"],
+        labels=tuple(manifest["labels"]),
+        event_types=tuple(manifest["event_types"]),
+        event_ids=tuple(manifest["event_ids"]),
+        center_sample_index=windows["center_sample_index"],
+        session_dirs=tuple(Path(path) for path in manifest["session_dirs"]),
+        sample_rate_hz=float(manifest["sample_rate_hz"]),
+        pre_samples=int(manifest["pre_samples"]),
+        post_samples=int(manifest["post_samples"]),
+        skipped=int(manifest.get("skipped", 0)),
+    )
+    dataset = SessionEventDataset.from_batch(
+        batch,
+        per_sample_session_dirs=manifest["session_dirs"],
+    )
+
+    train_indices = np.asarray(manifest["train_indices"], dtype=np.int64)
+    if "val_indices" in manifest:
+        val_indices = np.asarray(manifest["val_indices"], dtype=np.int64)
+        test_indices = np.asarray(manifest["test_indices"], dtype=np.int64)
+        val_sessions = tuple(Path(path) for path in manifest["val_sessions"])
+    else:
+        # v1 manifests combined val (extra-session) + test (intra-session) in test_indices
+        combined_test = np.asarray(manifest["test_indices"], dtype=np.int64)
+        val_session_set = {Path(path) for path in manifest["extra_test_sessions"]}
+        per_sample_sessions = tuple(Path(path) for path in manifest["session_dirs"])
+        val_mask = np.array(
+            [per_sample_sessions[i] in val_session_set for i in combined_test],
+            dtype=bool,
+        )
+        val_indices = combined_test[val_mask]
+        test_indices = combined_test[~val_mask]
+        val_sessions = tuple(Path(path) for path in manifest["extra_test_sessions"])
+
+    return DatasetSplits(
+        dataset=dataset,
+        train=Subset(dataset, train_indices.tolist()),
+        val=Subset(dataset, val_indices.tolist()),
+        test=Subset(dataset, test_indices.tolist()),
+        train_indices=train_indices,
+        val_indices=val_indices,
+        test_indices=test_indices,
+        train_sessions=tuple(Path(path) for path in manifest["train_sessions"]),
+        val_sessions=val_sessions,
+        recordings_path=Path(manifest["recordings_path"]),
+        pre_ms=float(manifest["pre_ms"]),
+        post_ms=float(manifest["post_ms"]),
+        extra_session_test_split=float(manifest["extra_session_test_split"]),
+        intra_session_test_split=float(manifest["intra_session_test_split"]),
+    )
+
+
+def print_split_summary(splits: DatasetSplits) -> None:
+    print("\n\n")
+    print(f"splits: {len(splits.dataset)} total windows ({splits.dataset.skipped} skipped during build)")
+    print(
+        f"train: {len(splits.train)} samples from {len(splits.train_sessions)} sessions"
+    )
+    print(
+        f"val:   {len(splits.val)} samples from {len(splits.val_sessions)} held-out sessions"
+    )
+    print(
+        f"test:  {len(splits.test)} held-out intra-session events from train sessions"
+    )
+    print("\n\n")
+
+
+# --- config (edit these)
+SEED = 42
+RECORDINGS_PATH = Path(__file__).resolve().parent.parent / "client" / "recordings"
+SPLITS_OUTPUT_DIR = Path(__file__).resolve().parent / "splits"
+PRE_MS = 0.0
+POST_MS = 0.0
+EXTRA_SESSION_TEST_SPLIT = 0.2
+INTRA_SESSION_TEST_SPLIT = 0.15
+
+
+if __name__ == "__main__":
+    set_split_seed(SEED)
+    seed_everything(SEED)
+
+    splits = build_dataset_splits(
+        RECORDINGS_PATH,
+        pre_ms=PRE_MS,
+        post_ms=POST_MS,
+        extra_session_test_split=EXTRA_SESSION_TEST_SPLIT,
+        intra_session_test_split=INTRA_SESSION_TEST_SPLIT,
+    )
+    save_dataset_splits(SPLITS_OUTPUT_DIR, splits)
+    print(f"Saved splits to {SPLITS_OUTPUT_DIR.resolve()}")
+    print_split_summary(splits)

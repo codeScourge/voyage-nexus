@@ -1,6 +1,12 @@
 client/recordings/*
 !client/recordings/.gitkeep
 
+model/splits/*
+!model/splits/.gitkeep
+
+model/checkpoints/*
+!model/splits/.checkpoints
+
 # macOS
 .DS_Store
 
