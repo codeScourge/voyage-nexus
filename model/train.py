@@ -16,13 +16,63 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-from _preprocessors import EEG_CHANNELS, EMG_CHANNELS
 from data import load_dataset_splits
 
 # ---
 SEED = 42
 TORCH_DETERMINISTIC = False
 RUN_DIR_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}")
+
+# --- channel selection (set False to exclude from training)
+EEG1 = 1
+EEG2 = 1
+EEG3 = 0
+EEG4 = 0
+EEG5 = 0
+EEG6 = 1
+EEG7 = 1
+EEG8 = 1
+EEG9 =1
+EEG10 = 1
+EEG11 = 0
+EEG12 = 0
+EEG13 = 0
+EEG14 = 0
+EEG15 = 0
+EEG16 = 1
+
+EMG1 = 1
+EMG2 = 1
+EMG3 = 1
+EMG4 = 1
+EMG5 = 1
+EMG6 = 1
+EMG7 = 1
+EMG8 = 1
+EMG9 = 1
+EMG10 = 1
+EMG11 = 1
+EMG12 = 1
+EMG13 = 1
+EMG14 = 1
+EMG15 = 1
+EMG16 = 1
+
+_EEG_CHANNEL_USE = (
+    EEG1, EEG2, EEG3, EEG4, EEG5, EEG6, EEG7, EEG8,
+    EEG9, EEG10, EEG11, EEG12, EEG13, EEG14, EEG15, EEG16,
+)
+_EMG_CHANNEL_USE = (
+    EMG1, EMG2, EMG3, EMG4, EMG5, EMG6, EMG7, EMG8,
+    EMG9, EMG10, EMG11, EMG12, EMG13, EMG14, EMG15, EMG16,
+)
+ACTIVE_EEG_INDICES = [i for i, use in enumerate(_EEG_CHANNEL_USE) if use]
+ACTIVE_EMG_INDICES = [16 + i for i, use in enumerate(_EMG_CHANNEL_USE) if use]
+
+if not ACTIVE_EEG_INDICES:
+    raise ValueError("At least one EEG channel must be enabled")
+if not ACTIVE_EMG_INDICES:
+    raise ValueError("At least one EMG channel must be enabled")
 
 
 def seed_everything(seed: int = 0, deterministic: bool = True) -> None:
@@ -208,8 +258,8 @@ class FusionDataset(torch.utils.data.Dataset):
         x = sample["x"]
         x = (x - x.mean(dim=0, keepdim=True)) / (x.std(dim=0, keepdim=True) + 1e-6)
                                 
-        eeg = x[:, EEG_CHANNELS].T.unsqueeze(0)  # (1, C_eeg, T)
-        emg = x[:, EMG_CHANNELS].T.unsqueeze(0)  # (1, C_emg, T)
+        eeg = x[:, ACTIVE_EEG_INDICES].T.unsqueeze(0)  # (1, C_eeg, T)
+        emg = x[:, ACTIVE_EMG_INDICES].T.unsqueeze(0)  # (1, C_emg, T)
         y = self.label_to_idx[sample["label"]]
         return eeg, emg, torch.tensor(y, dtype=torch.long)
 
@@ -242,7 +292,14 @@ def construct_model(splits):
         p_drop=0.5
     ).to(device)
 
-    return model, label_to_idx, {"n_eeg": n_eeg, "n_emg": n_emg, "n_classes": n_classes, "T": T}
+    return model, label_to_idx, {
+        "n_eeg": n_eeg,
+        "n_emg": n_emg,
+        "n_classes": n_classes,
+        "T": T,
+        "active_eeg_indices": ACTIVE_EEG_INDICES,
+        "active_emg_indices": ACTIVE_EMG_INDICES,
+    }
 
 def new_run_dir_name(now: datetime | None = None) -> str:
     """e.g. 2026-06-20_01-44-45_run_a3f8b2c1 (mirrors client recording folders)."""
