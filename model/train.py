@@ -24,38 +24,38 @@ TORCH_DETERMINISTIC = False
 RUN_DIR_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}")
 
 # --- channel selection (set False to exclude from training)
-EEG1 = 1
+EEG1 = 0
 EEG2 = 1
 EEG3 = 0
-EEG4 = 0
-EEG5 = 0
-EEG6 = 1
+EEG4 = 1
+EEG5 = 1
+EEG6 = 0
 EEG7 = 1
 EEG8 = 1
-EEG9 =1
+EEG9 = 1
 EEG10 = 1
 EEG11 = 0
-EEG12 = 0
+EEG12 = 1
 EEG13 = 0
 EEG14 = 0
 EEG15 = 0
-EEG16 = 1
+EEG16 = 0
 
 EMG1 = 1
-EMG2 = 1
+EMG2 = 0
 EMG3 = 1
 EMG4 = 1
-EMG5 = 1
+EMG5 = 0
 EMG6 = 1
-EMG7 = 1
+EMG7 = 0
 EMG8 = 1
-EMG9 = 1
+EMG9 = 0
 EMG10 = 1
-EMG11 = 1
-EMG12 = 1
-EMG13 = 1
+EMG11 = 0
+EMG12 = 0
+EMG13 = 0
 EMG14 = 1
-EMG15 = 1
+EMG15 = 0
 EMG16 = 1
 
 _EEG_CHANNEL_USE = (
@@ -187,8 +187,8 @@ class IntermediateFusionEEGNet(nn.Module):
         F1: int = 8,
         D: int = 2,
         F2: int = 16,
-        kern_eeg: int = 64,   # half the sampling rate per the paper
-        kern_emg: int = 64,   # tune: EMG carries higher-freq content
+        kern_eeg: int = 128,   # half the sampling rate per the paper
+        kern_emg: int = 128,   # tune: EMG carries higher-freq content
         sep_kernel: int = 16,
         p_drop: float = 0.5,
     ):
