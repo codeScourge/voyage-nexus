@@ -366,6 +366,7 @@ def train(
     *,
     run_dir: Path,
     save_interval: int = CHECKPOINT_SAVE_INTERVAL,
+    early_stopping_patience: int = 15,
     num_workers=0,
     pin_memory=False,
 ):
@@ -385,6 +386,7 @@ def train(
     weights = (counts.sum() / (counts * n_classes)).to(device)
 
     crit = nn.CrossEntropyLoss(weight=weights)
+
     opt = torch.optim.Adam(model.parameters(), lr=lr)
 
     best_acc = 0.0
@@ -402,6 +404,7 @@ def train(
         "train_acc": [],
         "val_acc": [],
     }
+    epochs_without_improve = 0
 
     def write_checkpoint(
         path: Path,
@@ -483,6 +486,7 @@ def train(
                 "val_loss": val_loss,
                 "val_acc": acc,
             }
+            epochs_without_improve = 0
             write_checkpoint(
                 run_dir / "best.pt",
                 kind="best",
@@ -493,6 +497,8 @@ def train(
                 val_acc=acc,
                 state_dict=best_state,
             )
+        else:
+            epochs_without_improve += 1
 
         if save_interval > 0 and epoch_num % save_interval == 0:
             write_checkpoint(
@@ -506,19 +512,31 @@ def train(
             )
 
         epoch_time = time.perf_counter() - epoch_start
-        epoch_bar.set_postfix(
-            train_loss=f"{train_loss:.4f}",
-            val_loss=f"{val_loss:.4f}",
-            train_acc=f"{train_acc:.4f}",
-            val_acc=f"{acc:.4f}",
-            best=f"{best_acc:.4f}",
-            epoch_s=f"{epoch_time:.1f}s",
-        )
+        postfix = {
+            "train_loss": f"{train_loss:.4f}",
+            "val_loss": f"{val_loss:.4f}",
+            "train_acc": f"{train_acc:.4f}",
+            "val_acc": f"{acc:.4f}",
+            "best": f"{best_acc:.4f}",
+            "epoch_s": f"{epoch_time:.1f}s",
+        }
+        if early_stopping_patience > 0:
+            postfix["no_improve"] = epochs_without_improve
+        epoch_bar.set_postfix(**postfix)
 
+        if early_stopping_patience > 0 and epochs_without_improve >= early_stopping_patience:
+            print(
+                f"\nearly stopping at epoch {epoch_num}: "
+                f"no val acc improvement for {early_stopping_patience} epochs "
+                f"(best={best_acc:.4f} @ epoch {best_metrics['epoch']})"
+            )
+            break
+
+    last_epoch = len(history["train_loss"])
     write_checkpoint(
         run_dir / "last.pt",
         kind="last",
-        epoch_num=epochs,
+        epoch_num=last_epoch,
         train_loss=history["train_loss"][-1],
         train_acc=history["train_acc"][-1],
         val_loss=history["val_loss"][-1],
