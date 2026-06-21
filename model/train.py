@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-from data import load_dataset_splits
+from data import default_label_to_idx, load_dataset_splits
 
 # ---
 SEED = 42
@@ -265,14 +265,19 @@ class FusionDataset(torch.utils.data.Dataset):
 
 
 def build_label_map(base_dataset, indices) -> dict:
-    labels = sorted({base_dataset[i]["label"] for i in indices})
-    return {lab: idx for idx, lab in enumerate(labels)}
+    label_to_idx = default_label_to_idx()
+    seen = {base_dataset[i]["label"] for i in indices}
+    unknown = seen - set(label_to_idx)
+    if unknown:
+        raise ValueError(f"Unknown labels in training data: {sorted(unknown)}")
+    return label_to_idx
 
 
 # --- train
 def construct_model(splits):
     label_to_idx = build_label_map(splits.dataset, splits.train.indices)
     n_classes = len(label_to_idx)
+    print(f"classes ({n_classes}): {', '.join(label_to_idx)}")
 
     # infer shapes from one sample
     eeg0, emg0, _ = FusionDataset(splits.dataset, splits.train.indices, label_to_idx)[0]
@@ -440,7 +445,8 @@ def train(
     counts = torch.zeros(n_classes)
     for i in train_ds.indices:
         counts[label_to_idx[splits.dataset[i]["label"]]] += 1
-    weights = (counts.sum() / (counts * n_classes)).to(device)
+    safe_counts = torch.where(counts > 0, counts, torch.ones_like(counts))
+    weights = (counts.sum() / (safe_counts * n_classes)).to(device)
 
     crit = nn.CrossEntropyLoss(weight=weights)
 

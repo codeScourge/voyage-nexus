@@ -76,11 +76,44 @@ ALIGNMENT_TEST_PAD_S = 0.3
 ALIGNMENT_TEST_DISPLAY_CHANNELS = tuple(range(8))
 MODEL_TEST_TRIALS = 3
 DEFAULT_SCRAMBLE_SET = 5
-DEFAULT_SCRAMBLE_REP = 7
+DEFAULT_SCRAMBLE_REP = 5
 SCRAMBLE_SET_MIN = 1
 SCRAMBLE_SET_MAX = 20
 SCRAMBLE_REP_MIN = 1
 SCRAMBLE_REP_MAX = 20
+NEGATIVE_LABELS_STILL_FRACTION = 0.65
+NEGATIVE_LABELS_NEG_WORD_FRACTION = 0.25
+NEGATIVE_LABELS_POS_WORD_FRACTION = 0.10
+NEGATIVE_LABELS_STILL_MIN_S = 1.0
+NEGATIVE_LABELS_STILL_MAX_S = 20.0
+NEGATIVE_LABEL_WORD_COUNT = 15
+NEGATIVE_LABEL_WORD_POOL = (
+    "sidewalk",
+    "umbrella",
+    "keyboard",
+    "backward",
+    "sunshine",
+    "notebook",
+    "sandwich",
+    "football",
+    "standard",
+    "platform",
+    "wildcard",
+    "backpack",
+    "handbook",
+    "doorstep",
+    "headline",
+    "goldmine",
+    "basement",
+    "countdown",
+    "bookmark",
+    "lukewarm",
+    "turnover",
+    "backyard",
+    "doorbell",
+    "flashbulb",
+    "handrail",
+)
 SPEECH_AUDIO_RATE_HZ = 16000
 SPEECH_AUDIO_CHANNELS = 1
 RAIL_CODE_WARN = 0x7FFF00
@@ -640,6 +673,12 @@ class AcquisitionService:
         self._collect_block_id: Optional[str] = None
         self._collect_deadline_ns: Optional[int] = None
         self._collect_countdown_word_switch = False
+        self._collect_neg_words: list[str] = []
+        self._collect_neg_segment_kind = ""
+        self._collect_neg_still_time_s = 0.0
+        self._collect_neg_negative_word_time_s = 0.0
+        self._collect_neg_positive_word_time_s = 0.0
+        self._collect_neg_segment_started_ns: Optional[int] = None
 
         self._align_test_phase = "idle"
         self._align_test_deadline_ns: Optional[int] = None
@@ -824,7 +863,7 @@ class AcquisitionService:
         return max(0, int(remaining_s + 0.999))
 
     def _collect_phase_remaining_s(self) -> Optional[float]:
-        if self._collect_phase not in ("countdown", "say"):
+        if self._collect_phase not in ("countdown", "say", "still"):
             return None
         if self._collect_deadline_ns is None:
             return None
@@ -850,8 +889,81 @@ class AcquisitionService:
             choices = list(COLLECTION_WORDS)
         return random.choice(choices)
 
+    def _pick_negative_label_words(self) -> list[str]:
+        pool = list(NEGATIVE_LABEL_WORD_POOL)
+        random.shuffle(pool)
+        return pool[:NEGATIVE_LABEL_WORD_COUNT]
+
+    def _pick_negative_labels_segment(self) -> str:
+        targets = {
+            "still": NEGATIVE_LABELS_STILL_FRACTION,
+            "negative_word": NEGATIVE_LABELS_NEG_WORD_FRACTION,
+            "positive_word": NEGATIVE_LABELS_POS_WORD_FRACTION,
+        }
+        elapsed = {
+            "still": self._collect_neg_still_time_s,
+            "negative_word": self._collect_neg_negative_word_time_s,
+            "positive_word": self._collect_neg_positive_word_time_s,
+        }
+        total_elapsed = sum(elapsed.values())
+        if total_elapsed <= 0:
+            roll = random.random()
+            if roll < targets["still"]:
+                return "still"
+            if roll < targets["still"] + targets["negative_word"]:
+                return "negative_word"
+            return "positive_word"
+
+        deficits = {kind: targets[kind] - (elapsed[kind] / total_elapsed) for kind in targets}
+        weights = {kind: max(deficits[kind], 0.01) for kind in targets}
+        kinds = list(weights.keys())
+        return random.choices(kinds, weights=[weights[kind] for kind in kinds], k=1)[0]
+
+    def _mark_negative_labels_segment_start(self) -> None:
+        self._collect_neg_segment_started_ns = time.perf_counter_ns()
+
+    def _record_negative_labels_segment_elapsed(self, segment_kind: str) -> None:
+        started_ns = self._collect_neg_segment_started_ns
+        if started_ns is None:
+            return
+        elapsed_s = max(0.0, (time.perf_counter_ns() - started_ns) / 1e9)
+        self._collect_neg_segment_started_ns = None
+        if segment_kind == "still":
+            self._collect_neg_still_time_s += elapsed_s
+        elif segment_kind == "negative_word":
+            self._collect_neg_negative_word_time_s += elapsed_s
+        elif segment_kind == "positive_word":
+            self._collect_neg_positive_word_time_s += elapsed_s
+
+    def _begin_negative_labels_still(self) -> None:
+        duration_s = random.uniform(NEGATIVE_LABELS_STILL_MIN_S, NEGATIVE_LABELS_STILL_MAX_S)
+        self._collect_neg_segment_kind = "still"
+        self._collect_word = ""
+        self._collect_phase = "still"
+        self._collect_deadline_ns = time.perf_counter_ns() + int(duration_s * 1_000_000_000)
+        self._mark_negative_labels_segment_start()
+
+    def _begin_negative_labels_word_segment(self, segment_kind: str) -> None:
+        if segment_kind == "negative_word":
+            self._collect_word = random.choice(self._collect_neg_words)
+        else:
+            self._collect_word = random.choice(COLLECTION_WORDS)
+        self._collect_neg_segment_kind = segment_kind
+        self._collect_rep = 1
+        self._collect_reps_total = 1
+        self._begin_collect_countdown(new_label=True)
+        self._mark_negative_labels_segment_start()
+
+    def _begin_negative_labels_segment(self) -> None:
+        segment_kind = self._pick_negative_labels_segment()
+        if segment_kind == "still":
+            self._begin_negative_labels_still()
+        else:
+            self._begin_negative_labels_word_segment(segment_kind)
+
     def _collect_status(self) -> dict[str, Any]:
-        busy = self._collect_phase in ("countdown", "say")
+        busy = self._collect_phase in ("countdown", "say", "still")
+        negative_labels_active = self._collect_mode == "negative_labels" and busy
         return {
             "phase": self._collect_phase,
             "mode": self._collect_mode if busy else None,
@@ -860,6 +972,8 @@ class AcquisitionService:
             "repetitions_total": self._collect_reps_total if busy else COLLECTION_REPETITIONS,
             "set_index": self._collect_set_idx if busy and self._collect_mode == "scramble" else None,
             "sets_total": self._collect_set_total if busy and self._collect_mode == "scramble" else None,
+            "neg_segment_kind": self._collect_neg_segment_kind if negative_labels_active else None,
+            "negative_labels_active": negative_labels_active,
             "phase_remaining_s": self._collect_phase_remaining_s(),
             "words": list(COLLECTION_WORDS),
             "before_s": COLLECTION_BEFORE_S,
@@ -887,6 +1001,12 @@ class AcquisitionService:
         self._collect_block_id = None
         self._collect_deadline_ns = None
         self._collect_countdown_word_switch = False
+        self._collect_neg_words = []
+        self._collect_neg_segment_kind = ""
+        self._collect_neg_still_time_s = 0.0
+        self._collect_neg_negative_word_time_s = 0.0
+        self._collect_neg_positive_word_time_s = 0.0
+        self._collect_neg_segment_started_ns = None
 
     def _finish_collect_block(self) -> None:
         finished_word = self._collect_word
@@ -920,10 +1040,16 @@ class AcquisitionService:
                 )
 
     def _tick_collect(self) -> None:
-        if self._collect_phase not in ("countdown", "say"):
+        if self._collect_phase not in ("countdown", "say", "still"):
             return
         deadline = self._collect_deadline_ns
         if deadline is None or time.perf_counter_ns() < deadline:
+            return
+
+        if self._collect_phase == "still":
+            self._record_negative_labels_segment_elapsed("still")
+            if self._collect_mode == "negative_labels":
+                self._begin_negative_labels_segment()
             return
 
         if self._collect_phase == "countdown":
@@ -931,6 +1057,11 @@ class AcquisitionService:
             self._collect_countdown_word_switch = False
             self._collect_deadline_ns = time.perf_counter_ns() + int(COLLECTION_SAY_S * 1_000_000_000)
             self._log_silent_speech_rep()
+            return
+
+        if self._collect_mode == "negative_labels":
+            self._record_negative_labels_segment_elapsed(self._collect_neg_segment_kind)
+            self._begin_negative_labels_segment()
             return
 
         if self._collect_rep < self._collect_reps_total:
@@ -1074,6 +1205,88 @@ class AcquisitionService:
             },
         )
         self._log_scramble_word()
+
+    def start_collect_negative_labels(self) -> None:
+        if not self._recorder.enabled:
+            raise RuntimeError("Start session recording first")
+        if self._collect_phase != "pick_word":
+            raise RuntimeError("Finish the current collection before starting another")
+        if self._trial_state != TrialState.IDLE:
+            raise RuntimeError("Another trial is already active")
+        _event_host_ns, aligned_float, aligned_idx, method = self._aligned_sample_now()
+        if aligned_idx is None:
+            raise RuntimeError("No samples yet; cannot start collection")
+
+        block_id = uuid.uuid4().hex
+        self._collect_block_id = block_id
+        self._collect_mode = "negative_labels"
+        self._collect_neg_words = self._pick_negative_label_words()
+        self._collect_neg_segment_kind = ""
+        self._collect_neg_still_time_s = 0.0
+        self._collect_neg_negative_word_time_s = 0.0
+        self._collect_neg_positive_word_time_s = 0.0
+        self._collect_neg_segment_started_ns = None
+        self._recorder.log_event(
+            event_type="silent_speech_block_start",
+            label_text="",
+            sample_index_start=aligned_idx,
+            sample_index_start_float=aligned_float,
+            alignment_method=method,
+            payload={
+                "collection_block_id": block_id,
+                "mode": "negative_labels",
+                "negative_words": list(self._collect_neg_words),
+                "still_fraction": NEGATIVE_LABELS_STILL_FRACTION,
+                "negative_word_fraction": NEGATIVE_LABELS_NEG_WORD_FRACTION,
+                "positive_word_fraction": NEGATIVE_LABELS_POS_WORD_FRACTION,
+            },
+        )
+        self._begin_negative_labels_segment()
+
+    def stop_collect_negative_labels(self) -> None:
+        if self._collect_mode != "negative_labels":
+            raise RuntimeError("Negative labels mode is not active")
+        if self._collect_phase == "still":
+            self._record_negative_labels_segment_elapsed("still")
+        elif self._collect_phase == "say" and self._collect_neg_segment_kind in ("negative_word", "positive_word"):
+            self._record_negative_labels_segment_elapsed(self._collect_neg_segment_kind)
+        block_id = self._collect_block_id
+        _event_host_ns, aligned_float, aligned_idx, method = self._aligned_sample_now()
+        if aligned_idx is not None and block_id and self._recorder.enabled:
+            self._recorder.log_event(
+                event_type="silent_speech_block_end",
+                label_text="",
+                sample_index_start=aligned_idx,
+                sample_index_start_float=aligned_float,
+                alignment_method=method,
+                payload={
+                    "collection_block_id": block_id,
+                    "mode": "negative_labels",
+                },
+            )
+        self._collect_phase = "pick_word"
+        self._collect_mode = "single"
+        self._collect_word = ""
+        self._collect_rep = 0
+        self._collect_reps_total = COLLECTION_REPETITIONS
+        self._collect_set_idx = 0
+        self._collect_set_total = 0
+        self._collect_prev_word = ""
+        self._collect_block_id = None
+        self._collect_deadline_ns = None
+        self._collect_countdown_word_switch = False
+        self._collect_neg_words = []
+        self._collect_neg_segment_kind = ""
+        self._collect_neg_still_time_s = 0.0
+        self._collect_neg_negative_word_time_s = 0.0
+        self._collect_neg_positive_word_time_s = 0.0
+        self._collect_neg_segment_started_ns = None
+
+    def toggle_collect_negative_labels(self) -> None:
+        if self._collect_mode == "negative_labels":
+            self.stop_collect_negative_labels()
+        else:
+            self.start_collect_negative_labels()
 
     def _alignment_test_busy(self) -> bool:
         return self._align_test_phase in ("countdown", "blink")
@@ -1901,6 +2114,11 @@ def create_app(service: AcquisitionService) -> Flask:
         set_count = int(payload.get("set", DEFAULT_SCRAMBLE_SET))
         rep_count = int(payload.get("rep", DEFAULT_SCRAMBLE_REP))
         service.start_collect_scramble(set_count=set_count, rep_count=rep_count)
+        return jsonify(service.status()["collect"])
+
+    @app.post("/collect/negative-labels/toggle")
+    def collect_negative_labels_toggle() -> Any:
+        service.toggle_collect_negative_labels()
         return jsonify(service.status()["collect"])
 
     @app.post("/alignment-test/start")

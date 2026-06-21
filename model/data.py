@@ -28,6 +28,20 @@ EEG_RECORD_FORMAT_CODES_LEGACY = "<QQ32i"
 # Match client/app.py — duration of each silent_speech_word "say" window.
 COLLECTION_SAY_S = 1.6
 
+TARGET_WORDS: frozenset[str] = frozenset({"highlight", "bullshit", "gogogo"})
+UNKNOWN_WORD_LABEL = "unknown word"
+SILENCE_LABEL = "silence"
+ALL_LABELS: tuple[str, ...] = (
+    "highlight",
+    "bullshit",
+    "gogogo",
+    UNKNOWN_WORD_LABEL,
+    SILENCE_LABEL,
+)
+SILENT_SPEECH_WORD_EVENT = "silent_speech_word"
+NEGATIVE_LABELS_BLOCK_START_EVENT = "silent_speech_block_start"
+NEGATIVE_LABELS_BLOCK_END_EVENT = "silent_speech_block_end"
+
 EEG_RECORD_DTYPE = np.dtype(
     [
         ("sample_index", "<u8"),
@@ -174,6 +188,214 @@ def load_events(session_dir: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def parse_event_payload(event: dict[str, str]) -> dict[str, Any]:
+    raw = event.get("payload_json", "")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def default_label_to_idx() -> dict[str, int]:
+    return {label: idx for idx, label in enumerate(ALL_LABELS)}
+
+
+def normalize_word_label(label: str) -> Optional[str]:
+    word = label.strip().lower()
+    if not word:
+        return None
+    if word in TARGET_WORDS:
+        return word
+    return UNKNOWN_WORD_LABEL
+
+
+def _event_sample_end(
+    event: dict[str, str],
+    start_idx: int,
+    start_row: int,
+    *,
+    fs: float,
+    index_to_row: dict[int, int],
+) -> tuple[int, int]:
+    end_text = event.get("sample_index_end", "")
+    if end_text:
+        end_idx = int(end_text)
+        end_row = index_to_row.get(end_idx)
+        if end_row is None:
+            end_row = start_row + max(0, end_idx - start_idx)
+    else:
+        duration_samples = int(round(COLLECTION_SAY_S * fs))
+        end_idx = start_idx + duration_samples
+        end_row = start_row + duration_samples
+    return end_idx, end_row
+
+
+def _extract_channel_window(
+    channels: np.ndarray,
+    start_row: int,
+    end_row: int,
+    *,
+    pre_samples: int,
+    post_samples: int,
+) -> Optional[np.ndarray]:
+    if end_row < start_row:
+        return None
+    start = start_row - pre_samples
+    end = end_row + post_samples + 1
+    if start < 0 or end > channels.shape[0]:
+        return None
+    window = channels[start:end, :]
+    if window.shape[0] == 0:
+        return None
+    return window
+
+
+def _negative_labels_blocks(events: Sequence[dict[str, str]]) -> list[dict[str, Any]]:
+    pending: dict[str, int] = {}
+    blocks: list[dict[str, Any]] = []
+    for event in events:
+        payload = parse_event_payload(event)
+        block_id = str(payload.get("collection_block_id", "")).strip()
+        if not block_id:
+            continue
+        event_type = event.get("event_type", "")
+        start_text = event.get("sample_index_start", "")
+        if not start_text:
+            continue
+        if (
+            event_type == NEGATIVE_LABELS_BLOCK_START_EVENT
+            and payload.get("mode") == "negative_labels"
+        ):
+            pending[block_id] = int(start_text)
+            continue
+        if (
+            event_type == NEGATIVE_LABELS_BLOCK_END_EVENT
+            and payload.get("mode") == "negative_labels"
+        ):
+            block_start = pending.pop(block_id, None)
+            if block_start is None:
+                continue
+            block_end = int(start_text)
+            if block_end <= block_start:
+                continue
+            blocks.append(
+                {
+                    "block_id": block_id,
+                    "start_idx": block_start,
+                    "end_idx": block_end,
+                }
+            )
+    return blocks
+
+
+def _negative_labels_word_spans(
+    events: Sequence[dict[str, str]],
+    block_id: str,
+    *,
+    fs: float,
+    index_to_row: dict[int, int],
+) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for event in events:
+        if event.get("event_type", "") != SILENT_SPEECH_WORD_EVENT:
+            continue
+        payload = parse_event_payload(event)
+        if str(payload.get("collection_block_id", "")).strip() != block_id:
+            continue
+        start_text = event.get("sample_index_start", "")
+        if not start_text:
+            continue
+        start_idx = int(start_text)
+        start_row = index_to_row.get(start_idx)
+        if start_row is None:
+            continue
+        end_idx, _end_row = _event_sample_end(
+            event,
+            start_idx,
+            start_row,
+            fs=fs,
+            index_to_row=index_to_row,
+        )
+        if end_idx <= start_idx:
+            continue
+        spans.append((start_idx, end_idx))
+    spans.sort(key=lambda span: span[0])
+    return spans
+
+
+def _negative_labels_silence_spans(
+    block_start_idx: int,
+    block_end_idx: int,
+    word_spans: Sequence[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    gaps: list[tuple[int, int]] = []
+    cursor = block_start_idx
+    for word_start, word_end in word_spans:
+        if word_start > cursor:
+            gaps.append((cursor, word_start))
+        cursor = max(cursor, word_end)
+    if block_end_idx > cursor:
+        gaps.append((cursor, block_end_idx))
+    return [(start, end) for start, end in gaps if end > start]
+
+
+def _append_silence_windows(
+    *,
+    channels: np.ndarray,
+    events: Sequence[dict[str, str]],
+    index_to_row: dict[int, int],
+    fs: float,
+    pre_samples: int,
+    post_samples: int,
+    raw_windows: list[np.ndarray],
+    labels: list[str],
+    event_type_list: list[str],
+    event_ids: list[str],
+    center_samples: list[int],
+    skipped: int,
+) -> int:
+    for block in _negative_labels_blocks(events):
+        block_id = str(block["block_id"])
+        word_spans = _negative_labels_word_spans(
+            events,
+            block_id,
+            fs=fs,
+            index_to_row=index_to_row,
+        )
+        for gap_start, gap_end in _negative_labels_silence_spans(
+            int(block["start_idx"]),
+            int(block["end_idx"]),
+            word_spans,
+        ):
+            start_row = index_to_row.get(gap_start)
+            if start_row is None:
+                skipped += 1
+                continue
+            end_row = index_to_row.get(gap_end)
+            if end_row is None:
+                end_row = start_row + max(0, gap_end - gap_start)
+            window = _extract_channel_window(
+                channels,
+                start_row,
+                end_row,
+                pre_samples=pre_samples,
+                post_samples=post_samples,
+            )
+            if window is None:
+                skipped += 1
+                continue
+            center = gap_start + (gap_end - gap_start) // 2
+            raw_windows.append(window)
+            labels.append(SILENCE_LABEL)
+            event_type_list.append("negative_labels_silence")
+            event_ids.append(f"silence:{block_id}:{gap_start}-{gap_end}")
+            center_samples.append(center)
+    return skipped
+
+
 def window_sample_counts(
     sample_rate_hz: float,
     pre_ms: float,
@@ -255,9 +477,11 @@ def build_event_windows(
         event_type = event.get("event_type", "")
         if event_types is not None and event_type not in event_types:
             continue
+        if event_type != SILENT_SPEECH_WORD_EVENT:
+            continue
 
-        label = event.get("label_text", "")
-        if not label:
+        label = normalize_word_label(event.get("label_text", ""))
+        if label is None:
             skipped += 1
             continue
 
@@ -272,29 +496,21 @@ def build_event_windows(
             skipped += 1
             continue
 
-        end_text = event.get("sample_index_end", "")
-        if end_text:
-            end_idx = int(end_text)
-            end_row = index_to_row.get(end_idx)
-            if end_row is None:
-                end_row = start_row + max(0, end_idx - start_idx)
-        else:
-            duration_samples = int(round(COLLECTION_SAY_S * fs))
-            end_idx = start_idx + duration_samples
-            end_row = start_row + duration_samples
-
-        if end_row < start_row:
-            skipped += 1
-            continue
-
-        start = start_row - pre_samples
-        end = end_row + post_samples + 1
-        if start < 0 or end > channels.shape[0]:
-            skipped += 1
-            continue
-
-        window = channels[start:end, :]
-        if window.shape[0] == 0:
+        end_idx, end_row = _event_sample_end(
+            event,
+            start_idx,
+            start_row,
+            fs=fs,
+            index_to_row=index_to_row,
+        )
+        window = _extract_channel_window(
+            channels,
+            start_row,
+            end_row,
+            pre_samples=pre_samples,
+            post_samples=post_samples,
+        )
+        if window is None:
             skipped += 1
             continue
 
@@ -303,6 +519,21 @@ def build_event_windows(
         event_type_list.append(event_type)
         event_ids.append(event.get("event_id", ""))
         center_samples.append(start_idx)
+
+    skipped = _append_silence_windows(
+        channels=channels,
+        events=events,
+        index_to_row=index_to_row,
+        fs=fs,
+        pre_samples=pre_samples,
+        post_samples=post_samples,
+        raw_windows=raw_windows,
+        labels=labels,
+        event_type_list=event_type_list,
+        event_ids=event_ids,
+        center_samples=center_samples,
+        skipped=skipped,
+    )
 
     if raw_windows:
         if target_len is None:
@@ -752,6 +983,30 @@ def load_dataset_splits(splits_dir: Path) -> DatasetSplits:
     )
 
 
+def label_distribution(
+    dataset: SessionEventDataset,
+    indices: Sequence[int],
+) -> dict[str, int]:
+    counts: dict[str, int] = {label: 0 for label in ALL_LABELS}
+    for index in indices:
+        label = dataset[int(index)]["label"]
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+def print_label_distribution(name: str, counts: dict[str, int], total: int) -> None:
+    print(f"{name} label distribution ({total} samples):")
+    for label in ALL_LABELS:
+        count = counts.get(label, 0)
+        pct = (100.0 * count / total) if total else 0.0
+        print(f"  {label:14s} {count:5d}  ({pct:5.1f}%)")
+    extra = sorted(label for label in counts if label not in ALL_LABELS and counts[label] > 0)
+    for label in extra:
+        count = counts[label]
+        pct = (100.0 * count / total) if total else 0.0
+        print(f"  {label:14s} {count:5d}  ({pct:5.1f}%)")
+
+
 def print_split_summary(splits: DatasetSplits) -> None:
     print("\n\n")
     print(f"splits: {len(splits.dataset)} total windows ({splits.dataset.skipped} skipped during build)")
@@ -764,6 +1019,14 @@ def print_split_summary(splits: DatasetSplits) -> None:
     print(
         f"test:  {len(splits.test)} held-out intra-session events from train sessions"
     )
+    print()
+    for name, subset in (
+        ("train", splits.train),
+        ("val", splits.val),
+        ("test", splits.test),
+    ):
+        counts = label_distribution(splits.dataset, subset.indices)
+        print_label_distribution(name, counts, len(subset))
     print("\n\n")
 
 

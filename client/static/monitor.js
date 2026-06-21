@@ -45,6 +45,7 @@ const els = {
   scrambleRep: document.getElementById("scramble-rep"),
   scrambleSetVal: document.getElementById("scramble-set-val"),
   scrambleRepVal: document.getElementById("scramble-rep-val"),
+  negativeLabelsBtn: document.getElementById("btn-negative-labels"),
   wordSwitchFlash: document.getElementById("word-switch-flash"),
   alignmentBtn: document.getElementById("btn-alignment-test"),
   alignmentDismiss: document.getElementById("btn-alignment-dismiss"),
@@ -622,7 +623,7 @@ function syncScrambleSliderLabels(collect = {}) {
     els.scrambleRep.min = String(collect.scramble_rep_min ?? 1);
     els.scrambleRep.max = String(collect.scramble_rep_max ?? 20);
     if (!els.scrambleRep.dataset.touched) {
-      els.scrambleRep.value = String(collect.default_scramble_rep ?? 7);
+      els.scrambleRep.value = String(collect.default_scramble_rep ?? 5);
     }
     els.scrambleRepVal.textContent = els.scrambleRep.value;
   }
@@ -660,16 +661,19 @@ function updateCollectUi(status) {
   ensureWordButtons(collect.words || []);
 
   const picking = recording && phase === "pick_word";
-  const busy = phase === "countdown" || phase === "say";
+  const busy = phase === "countdown" || phase === "say" || phase === "still";
+  const negativeLabels = mode === "negative_labels";
 
   els.collectPanel.classList.toggle("hidden", !recording);
   const beforeS = collect.before_s ?? 1;
   const betweenS = collect.between_s ?? 0.4;
   const wordSwitchS = collect.word_switch_s ?? beforeS + 0.3;
   const sayS = collect.say_s ?? 1.6;
-  els.collectHint.textContent = picking
-    ? `Choose a word (7 reps each) or run Scramble — ${beforeS}s before each label, ${betweenS}s between reps, ${wordSwitchS}s between scramble words, ${sayS}s to speak`
-    : "Recording active — finish current collection to pick another";
+  els.collectHint.textContent = negativeLabels && busy
+    ? "Negative labels running — click Stop Negative Labels when finished (65% still, 25% off-list words, 10% target words)"
+    : picking
+      ? `Choose a word (7 reps each), run Scramble, or Negative Labels — ${beforeS}s before each label, ${betweenS}s between reps, ${wordSwitchS}s between scramble words, ${sayS}s to speak`
+      : "Recording active — finish current collection to pick another";
 
   els.wordButtons.querySelectorAll(".word-btn").forEach((btn) => {
     btn.disabled = !picking;
@@ -677,6 +681,11 @@ function updateCollectUi(status) {
   if (els.scrambleBtn) els.scrambleBtn.disabled = !picking;
   if (els.scrambleSet) els.scrambleSet.disabled = !picking;
   if (els.scrambleRep) els.scrambleRep.disabled = !picking;
+  if (els.negativeLabelsBtn) {
+    els.negativeLabelsBtn.disabled = !recording || (!picking && !negativeLabels);
+    els.negativeLabelsBtn.textContent = negativeLabels && busy ? "Stop Negative Labels" : "Negative Labels";
+    els.negativeLabelsBtn.classList.toggle("active", negativeLabels && busy);
+  }
 
   els.collectPrompt.classList.toggle("hidden", !busy);
   const wordSwitchCountdown = phase === "countdown" && !!collect.word_switch;
@@ -689,23 +698,36 @@ function updateCollectUi(status) {
     const setTotal = collect.sets_total ?? 1;
     const remaining = collect.phase_remaining_s ?? 0;
     const scramble = mode === "scramble";
-    els.collectPromptWord.textContent = wordSwitchCountdown ? "Next word" : word;
+    const negKind = collect.neg_segment_kind || "";
 
-    const setPrefix = scramble ? `Set ${setIdx}/${setTotal} · ` : "";
-    if (phase === "countdown") {
-      els.collectPromptMain.textContent = wordSwitchCountdown ? word : remaining.toFixed(1);
+    if (phase === "still") {
+      els.collectPromptWord.textContent = "Sit still";
+      els.collectPromptMain.textContent = remaining.toFixed(1);
       els.collectPromptMain.classList.remove("say-it");
-      els.collectPromptSub.textContent = wordSwitchCountdown
-        ? `${setPrefix}${remaining.toFixed(1)}s — new word`
-        : scramble && rep === 1
-          ? `${setPrefix}new word — get ready`
-          : `${setPrefix}Rep ${rep}/${total} — get ready`;
+      els.collectPromptSub.textContent = "Negative labels — no speech";
     } else {
-      els.collectPromptMain.textContent = "SAY IT";
-      els.collectPromptMain.classList.add("say-it");
-      els.collectPromptSub.textContent = scramble
-        ? `${setPrefix}Rep ${rep}/${total} — speak “${word}” now`
-        : `Repetition ${rep}/${total} — speak “${word}” now`;
+      els.collectPromptWord.textContent = wordSwitchCountdown ? "Next word" : word;
+
+      const setPrefix = scramble ? `Set ${setIdx}/${setTotal} · ` : "";
+      if (phase === "countdown") {
+        els.collectPromptMain.textContent = wordSwitchCountdown ? word : remaining.toFixed(1);
+        els.collectPromptMain.classList.remove("say-it");
+        els.collectPromptSub.textContent = wordSwitchCountdown
+          ? `${setPrefix}${remaining.toFixed(1)}s — new word`
+          : negativeLabels
+            ? `${negKind === "positive_word" ? "Target word" : "Off-list word"} — get ready`
+            : scramble && rep === 1
+              ? `${setPrefix}new word — get ready`
+              : `${setPrefix}Rep ${rep}/${total} — get ready`;
+      } else {
+        els.collectPromptMain.textContent = "SAY IT";
+        els.collectPromptMain.classList.add("say-it");
+        els.collectPromptSub.textContent = negativeLabels
+          ? `${negKind === "positive_word" ? "Target word" : "Off-list word"} — speak “${word}” now`
+          : scramble
+            ? `${setPrefix}Rep ${rep}/${total} — speak “${word}” now`
+            : `Repetition ${rep}/${total} — speak “${word}” now`;
+      }
     }
   }
 
@@ -713,7 +735,15 @@ function updateCollectUi(status) {
   if (!recording) {
     trialText = "Collection: not recording";
   } else if (phase === "pick_word") {
-    trialText = "Collection: choose a word or scramble";
+    trialText = "Collection: choose a word, scramble, or negative labels";
+  } else if (negativeLabels) {
+    if (phase === "still") {
+      trialText = "Negative labels: sit still";
+    } else if (phase === "countdown") {
+      trialText = `Negative labels: “${collect.word}” — countdown`;
+    } else if (phase === "say") {
+      trialText = `Negative labels: “${collect.word}” — say it`;
+    }
   } else if (mode === "scramble") {
     if (phase === "countdown") {
       trialText = `Scramble: “${collect.word}” set ${collect.set_index}/${collect.sets_total} rep ${collect.repetition}/${collect.repetitions_total} — countdown`;
@@ -1162,6 +1192,16 @@ if (els.scrambleBtn) {
         set: Number(els.scrambleSet.value),
         rep: Number(els.scrambleRep.value),
       });
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
+}
+
+if (els.negativeLabelsBtn) {
+  els.negativeLabelsBtn.addEventListener("click", async () => {
+    try {
+      await post("/collect/negative-labels/toggle");
     } catch (err) {
       showToast(err.message, true);
     }

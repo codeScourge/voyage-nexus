@@ -379,6 +379,29 @@ button.primary {
   background: #4a3a68;
 }
 
+.negative-labels-btn {
+  min-width: 8.5rem;
+  font-weight: 700;
+  background: #2f3f3a;
+  border-color: #6fbf8f;
+}
+
+.negative-labels-btn.active {
+  position: fixed;
+  bottom: 1.5rem;
+  left: 50%;
+  z-index: 35;
+  transform: translateX(-50%);
+  background: #3a5548;
+  border-color: #8fe0a8;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.55);
+  pointer-events: auto;
+}
+
+.negative-labels-btn:hover:not(:disabled) {
+  background: #3a5548;
+}
+
 .scramble-slider {
   display: flex;
   align-items: center;
