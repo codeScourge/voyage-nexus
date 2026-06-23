@@ -63,6 +63,11 @@ const els = {
   modelTestResult: document.getElementById("model-test-result"),
   modelTestResultMeta: document.getElementById("model-test-result-meta"),
   modelTestResultRows: document.getElementById("model-test-result-rows"),
+  modelUseBtn: document.getElementById("btn-model-use"),
+  modelUsePanel: document.getElementById("model-use-panel"),
+  modelUseMeta: document.getElementById("model-use-meta"),
+  modelUsePrediction: document.getElementById("model-use-prediction"),
+  modelUseBars: document.getElementById("model-use-bars"),
 };
 
 const MARGIN = { left: 44, right: 6, top: 3, bottom: 16 };
@@ -769,7 +774,8 @@ function updateAlignmentUi(status) {
     status.trial_state === "idle" &&
     (status.collect?.phase === "disabled" || status.collect?.phase === "pick_word") &&
     status.model_test?.phase !== "countdown" &&
-    status.model_test?.phase !== "say";
+    status.model_test?.phase !== "say" &&
+    !status.model_use?.active;
 
   if (els.alignmentBtn) {
     els.alignmentBtn.disabled = !canStart;
@@ -868,7 +874,8 @@ function updateModelTestUi(status) {
     status.trial_state === "idle" &&
     (status.collect?.phase === "disabled" || status.collect?.phase === "pick_word") &&
     status.alignment_test?.phase !== "countdown" &&
-    status.alignment_test?.phase !== "blink";
+    status.alignment_test?.phase !== "blink" &&
+    !status.model_use?.active;
 
   if (els.modelTestBtn) {
     els.modelTestBtn.disabled = !canStart;
@@ -1010,16 +1017,127 @@ async function fetchModelTestResult() {
   renderModelTestResult(result);
 }
 
+function renderModelUseBars(container, latest) {
+  if (!container) return;
+  container.replaceChildren();
+  const labelRows = (latest?.predictions || latest?.predictions_by_label || []).slice().sort(
+    (a, b) => (b.probability ?? 0) - (a.probability ?? 0),
+  );
+  if (!labelRows.length || latest?.error) return;
+
+  for (const pred of labelRows) {
+    const item = document.createElement("div");
+    item.className = "model-test-bar-row";
+
+    const label = document.createElement("span");
+    label.className = "model-test-bar-label";
+    label.textContent = pred.label;
+
+    const track = document.createElement("div");
+    track.className = "model-test-bar-track";
+    const fill = document.createElement("div");
+    fill.className = "model-test-bar-fill";
+    if (pred.label === latest.predicted_label) {
+      fill.classList.add("is-top");
+    }
+    fill.style.width = `${Math.min(100, barWidthPct(pred.probability))}%`;
+    track.appendChild(fill);
+
+    const pct = document.createElement("span");
+    pct.className = "model-test-bar-pct";
+    pct.textContent = formatPct(pred.probability);
+
+    item.append(label, track, pct);
+    container.appendChild(item);
+  }
+}
+
+function updateModelUseUi(status) {
+  const modelUse = status.model_use || {
+    active: false,
+    window_s: 1.6,
+    interval_s: 0.4,
+    prediction_count: 0,
+    latest: null,
+  };
+  const active = !!modelUse.active;
+  const modelTestBusy =
+    status.model_test?.phase === "countdown" || status.model_test?.phase === "say";
+  const alignBusy =
+    status.alignment_test?.phase === "countdown" || status.alignment_test?.phase === "blink";
+  const canStart = !active && !modelTestBusy && !alignBusy;
+
+  if (els.modelUseBtn) {
+    els.modelUseBtn.disabled = !canStart && !active;
+    els.modelUseBtn.textContent = active ? "Stop Model" : "Use Model";
+    els.modelUseBtn.classList.toggle("primary", active);
+  }
+
+  els.modelUsePanel?.classList.toggle("hidden", !active);
+
+  if (!active || !els.modelUseMeta || !els.modelUsePrediction) {
+    return;
+  }
+
+  const checkpoint = modelUse.checkpoint || "";
+  const ckptName = checkpoint.split("/").pop() || checkpoint;
+  const windowS = modelUse.window_s ?? 1.6;
+  const intervalS = modelUse.interval_s ?? 0.4;
+  const count = modelUse.prediction_count ?? 0;
+  els.modelUseMeta.textContent = [
+    ckptName ? `checkpoint: ${ckptName}` : null,
+    `${windowS}s window · every ${intervalS}s`,
+    count ? `${count} predictions` : "waiting…",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  els.modelUsePrediction.replaceChildren();
+  const latest = modelUse.latest;
+  if (!latest) {
+    const waiting = document.createElement("span");
+    waiting.className = "model-use-confidence";
+    waiting.textContent = "Waiting for first prediction…";
+    els.modelUsePrediction.appendChild(waiting);
+    els.modelUseBars?.replaceChildren();
+    return;
+  }
+
+  if (latest.error) {
+    const err = document.createElement("span");
+    err.className = "model-use-error";
+    err.textContent = latest.error;
+    els.modelUsePrediction.appendChild(err);
+    els.modelUseBars?.replaceChildren();
+    return;
+  }
+
+  const label = document.createElement("span");
+  label.className = "model-use-label";
+  label.textContent = latest.predicted_label || "—";
+
+  const confidence = document.createElement("span");
+  confidence.className = "model-use-confidence";
+  confidence.textContent = latest.predicted_probability
+    ? formatPct(latest.predicted_probability)
+    : "";
+
+  els.modelUsePrediction.append(label, confidence);
+  renderModelUseBars(els.modelUseBars, latest);
+}
+
 function syncAlignmentStatusPolling(status) {
   const align = status.alignment_test || {};
   const model = status.model_test || {};
+  const modelUse = status.model_use || {};
   const phase = align.phase;
   const modelPhase = model.phase;
   const fast =
     phase === "countdown" ||
     phase === "blink" ||
     modelPhase === "countdown" ||
-    modelPhase === "say";
+    modelPhase === "say" ||
+    !!modelUse.active;
   const hz = fast ? 20 : 0;
   if (hz > 0) {
     if (state.statusPollTimer) return;
@@ -1030,13 +1148,16 @@ function syncAlignmentStatusPolling(status) {
         updateControls(next);
         updateAlignmentUi(next);
         updateModelTestUi(next);
+        updateModelUseUi(next);
         const alignNext = next.alignment_test?.phase;
         const modelNext = next.model_test?.phase;
+        const modelUseNext = next.model_use?.active;
         if (
           alignNext !== "countdown" &&
           alignNext !== "blink" &&
           modelNext !== "countdown" &&
-          modelNext !== "say"
+          modelNext !== "say" &&
+          !modelUseNext
         ) {
           window.clearInterval(state.statusPollTimer);
           state.statusPollTimer = null;
@@ -1065,6 +1186,7 @@ function updateControls(status) {
   updateCollectUi(status);
   updateAlignmentUi(status);
   updateModelTestUi(status);
+  updateModelUseUi(status);
   syncAlignmentStatusPolling(status);
 }
 
@@ -1250,6 +1372,24 @@ if (els.modelTestBtn) {
     els.modelTestResult?.classList.add("hidden");
     try {
       await post("/model-test/start");
+      await refreshStatus();
+    } catch (err) {
+      showToast(err.message, true);
+      try {
+        await refreshStatus();
+      } catch (_) {
+        /* keep existing UI */
+      }
+    }
+  });
+}
+
+if (els.modelUseBtn) {
+  els.modelUseBtn.addEventListener("click", async () => {
+    const active = els.modelUseBtn.classList.contains("primary");
+    els.modelUseBtn.disabled = true;
+    try {
+      await post(active ? "/model-use/stop" : "/model-use/start");
       await refreshStatus();
     } catch (err) {
       showToast(err.message, true);

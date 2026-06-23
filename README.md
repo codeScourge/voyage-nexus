@@ -29,3 +29,8 @@ cd model && uv run visualize.py
     data has a function to pull the events inside which correspond with labeled things. it can also just give the raw array as one, which visualize uses to pick random samples of a length when doing --raw
 
 
+
+
+### training
+in data.py you can decide whether to include silent and unknown word class, as well as the type of preprocessing
+in train.py you choose channels to use 

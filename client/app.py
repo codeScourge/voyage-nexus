@@ -75,12 +75,16 @@ COLLECTION_SAY_S = 1.6
 ALIGNMENT_TEST_PAD_S = 0.3
 ALIGNMENT_TEST_DISPLAY_CHANNELS = tuple(range(8))
 MODEL_TEST_TRIALS = 3
+MODEL_USE_INTERVAL_S = 0.4
+MODEL_USE_WINDOW_S = COLLECTION_SAY_S
 DEFAULT_SCRAMBLE_SET = 5
 DEFAULT_SCRAMBLE_REP = 5
 SCRAMBLE_SET_MIN = 1
 SCRAMBLE_SET_MAX = 20
 SCRAMBLE_REP_MIN = 1
 SCRAMBLE_REP_MAX = 20
+NEGATIVE_LABELS_INCLUDE_NEGATIVE_WORDS = True
+NEGATIVE_LABELS_INCLUDE_POSITIVE_WORDS = True
 NEGATIVE_LABELS_STILL_FRACTION = 0.65
 NEGATIVE_LABELS_NEG_WORD_FRACTION = 0.25
 NEGATIVE_LABELS_POS_WORD_FRACTION = 0.10
@@ -176,7 +180,7 @@ def _ordered_buffer_view(buffer_uv: np.ndarray, write_idx: int) -> np.ndarray:
 
 
 def _preprocess_monitor_window(view: np.ndarray, sample_rate_hz: float) -> np.ndarray:
-    """Apply the same preprocessing as model/data.load_session_channels (line notch + band-pass)."""
+    """Apply line notch + band-pass for live plots (causal notch on sliding windows)."""
     block = np.asarray(view, dtype=np.float32).T  # (time, channels)
     filtered = preprocess_session_channels(
         block,
@@ -184,6 +188,7 @@ def _preprocess_monitor_window(view: np.ndarray, sample_rate_hz: float) -> np.nd
         line_noise=DEFAULT_LINE_NOISE_CONFIG,
         eeg=DEFAULT_EEG_BANDPASS_CONFIG,
         emg=DEFAULT_EMG_BANDPASS_CONFIG,
+        zero_phase=False,
     )
     return filtered.T
 
@@ -704,6 +709,11 @@ class AcquisitionService:
         self._model_test_model_config: Optional[dict[str, Any]] = None
         self._model_test_device = None
 
+        self._model_use_active = False
+        self._model_use_deadline_ns: Optional[int] = None
+        self._model_use_latest: Optional[dict[str, Any]] = None
+        self._model_use_prediction_count = 0
+
         self._latest_sample_index = -1
         self._total_frames = 0
         self._buffer_samples = FILTER_BUFFER_SECONDS * SAMPLE_RATE_HZ
@@ -731,12 +741,14 @@ class AcquisitionService:
                 self._tick_collect()
                 self._tick_alignment_test()
                 self._tick_model_test()
+                self._tick_model_use()
                 continue
             self._push_frame(rx_frame)
             self._tick_countdown()
             self._tick_collect()
             self._tick_alignment_test()
             self._tick_model_test()
+            self._tick_model_use()
 
         while True:
             try:
@@ -894,25 +906,35 @@ class AcquisitionService:
         random.shuffle(pool)
         return pool[:NEGATIVE_LABEL_WORD_COUNT]
 
+    def _negative_labels_segment_targets(self) -> dict[str, float]:
+        if not NEGATIVE_LABELS_INCLUDE_NEGATIVE_WORDS and not NEGATIVE_LABELS_INCLUDE_POSITIVE_WORDS:
+            return {"still": 1.0}
+        targets: dict[str, float] = {"still": NEGATIVE_LABELS_STILL_FRACTION}
+        if NEGATIVE_LABELS_INCLUDE_NEGATIVE_WORDS:
+            targets["negative_word"] = NEGATIVE_LABELS_NEG_WORD_FRACTION
+        if NEGATIVE_LABELS_INCLUDE_POSITIVE_WORDS:
+            targets["positive_word"] = NEGATIVE_LABELS_POS_WORD_FRACTION
+        total = sum(targets.values())
+        return {kind: weight / total for kind, weight in targets.items()}
+
     def _pick_negative_labels_segment(self) -> str:
-        targets = {
-            "still": NEGATIVE_LABELS_STILL_FRACTION,
-            "negative_word": NEGATIVE_LABELS_NEG_WORD_FRACTION,
-            "positive_word": NEGATIVE_LABELS_POS_WORD_FRACTION,
-        }
+        targets = self._negative_labels_segment_targets()
+        if len(targets) == 1:
+            return "still"
         elapsed = {
             "still": self._collect_neg_still_time_s,
             "negative_word": self._collect_neg_negative_word_time_s,
             "positive_word": self._collect_neg_positive_word_time_s,
         }
-        total_elapsed = sum(elapsed.values())
+        total_elapsed = sum(elapsed[kind] for kind in targets)
         if total_elapsed <= 0:
             roll = random.random()
-            if roll < targets["still"]:
-                return "still"
-            if roll < targets["still"] + targets["negative_word"]:
-                return "negative_word"
-            return "positive_word"
+            cumulative = 0.0
+            for kind, weight in targets.items():
+                cumulative += weight
+                if roll < cumulative:
+                    return kind
+            return next(reversed(targets))
 
         deficits = {kind: targets[kind] - (elapsed[kind] / total_elapsed) for kind in targets}
         weights = {kind: max(deficits[kind], 0.01) for kind in targets}
@@ -1236,6 +1258,8 @@ class AcquisitionService:
                 "collection_block_id": block_id,
                 "mode": "negative_labels",
                 "negative_words": list(self._collect_neg_words),
+                "include_negative_words": NEGATIVE_LABELS_INCLUDE_NEGATIVE_WORDS,
+                "include_positive_words": NEGATIVE_LABELS_INCLUDE_POSITIVE_WORDS,
                 "still_fraction": NEGATIVE_LABELS_STILL_FRACTION,
                 "negative_word_fraction": NEGATIVE_LABELS_NEG_WORD_FRACTION,
                 "positive_word_fraction": NEGATIVE_LABELS_POS_WORD_FRACTION,
@@ -1686,6 +1710,8 @@ class AcquisitionService:
             raise RuntimeError("Finish alignment test before running model test")
         if self._model_test_busy():
             raise RuntimeError("Model test already running")
+        if self._model_use_active:
+            raise RuntimeError("Stop model usage before running model test")
         _event_host_ns, aligned_float, aligned_idx, _method = self._aligned_sample_now()
         if aligned_idx is None:
             raise RuntimeError("No samples yet; wait for EEG stream")
@@ -1704,6 +1730,126 @@ class AcquisitionService:
         if self._model_test_phase != "result" or self._model_test_result is None:
             raise RuntimeError("No model test result available")
         return self._model_test_result
+
+    def _model_use_busy(self) -> bool:
+        return self._model_use_active
+
+    def _reset_model_use(self) -> None:
+        self._model_use_active = False
+        self._model_use_deadline_ns = None
+        self._model_use_latest = None
+        self._model_use_prediction_count = 0
+
+    def _model_use_status(self) -> dict[str, Any]:
+        return {
+            "active": self._model_use_active,
+            "window_s": MODEL_USE_WINDOW_S,
+            "interval_s": MODEL_USE_INTERVAL_S,
+            "prediction_count": self._model_use_prediction_count,
+            "checkpoint": self._model_test_checkpoint,
+            "latest": self._model_use_latest,
+        }
+
+    def _capture_model_use_window(self) -> dict[str, Any]:
+        with self._lock:
+            latest = self._latest_sample_index
+            filled = min(self._total_frames, self._buffer_samples)
+
+        if latest < 0 or filled <= 0:
+            return {"error": "no samples yet"}
+
+        window_samples = int(round(MODEL_USE_WINDOW_S * SAMPLE_RATE_HZ))
+        if filled < window_samples:
+            return {
+                "error": f"need {window_samples} samples, have {filled}",
+            }
+
+        end_idx = latest
+        start_idx = end_idx - window_samples + 1
+        window_tc = self._extract_training_aligned_window(start_idx, end_idx)
+        if window_tc is None:
+            return {
+                "error": "rolling window is no longer in the ring buffer",
+                "sample_index_start": start_idx,
+                "sample_index_end": end_idx,
+            }
+
+        return {
+            "sample_index_start": start_idx,
+            "sample_index_end": end_idx,
+            "window_tc": window_tc,
+            "window_len": int(window_tc.shape[0]),
+        }
+
+    def _predict_model_use_window(self, capture: dict[str, Any]) -> dict[str, Any]:
+        row: dict[str, Any] = {
+            "sample_index_start": capture.get("sample_index_start"),
+            "sample_index_end": capture.get("sample_index_end"),
+            "window_len": capture.get("window_len"),
+        }
+        if capture.get("error"):
+            row["error"] = capture["error"]
+            return row
+        window_tc = capture.get("window_tc")
+        if window_tc is None:
+            row["error"] = "missing window"
+            return row
+        if self._model_test_nn is None:
+            row["error"] = "model not loaded"
+            return row
+
+        idx_to_label = self._model_test_idx_to_label or {}
+        pred = predict_fusion_batch(
+            self._model_test_nn,
+            [np.asarray(window_tc, dtype=np.float32)],
+            device=self._model_test_device,
+            idx_to_label=idx_to_label,
+        )[0]
+        row.update(pred)
+        labeled_probs = {
+            idx_to_label[i]: round(float(pred["probs"][i]), 4)
+            for i in range(len(pred["probs"]))
+        }
+        print(
+            f"[model-use] samples {row.get('sample_index_start')}–{row.get('sample_index_end')}: "
+            f"probs={labeled_probs} "
+            f"pred={pred['predicted_label']} ({pred['predicted_probability']:.4f})",
+            flush=True,
+        )
+        return row
+
+    def _tick_model_use(self) -> None:
+        if not self._model_use_active:
+            return
+        deadline = self._model_use_deadline_ns
+        if deadline is None or time.perf_counter_ns() < deadline:
+            return
+
+        capture = self._capture_model_use_window()
+        self._model_use_latest = self._predict_model_use_window(capture)
+        self._model_use_prediction_count += 1
+        self._model_use_deadline_ns = time.perf_counter_ns() + int(MODEL_USE_INTERVAL_S * 1_000_000_000)
+
+    def start_model_use(self) -> None:
+        if self._model_test_busy():
+            raise RuntimeError("Finish model test before using the model")
+        if self._alignment_test_busy():
+            raise RuntimeError("Finish alignment test before using the model")
+        if self._model_use_active:
+            raise RuntimeError("Model usage already active")
+        with self._lock:
+            latest = self._latest_sample_index
+        if latest < 0:
+            raise RuntimeError("No samples yet; wait for EEG stream")
+
+        self._load_model_for_test()
+        self._model_use_active = True
+        self._model_use_latest = None
+        self._model_use_prediction_count = 0
+        self._model_use_deadline_ns = time.perf_counter_ns()
+
+    def stop_model_use(self) -> None:
+        self._reset_model_use()
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -1731,6 +1877,7 @@ class AcquisitionService:
             "collect": self._collect_status(),
             "alignment_test": self._alignment_test_status(),
             "model_test": self._model_test_status(),
+            "model_use": self._model_use_status(),
         }
 
     def waveform(
@@ -2148,6 +2295,16 @@ def create_app(service: AcquisitionService) -> Flask:
     @app.get("/model-test/result")
     def model_test_result() -> Any:
         return jsonify(service.model_test_result())
+
+    @app.post("/model-use/start")
+    def start_model_use() -> Any:
+        service.start_model_use()
+        return jsonify(service.status()["model_use"])
+
+    @app.post("/model-use/stop")
+    def stop_model_use() -> Any:
+        service.stop_model_use()
+        return jsonify(service.status()["model_use"])
 
     @app.post("/events/marker")
     def marker() -> Any:

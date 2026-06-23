@@ -24,6 +24,7 @@
       <button type="button" id="btn-record" class="primary">Start Session Recording</button>
       <button type="button" id="btn-alignment-test">Alignment Test</button>
       <button type="button" id="btn-model-test">Test Model</button>
+      <button type="button" id="btn-model-use">Use Model</button>
     </section>
 
     <section id="collect-panel" class="collect-panel hidden">
@@ -80,6 +81,15 @@
         <button type="button" id="btn-model-test-dismiss">Dismiss</button>
       </div>
       <div id="model-test-result-rows" class="model-test-result-rows"></div>
+    </section>
+
+    <section id="model-use-panel" class="model-use-panel hidden" aria-live="polite">
+      <div class="model-use-head">
+        <h2>Live model</h2>
+        <p id="model-use-meta" class="model-use-meta"></p>
+      </div>
+      <div id="model-use-prediction" class="model-use-prediction"></div>
+      <div id="model-use-bars" class="model-test-bars"></div>
     </section>
 
     <div id="word-switch-flash" class="word-switch-flash" aria-hidden="true"></div>

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.signal import butter, sosfiltfilt
+from scipy.signal import butter, iirnotch, sosfilt, sosfiltfilt, tf2sos
 
 EEG_CHANNELS = slice(0, 16)
 EMG_CHANNELS = slice(16, 32)
@@ -72,42 +72,6 @@ def _notch_frequencies(
     return tuple(sorted(set(out)))
 
 
-def _notch_biquad_coeffs(
-    sample_rate_hz: float,
-    notch_hz: float,
-    q: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """RBJ peaking EQ configured as a notch (gain = 0). Returns (b, a) with a[0] == 1."""
-    w0 = 2.0 * np.pi * notch_hz / sample_rate_hz
-    cos_w0 = float(np.cos(w0))
-    sin_w0 = float(np.sin(w0))
-    alpha = sin_w0 / (2.0 * q)
-    b0 = 1.0
-    b1 = -2.0 * cos_w0
-    b2 = 1.0
-    a0 = 1.0 + alpha
-    a1 = -2.0 * cos_w0
-    a2 = 1.0 - alpha
-    b = np.array([b0, b1, b2], dtype=np.float64) / a0
-    a = np.array([1.0, a1 / a0, a2 / a0], dtype=np.float64)
-    return b, a
-
-
-def _biquad_filter_1d(x: np.ndarray, b: np.ndarray, a: np.ndarray) -> np.ndarray:
-    y = np.empty_like(x, dtype=np.float32)
-    x1 = x2 = 0.0
-    y1 = y2 = 0.0
-    b0, b1, b2 = float(b[0]), float(b[1]), float(b[2])
-    a1, a2 = float(a[1]), float(a[2])
-    for i in range(x.shape[0]):
-        x0 = float(x[i])
-        yn = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
-        x2, x1 = x1, x0
-        y2, y1 = y1, yn
-        y[i] = np.float32(yn)
-    return y
-
-
 def notch_filter(
     x: np.ndarray,
     sample_rate_hz: float,
@@ -115,31 +79,42 @@ def notch_filter(
     *,
     q: float = 30.0,
     axis: int = -1,
+    zero_phase: bool = True,
 ) -> np.ndarray:
-    """Second-order IIR notch at ``notch_hz`` (forward pass)."""
+    """IIR notch at ``notch_hz``.
+
+    Uses zero-phase forward-backward filtering by default (offline batch data).
+    Set ``zero_phase=False`` for causal single-pass filtering (live monitor windows).
+    """
     _validate_cutoff(sample_rate_hz, notch_hz, label="notch_hz")
-    b, a = _notch_biquad_coeffs(sample_rate_hz, notch_hz, q)
-    moved = np.moveaxis(np.asarray(x, dtype=np.float32), axis, 0)
-    if moved.ndim == 1:
-        filtered = _biquad_filter_1d(moved, b, a)
-    else:
-        filtered = np.empty_like(moved)
-        for ch in range(moved.shape[1]):
-            filtered[:, ch] = _biquad_filter_1d(moved[:, ch], b, a)
-    return np.moveaxis(filtered, 0, axis)
+    b, a = iirnotch(notch_hz, q, sample_rate_hz)
+    sos = tf2sos(b, a)
+    x32 = np.asarray(x, dtype=np.float32)
+    if zero_phase:
+        return sosfiltfilt(sos, x32, axis=axis).astype(np.float32)
+    return sosfilt(sos, x32, axis=axis).astype(np.float32)
 
 
 def apply_line_noise_notch(
     channels: np.ndarray,
     sample_rate_hz: float,
     config: LineNoiseConfig = DEFAULT_LINE_NOISE_CONFIG,
+    *,
+    zero_phase: bool = True,
 ) -> np.ndarray:
     """Cascade notches for 50/60 Hz (and optional harmonics) on all channels."""
     out = np.asarray(channels, dtype=np.float32)
     if out.ndim != 2:
         raise ValueError(f"Expected (time, channels) array, got shape {out.shape}")
     for notch_hz in _notch_frequencies(sample_rate_hz, config):
-        out = notch_filter(out, sample_rate_hz, notch_hz, q=config.q, axis=0)
+        out = notch_filter(
+            out,
+            sample_rate_hz,
+            notch_hz,
+            q=config.q,
+            axis=0,
+            zero_phase=zero_phase,
+        )
     return out
 
 
@@ -151,11 +126,12 @@ def preprocess_session_channels(
     eeg: BandpassConfig | None = DEFAULT_EEG_BANDPASS_CONFIG,
     emg: BandpassConfig | None = DEFAULT_EMG_BANDPASS_CONFIG,
     order: int = 4,
+    zero_phase: bool = True,
 ) -> np.ndarray:
     """Line-noise notches first, then per-modality band-pass."""
     out = np.asarray(channels, dtype=np.float32)
     if line_noise is not None:
-        out = apply_line_noise_notch(out, sample_rate_hz, line_noise)
+        out = apply_line_noise_notch(out, sample_rate_hz, line_noise, zero_phase=zero_phase)
     if eeg is not None or emg is not None:
         out = apply_session_bandpass(out, sample_rate_hz, eeg=eeg, emg=emg, order=order)
     return out

@@ -785,6 +785,69 @@ button.primary {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
+.model-use-panel {
+  flex-shrink: 0;
+  margin: 0 0.5rem 0.35rem;
+  padding: 0.5rem 0.65rem;
+  background: var(--panel);
+  border: 1px solid #3fb950;
+  border-radius: 6px;
+  max-height: 28vh;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.model-use-panel.hidden {
+  display: none;
+}
+
+.model-use-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.35rem 0.75rem;
+  margin-bottom: 0.35rem;
+}
+
+.model-use-head h2 {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+
+.model-use-meta {
+  margin: 0;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.model-use-prediction {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.35rem 0.75rem;
+  margin-bottom: 0.35rem;
+}
+
+.model-use-label {
+  font-size: clamp(1.4rem, 4vw, 2.2rem);
+  font-weight: 800;
+  color: #3fb950;
+  text-transform: lowercase;
+}
+
+.model-use-confidence {
+  font-size: 0.85rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.model-use-error {
+  font-size: 0.85rem;
+  color: #f85149;
+}
+
 @media (max-width: 900px) {
   .top-bar {
     grid-template-columns: 1fr;

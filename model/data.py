@@ -4,6 +4,7 @@ import csv
 import json
 import os
 import random
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Any, Optional, Sequence, Union
 import numpy as np
 import torch
 from torch.utils.data import Dataset, Subset
+from tqdm import tqdm
 
 from _preprocessors import (
     BandpassConfig,
@@ -22,6 +24,10 @@ from _preprocessors import (
     preprocess_session_channels,
 )
 
+# Include negative-label classes when building windows and label maps.
+INCLUDE_UNKNOWN_WORD_LABEL = False
+INCLUDE_SILENCE_LABEL = True
+
 EEG_RECORD_FORMAT = "<QQ32f"
 EEG_RECORD_FORMAT_CODES_LEGACY = "<QQ32i"
 
@@ -31,13 +37,18 @@ COLLECTION_SAY_S = 1.6
 TARGET_WORDS: frozenset[str] = frozenset({"highlight", "bullshit", "gogogo"})
 UNKNOWN_WORD_LABEL = "unknown word"
 SILENCE_LABEL = "silence"
-ALL_LABELS: tuple[str, ...] = (
-    "highlight",
-    "bullshit",
-    "gogogo",
-    UNKNOWN_WORD_LABEL,
-    SILENCE_LABEL,
-)
+
+
+def all_labels() -> tuple[str, ...]:
+    labels: list[str] = ["highlight", "bullshit", "gogogo"]
+    if INCLUDE_UNKNOWN_WORD_LABEL:
+        labels.append(UNKNOWN_WORD_LABEL)
+    if INCLUDE_SILENCE_LABEL:
+        labels.append(SILENCE_LABEL)
+    return tuple(labels)
+
+
+ALL_LABELS: tuple[str, ...] = all_labels()
 SILENT_SPEECH_WORD_EVENT = "silent_speech_word"
 NEGATIVE_LABELS_BLOCK_START_EVENT = "silent_speech_block_start"
 NEGATIVE_LABELS_BLOCK_END_EVENT = "silent_speech_block_end"
@@ -176,7 +187,7 @@ def load_eeg_frames(session_dir: Path) -> np.ndarray:
     dtype = eeg_record_dtype(meta)
     frames = np.fromfile(eeg_path, dtype=dtype)
     if frames.size == 0:
-        raise RuntimeError("No EEG frames in session")
+        raise RuntimeError(f"No EEG frames in session {session_dir}")
     return frames
 
 
@@ -200,7 +211,7 @@ def parse_event_payload(event: dict[str, str]) -> dict[str, Any]:
 
 
 def default_label_to_idx() -> dict[str, int]:
-    return {label: idx for idx, label in enumerate(ALL_LABELS)}
+    return {label: idx for idx, label in enumerate(all_labels())}
 
 
 def normalize_word_label(label: str) -> Optional[str]:
@@ -484,6 +495,9 @@ def build_event_windows(
         if label is None:
             skipped += 1
             continue
+        if label == UNKNOWN_WORD_LABEL and not INCLUDE_UNKNOWN_WORD_LABEL:
+            skipped += 1
+            continue
 
         start_text = event.get("sample_index_start", "")
         if not start_text:
@@ -520,20 +534,21 @@ def build_event_windows(
         event_ids.append(event.get("event_id", ""))
         center_samples.append(start_idx)
 
-    skipped = _append_silence_windows(
-        channels=channels,
-        events=events,
-        index_to_row=index_to_row,
-        fs=fs,
-        pre_samples=pre_samples,
-        post_samples=post_samples,
-        raw_windows=raw_windows,
-        labels=labels,
-        event_type_list=event_type_list,
-        event_ids=event_ids,
-        center_samples=center_samples,
-        skipped=skipped,
-    )
+    if INCLUDE_SILENCE_LABEL:
+        skipped = _append_silence_windows(
+            channels=channels,
+            events=events,
+            index_to_row=index_to_row,
+            fs=fs,
+            pre_samples=pre_samples,
+            post_samples=post_samples,
+            raw_windows=raw_windows,
+            labels=labels,
+            event_type_list=event_type_list,
+            event_ids=event_ids,
+            center_samples=center_samples,
+            skipped=skipped,
+        )
 
     if raw_windows:
         if target_len is None:
@@ -622,6 +637,7 @@ class SessionEventDataset(Dataset):
         label_to_idx: Optional[dict[str, int]] = None,
         dtype: torch.dtype = torch.float32,
         channel_first: bool = False,
+        show_progress: bool = False,
     ) -> None:
         if isinstance(session_dirs, (str, Path)):
             dirs = [Path(session_dirs)]
@@ -630,8 +646,17 @@ class SessionEventDataset(Dataset):
         if not dirs:
             raise ValueError("session_dirs must not be empty")
 
-        batches = [
-            build_event_windows(
+        batches: list[EventWindowBatch] = []
+        progress = tqdm(
+            dirs,
+            desc="Building event windows",
+            unit="session",
+            disable=not show_progress,
+        )
+        build_started = time.perf_counter()
+        for session_dir in progress:
+            session_started = time.perf_counter()
+            batch = build_event_windows(
                 session_dir,
                 pre_ms=pre_ms,
                 post_ms=post_ms,
@@ -641,8 +666,14 @@ class SessionEventDataset(Dataset):
                 emg_bandpass=emg_bandpass,
                 filter_order=filter_order,
             )
-            for session_dir in dirs
-        ]
+            batches.append(batch)
+            session_elapsed = time.perf_counter() - session_started
+            progress.set_postfix(
+                windows=len(batch.labels),
+                skipped=batch.skipped,
+                last_s=f"{session_elapsed:.1f}",
+            )
+        self.build_elapsed_s = time.perf_counter() - build_started
         batch = _merge_batches(batches)
 
         self._batch = batch
@@ -717,6 +748,7 @@ class SessionEventDataset(Dataset):
         dataset._label_to_idx = label_to_idx
         dataset._dtype = dtype
         dataset._channel_first = channel_first
+        dataset.build_elapsed_s = 0.0
         return dataset
 
 
@@ -839,6 +871,7 @@ def build_dataset_splits(
     post_ms: float = 700.0,
     extra_session_test_split: float = 0.2,
     intra_session_test_split: float = 0.15,
+    show_progress: bool = True,
 ) -> DatasetSplits:
     from _viewer_core import discover_sessions
 
@@ -848,6 +881,7 @@ def build_dataset_splits(
         sessions,
         pre_ms=pre_ms,
         post_ms=post_ms,
+        show_progress=show_progress,
     )
     (
         train_indices,
@@ -987,7 +1021,7 @@ def label_distribution(
     dataset: SessionEventDataset,
     indices: Sequence[int],
 ) -> dict[str, int]:
-    counts: dict[str, int] = {label: 0 for label in ALL_LABELS}
+    counts: dict[str, int] = {label: 0 for label in all_labels()}
     for index in indices:
         label = dataset[int(index)]["label"]
         counts[label] = counts.get(label, 0) + 1
@@ -996,11 +1030,11 @@ def label_distribution(
 
 def print_label_distribution(name: str, counts: dict[str, int], total: int) -> None:
     print(f"{name} label distribution ({total} samples):")
-    for label in ALL_LABELS:
+    for label in all_labels():
         count = counts.get(label, 0)
         pct = (100.0 * count / total) if total else 0.0
         print(f"  {label:14s} {count:5d}  ({pct:5.1f}%)")
-    extra = sorted(label for label in counts if label not in ALL_LABELS and counts[label] > 0)
+    extra = sorted(label for label in counts if label not in all_labels() and counts[label] > 0)
     for label in extra:
         count = counts[label]
         pct = (100.0 * count / total) if total else 0.0
@@ -1044,13 +1078,25 @@ if __name__ == "__main__":
     set_split_seed(SEED)
     seed_everything(SEED)
 
+    total_started = time.perf_counter()
+    build_started = time.perf_counter()
     splits = build_dataset_splits(
         RECORDINGS_PATH,
         pre_ms=PRE_MS,
         post_ms=POST_MS,
         extra_session_test_split=EXTRA_SESSION_TEST_SPLIT,
         intra_session_test_split=INTRA_SESSION_TEST_SPLIT,
+        show_progress=True,
     )
+    build_elapsed = time.perf_counter() - build_started
+
+    save_started = time.perf_counter()
     save_dataset_splits(SPLITS_OUTPUT_DIR, splits)
+    save_elapsed = time.perf_counter() - save_started
+    total_elapsed = time.perf_counter() - total_started
+
     print(f"Saved splits to {SPLITS_OUTPUT_DIR.resolve()}")
+    print(
+        f"Timing: build={build_elapsed:.1f}s, save={save_elapsed:.1f}s, total={total_elapsed:.1f}s"
+    )
     print_split_summary(splits)
