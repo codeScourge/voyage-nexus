@@ -36,11 +36,14 @@ const els = {
   collectPanel: document.getElementById("collect-panel"),
   collectHint: document.getElementById("collect-hint"),
   wordButtons: document.getElementById("word-buttons"),
+  wordWeightSliders: document.getElementById("word-weight-sliders"),
+  negativeLabelMixSliders: document.getElementById("negative-label-mix-sliders"),
   collectPrompt: document.getElementById("collect-prompt"),
   collectPromptWord: document.getElementById("collect-prompt-word"),
   collectPromptMain: document.getElementById("collect-prompt-main"),
   collectPromptSub: document.getElementById("collect-prompt-sub"),
-  scrambleBtn: document.getElementById("btn-scramble"),
+  scrambleFastBtn: document.getElementById("btn-scramble-fast"),
+  scrambleBreaksBtn: document.getElementById("btn-scramble-breaks"),
   scrambleSet: document.getElementById("scramble-set"),
   scrambleRep: document.getElementById("scramble-rep"),
   scrambleSetVal: document.getElementById("scramble-set-val"),
@@ -615,6 +618,169 @@ function ensureWordButtons(words) {
   els.wordButtons.dataset.built = words.join(",");
 }
 
+let wordWeightPostTimer = null;
+let negMixPostTimer = null;
+
+function formatDistributionWeight(value) {
+  return Number(value).toFixed(2);
+}
+
+function normalizedMixSummary(weights, labels) {
+  const entries = Object.entries(weights || {}).filter(([, value]) => Number(value) > 0);
+  const total = entries.reduce((sum, [, value]) => sum + Number(value), 0);
+  if (!total) return "no active segments";
+  return entries
+    .map(([key, value]) => {
+      const label = labels?.[key] || key;
+      const pct = Math.round((Number(value) / total) * 100);
+      return `${label} ${pct}%`;
+    })
+    .join(", ");
+}
+
+async function postWordWeight(word, weight) {
+  try {
+    await post("/collect/word-weights", { weights: { [word]: Number(weight) } });
+  } catch (err) {
+    showToast(err.message, true);
+  }
+}
+
+function queueWordWeightPost(word, weight) {
+  if (wordWeightPostTimer) window.clearTimeout(wordWeightPostTimer);
+  wordWeightPostTimer = window.setTimeout(() => {
+    wordWeightPostTimer = null;
+    postWordWeight(word, weight);
+  }, 120);
+}
+
+async function postNegMixWeight(key, weight) {
+  try {
+    await post("/collect/negative-label-mix", { weights: { [key]: Number(weight) } });
+  } catch (err) {
+    showToast(err.message, true);
+  }
+}
+
+function queueNegMixWeightPost(key, weight) {
+  if (negMixPostTimer) window.clearTimeout(negMixPostTimer);
+  negMixPostTimer = window.setTimeout(() => {
+    negMixPostTimer = null;
+    postNegMixWeight(key, weight);
+  }, 120);
+}
+
+function buildDistributionSliders({
+  container,
+  builtKey,
+  items,
+  collect,
+  weightsKey,
+  defaultsKey,
+  onInput,
+  inputDatasetKey,
+}) {
+  if (!container) return;
+  if (container.dataset.built === builtKey) {
+    syncDistributionSliderValues(container, collect, weightsKey, defaultsKey, inputDatasetKey);
+    return;
+  }
+
+  const min = collect.word_weight_min ?? 0;
+  const max = collect.word_weight_max ?? 1;
+  const step = collect.word_weight_step ?? 0.05;
+  const defaults = collect[defaultsKey] || {};
+
+  container.innerHTML = "";
+  for (const item of items) {
+    const label = document.createElement("label");
+    label.className = "distribution-slider";
+
+    const name = document.createElement("span");
+    name.textContent = item.label;
+
+    const input = document.createElement("input");
+    input.type = "range";
+    input.min = String(min);
+    input.max = String(max);
+    input.step = String(step);
+    input.id = `${item.idPrefix}-${item.key}`;
+    input.dataset[inputDatasetKey] = item.key;
+    input.value = String(defaults[item.key] ?? 0);
+
+    const output = document.createElement("output");
+    output.htmlFor = input.id;
+    output.textContent = formatDistributionWeight(input.value);
+
+    input.addEventListener("input", () => {
+      input.dataset.touched = "1";
+      output.textContent = formatDistributionWeight(input.value);
+      onInput(item.key, input.value);
+    });
+
+    label.append(name, input, output);
+    container.appendChild(label);
+  }
+  container.dataset.built = builtKey;
+  syncDistributionSliderValues(container, collect, weightsKey, defaultsKey, inputDatasetKey);
+}
+
+function syncDistributionSliderValues(container, collect, weightsKey, defaultsKey, inputDatasetKey) {
+  const weights = collect[weightsKey] || collect[defaultsKey] || {};
+  container.querySelectorAll("input[type='range']").forEach((input) => {
+    const key = input.dataset[inputDatasetKey];
+    if (!key || input.dataset.touched === "1") return;
+    if (weights[key] === undefined) return;
+    input.value = String(weights[key]);
+    const output = input.parentElement?.querySelector("output");
+    if (output) output.textContent = formatDistributionWeight(input.value);
+  });
+}
+
+function setDistributionSlidersDisabled(container, disabled) {
+  if (!container) return;
+  container.querySelectorAll("input[type='range']").forEach((input) => {
+    input.disabled = disabled;
+  });
+}
+
+function ensureWordWeightSliders(collect = {}) {
+  const words = collect.words || [];
+  buildDistributionSliders({
+    container: els.wordWeightSliders,
+    builtKey: words.join(","),
+    items: words.map((word) => ({
+      key: word,
+      label: word,
+      idPrefix: "word-weight",
+    })),
+    collect,
+    weightsKey: "word_weights",
+    defaultsKey: "default_word_weights",
+    inputDatasetKey: "word",
+    onInput: queueWordWeightPost,
+  });
+}
+
+function ensureNegativeLabelMixSliders(collect = {}) {
+  const keys = collect.neg_mix_keys || ["still", "negative_word", "positive_word"];
+  const labels = collect.neg_mix_labels || {};
+  buildDistributionSliders({
+    container: els.negativeLabelMixSliders,
+    builtKey: keys.join(","),
+    items: keys.map((key) => ({
+      key,
+      label: labels[key] || key,
+      idPrefix: "neg-mix",
+    })),
+    collect,
+    weightsKey: "neg_mix_weights",
+    defaultsKey: "default_neg_mix_weights",
+    inputDatasetKey: "mixKey",
+    onInput: queueNegMixWeightPost,
+  });
+}
+
 function syncScrambleSliderLabels(collect = {}) {
   if (els.scrambleSet) {
     els.scrambleSet.min = String(collect.scramble_set_min ?? 1);
@@ -664,10 +830,16 @@ function updateCollectUi(status) {
 
   syncScrambleSliderLabels(collect);
   ensureWordButtons(collect.words || []);
+  ensureWordWeightSliders(collect);
+  ensureNegativeLabelMixSliders(collect);
 
   const picking = recording && phase === "pick_word";
   const busy = phase === "countdown" || phase === "say" || phase === "still";
   const negativeLabels = mode === "negative_labels";
+  const mixSummary = normalizedMixSummary(
+    collect.neg_mix_weights || collect.default_neg_mix_weights,
+    collect.neg_mix_labels,
+  );
 
   els.collectPanel.classList.toggle("hidden", !recording);
   const beforeS = collect.before_s ?? 1;
@@ -675,17 +847,20 @@ function updateCollectUi(status) {
   const wordSwitchS = collect.word_switch_s ?? beforeS + 0.3;
   const sayS = collect.say_s ?? 1.6;
   els.collectHint.textContent = negativeLabels && busy
-    ? "Negative labels running — click Stop Negative Labels when finished (65% still, 25% off-list words, 10% target words)"
+    ? `Negative labels running — target mix: ${mixSummary} — click Stop Negative Labels when finished`
     : picking
-      ? `Choose a word (7 reps each), run Scramble, or Negative Labels — ${beforeS}s before each label, ${betweenS}s between reps, ${wordSwitchS}s between scramble words, ${sayS}s to speak`
+      ? `Choose a word, tune distributions below, then Scramble or Negative Labels — Fast: ${beforeS}s / ${betweenS}s / ${wordSwitchS}s gaps; Breaks: ${sayS}s between reps`
       : "Recording active — finish current collection to pick another";
 
   els.wordButtons.querySelectorAll(".word-btn").forEach((btn) => {
     btn.disabled = !picking;
   });
-  if (els.scrambleBtn) els.scrambleBtn.disabled = !picking;
+  if (els.scrambleFastBtn) els.scrambleFastBtn.disabled = !picking;
+  if (els.scrambleBreaksBtn) els.scrambleBreaksBtn.disabled = !picking;
   if (els.scrambleSet) els.scrambleSet.disabled = !picking;
   if (els.scrambleRep) els.scrambleRep.disabled = !picking;
+  setDistributionSlidersDisabled(els.wordWeightSliders, !picking);
+  setDistributionSlidersDisabled(els.negativeLabelMixSliders, !picking);
   if (els.negativeLabelsBtn) {
     els.negativeLabelsBtn.disabled = !recording || (!picking && !negativeLabels);
     els.negativeLabelsBtn.textContent = negativeLabels && busy ? "Stop Negative Labels" : "Negative Labels";
@@ -702,7 +877,7 @@ function updateCollectUi(status) {
     const setIdx = collect.set_index ?? 1;
     const setTotal = collect.sets_total ?? 1;
     const remaining = collect.phase_remaining_s ?? 0;
-    const scramble = mode === "scramble";
+    const scramble = mode === "scramble" || mode === "scramble-breaks";
     const negKind = collect.neg_segment_kind || "";
 
     if (phase === "still") {
@@ -719,6 +894,8 @@ function updateCollectUi(status) {
         els.collectPromptMain.classList.remove("say-it");
         els.collectPromptSub.textContent = wordSwitchCountdown
           ? `${setPrefix}${remaining.toFixed(1)}s — new word`
+          : collect.trailing_break
+            ? `${setPrefix}final break — ${remaining.toFixed(1)}s`
           : negativeLabels
             ? `${negKind === "positive_word" ? "Target word" : "Off-list word"} — get ready`
             : scramble && rep === 1
@@ -740,7 +917,7 @@ function updateCollectUi(status) {
   if (!recording) {
     trialText = "Collection: not recording";
   } else if (phase === "pick_word") {
-    trialText = "Collection: choose a word, scramble, or negative labels";
+    trialText = "Collection: choose a word, scramble fast/breaks, or negative labels";
   } else if (negativeLabels) {
     if (phase === "still") {
       trialText = "Negative labels: sit still";
@@ -749,11 +926,12 @@ function updateCollectUi(status) {
     } else if (phase === "say") {
       trialText = `Negative labels: “${collect.word}” — say it`;
     }
-  } else if (mode === "scramble") {
+  } else if (mode === "scramble" || mode === "scramble-breaks") {
+    const scrambleLabel = mode === "scramble-breaks" ? "Scramble Breaks" : "Scramble Fast";
     if (phase === "countdown") {
-      trialText = `Scramble: “${collect.word}” set ${collect.set_index}/${collect.sets_total} rep ${collect.repetition}/${collect.repetitions_total} — countdown`;
+      trialText = `${scrambleLabel}: “${collect.word}” set ${collect.set_index}/${collect.sets_total} rep ${collect.repetition}/${collect.repetitions_total} — countdown`;
     } else if (phase === "say") {
-      trialText = `Scramble: “${collect.word}” set ${collect.set_index}/${collect.sets_total} rep ${collect.repetition}/${collect.repetitions_total} — say it`;
+      trialText = `${scrambleLabel}: “${collect.word}” set ${collect.set_index}/${collect.sets_total} rep ${collect.repetition}/${collect.repetitions_total} — say it`;
     }
   } else if (phase === "countdown") {
     trialText = `Collection: “${collect.word}” rep ${collect.repetition}/${collect.repetitions_total} — countdown`;
@@ -1307,17 +1485,23 @@ if (els.scrambleRep) {
   });
 }
 
-if (els.scrambleBtn) {
-  els.scrambleBtn.addEventListener("click", async () => {
-    try {
-      await post("/collect/scramble", {
-        set: Number(els.scrambleSet.value),
-        rep: Number(els.scrambleRep.value),
-      });
-    } catch (err) {
-      showToast(err.message, true);
-    }
-  });
+async function startScramble(endpoint) {
+  try {
+    await post(endpoint, {
+      set: Number(els.scrambleSet.value),
+      rep: Number(els.scrambleRep.value),
+    });
+  } catch (err) {
+    showToast(err.message, true);
+  }
+}
+
+if (els.scrambleFastBtn) {
+  els.scrambleFastBtn.addEventListener("click", () => startScramble("/collect/scramble"));
+}
+
+if (els.scrambleBreaksBtn) {
+  els.scrambleBreaksBtn.addEventListener("click", () => startScramble("/collect/scramble-breaks"));
 }
 
 if (els.negativeLabelsBtn) {

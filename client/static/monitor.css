@@ -358,18 +358,104 @@ button.primary {
   background: #354070;
 }
 
-.scramble-row {
+.word-weight-sliders,
+.distribution-sliders {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+}
+
+.word-weight-slider,
+.distribution-slider {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.distribution-slider span {
+  min-width: 6.5rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.collect-word-weights-section .distribution-slider span {
+  min-width: 4.75rem;
+  text-transform: lowercase;
+}
+
+.negative-labels-column .distribution-slider span {
+  min-width: 7.5rem;
+}
+
+.word-weight-slider input[type="range"],
+.distribution-slider input[type="range"] {
+  width: 5.5rem;
+  accent-color: var(--accent);
+}
+
+.word-weight-slider output,
+.distribution-slider output {
+  min-width: 2.25rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.collect-section {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+}
+
+.collect-subhead {
+  margin: 0 0 0.35rem;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text);
+}
+
+.collect-subhint {
+  margin: 0 0 0.55rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.collect-modes-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.85rem;
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+}
+
+.collect-mode-column {
+  flex: 1 1 18rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.scramble-column {
+  background: #1a2238;
+}
+
+.negative-labels-column {
+  background: #182622;
+}
+
+.scramble-controls {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 0.75rem;
-  margin-top: 0.65rem;
-  padding-top: 0.65rem;
-  border-top: 1px solid var(--border);
 }
 
 .scramble-btn {
-  min-width: 6.5rem;
+  min-width: 7.5rem;
   font-weight: 700;
   background: #3a2f50;
   border-color: #9b7fd4;
@@ -384,6 +470,7 @@ button.primary {
   font-weight: 700;
   background: #2f3f3a;
   border-color: #6fbf8f;
+  margin-bottom: 0.55rem;
 }
 
 .negative-labels-btn.active {
@@ -400,6 +487,10 @@ button.primary {
 
 .negative-labels-btn:hover:not(:disabled) {
   background: #3a5548;
+}
+
+.negative-labels-column .distribution-slider input[type="range"] {
+  accent-color: #6fbf8f;
 }
 
 .scramble-slider {

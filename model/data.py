@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import random
@@ -37,10 +38,19 @@ COLLECTION_SAY_S = 1.6
 TARGET_WORDS: frozenset[str] = frozenset({"highlight", "bullshit", "gogogo"})
 UNKNOWN_WORD_LABEL = "unknown word"
 SILENCE_LABEL = "silence"
+WORD_STARTING_LABEL = "word starting"
+WORD_ENDING_LABEL = "word ending"
+SCRAMBLE_BREAKS_MODE = "scramble-breaks"
+SCRAMBLE_BREAKS_BLOCK_START_EVENT = "silent_speech_scramble_start"
+SCRAMBLE_BREAKS_SAMPLES_PER_WORD = 7
+SCRAMBLE_BREAKS_SHIFT_MIN_S = 0.2
+SCRAMBLE_BREAKS_SHIFT_MAX_S = 1.4
+SCRAMBLE_BREAKS_WORD_MIN_SILENCE_S = 0.4
+SCRAMBLE_BREAKS_TRANSITION_MAX_SILENCE_S = 1.2
 
 
 def all_labels() -> tuple[str, ...]:
-    labels: list[str] = ["highlight", "bullshit", "gogogo"]
+    labels: list[str] = ["highlight", "bullshit", "gogogo", WORD_STARTING_LABEL, WORD_ENDING_LABEL]
     if INCLUDE_UNKNOWN_WORD_LABEL:
         labels.append(UNKNOWN_WORD_LABEL)
     if INCLUDE_SILENCE_LABEL:
@@ -407,6 +417,225 @@ def _append_silence_windows(
     return skipped
 
 
+def _stable_event_seed(event_id: str) -> int:
+    digest = hashlib.md5(event_id.encode(), usedforsecurity=False).hexdigest()
+    return int(digest[:8], 16)
+
+
+def _scramble_breaks_shift_label(*, shift_s: float, word: str) -> str:
+    if shift_s == 0.0:
+        return word
+    silence_s = abs(shift_s)
+    if silence_s <= SCRAMBLE_BREAKS_WORD_MIN_SILENCE_S:
+        return word
+    if silence_s < SCRAMBLE_BREAKS_TRANSITION_MAX_SILENCE_S:
+        return WORD_STARTING_LABEL if shift_s < 0 else WORD_ENDING_LABEL
+    return SILENCE_LABEL
+
+
+def _scramble_breaks_shifts_s(event_id: str) -> tuple[float, ...]:
+    rng = random.Random(_stable_event_seed(event_id))
+    shifts = [0.0]
+    for _ in range(3):
+        shifts.append(-rng.uniform(SCRAMBLE_BREAKS_SHIFT_MIN_S, SCRAMBLE_BREAKS_SHIFT_MAX_S))
+    for _ in range(3):
+        shifts.append(rng.uniform(SCRAMBLE_BREAKS_SHIFT_MIN_S, SCRAMBLE_BREAKS_SHIFT_MAX_S))
+    return tuple(shifts)
+
+
+def _scramble_breaks_blocks(events: Sequence[dict[str, str]]) -> list[dict[str, Any]]:
+    pending: dict[str, int] = {}
+    blocks: list[dict[str, Any]] = []
+    for event in events:
+        payload = parse_event_payload(event)
+        block_id = str(payload.get("collection_block_id", "")).strip()
+        if not block_id:
+            continue
+        event_type = event.get("event_type", "")
+        start_text = event.get("sample_index_start", "")
+        if not start_text:
+            continue
+        if (
+            event_type == SCRAMBLE_BREAKS_BLOCK_START_EVENT
+            and payload.get("mode") == SCRAMBLE_BREAKS_MODE
+        ):
+            pending[block_id] = int(start_text)
+            continue
+        if (
+            event_type == NEGATIVE_LABELS_BLOCK_END_EVENT
+            and payload.get("mode") == SCRAMBLE_BREAKS_MODE
+        ):
+            block_start = pending.pop(block_id, None)
+            if block_start is None:
+                continue
+            block_end = int(start_text)
+            if block_end <= block_start:
+                continue
+            blocks.append(
+                {
+                    "block_id": block_id,
+                    "start_idx": block_start,
+                    "end_idx": block_end,
+                }
+            )
+    return blocks
+
+
+def _scramble_breaks_word_spans(
+    events: Sequence[dict[str, str]],
+    block_id: str,
+    *,
+    fs: float,
+    index_to_row: dict[int, int],
+) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for event in events:
+        if event.get("event_type", "") != SILENT_SPEECH_WORD_EVENT:
+            continue
+        payload = parse_event_payload(event)
+        if str(payload.get("collection_block_id", "")).strip() != block_id:
+            continue
+        if payload.get("mode") != SCRAMBLE_BREAKS_MODE:
+            continue
+        start_text = event.get("sample_index_start", "")
+        if not start_text:
+            continue
+        start_idx = int(start_text)
+        start_row = index_to_row.get(start_idx)
+        if start_row is None:
+            continue
+        end_idx, _end_row = _event_sample_end(
+            event,
+            start_idx,
+            start_row,
+            fs=fs,
+            index_to_row=index_to_row,
+        )
+        if end_idx <= start_idx:
+            continue
+        spans.append((start_idx, end_idx))
+    spans.sort(key=lambda span: span[0])
+    return spans
+
+
+def _extract_shifted_channel_window(
+    channels: np.ndarray,
+    start_row: int,
+    end_row: int,
+    *,
+    shift_samples: int,
+    pre_samples: int,
+    post_samples: int,
+) -> Optional[np.ndarray]:
+    return _extract_channel_window(
+        channels,
+        start_row + shift_samples,
+        end_row + shift_samples,
+        pre_samples=pre_samples,
+        post_samples=post_samples,
+    )
+
+
+def _append_scramble_breaks_word_windows(
+    *,
+    channels: np.ndarray,
+    event: dict[str, str],
+    word: str,
+    start_idx: int,
+    start_row: int,
+    end_idx: int,
+    end_row: int,
+    fs: float,
+    pre_samples: int,
+    post_samples: int,
+    raw_windows: list[np.ndarray],
+    labels: list[str],
+    event_type_list: list[str],
+    event_ids: list[str],
+    center_samples: list[int],
+) -> int:
+    skipped = 0
+    event_id = event.get("event_id", "")
+    for shift_s in _scramble_breaks_shifts_s(event_id):
+        shift_samples = int(round(shift_s * fs))
+        window = _extract_shifted_channel_window(
+            channels,
+            start_row,
+            end_row,
+            shift_samples=shift_samples,
+            pre_samples=pre_samples,
+            post_samples=post_samples,
+        )
+        if window is None:
+            skipped += 1
+            continue
+        label = _scramble_breaks_shift_label(shift_s=shift_s, word=word)
+        center = start_idx + shift_samples + (end_idx - start_idx) // 2
+        raw_windows.append(window)
+        labels.append(label)
+        event_type_list.append("scramble_breaks_word_shift")
+        if shift_s == 0.0:
+            event_ids.append(event_id)
+        else:
+            event_ids.append(f"{event_id}:shift={shift_s:+.3f}")
+        center_samples.append(center)
+    return skipped
+
+
+def _append_scramble_breaks_silence_windows(
+    *,
+    channels: np.ndarray,
+    events: Sequence[dict[str, str]],
+    index_to_row: dict[int, int],
+    fs: float,
+    pre_samples: int,
+    post_samples: int,
+    raw_windows: list[np.ndarray],
+    labels: list[str],
+    event_type_list: list[str],
+    event_ids: list[str],
+    center_samples: list[int],
+    skipped: int,
+) -> int:
+    for block in _scramble_breaks_blocks(events):
+        block_id = str(block["block_id"])
+        word_spans = _scramble_breaks_word_spans(
+            events,
+            block_id,
+            fs=fs,
+            index_to_row=index_to_row,
+        )
+        for gap_start, gap_end in _negative_labels_silence_spans(
+            int(block["start_idx"]),
+            int(block["end_idx"]),
+            word_spans,
+        ):
+            start_row = index_to_row.get(gap_start)
+            if start_row is None:
+                skipped += 1
+                continue
+            end_row = index_to_row.get(gap_end)
+            if end_row is None:
+                end_row = start_row + max(0, gap_end - gap_start)
+            window = _extract_channel_window(
+                channels,
+                start_row,
+                end_row,
+                pre_samples=pre_samples,
+                post_samples=post_samples,
+            )
+            if window is None:
+                skipped += 1
+                continue
+            center = gap_start + (gap_end - gap_start) // 2
+            raw_windows.append(window)
+            labels.append(SILENCE_LABEL)
+            event_type_list.append("scramble_breaks_silence")
+            event_ids.append(f"silence:{block_id}:{gap_start}-{gap_end}")
+            center_samples.append(center)
+    return skipped
+
+
 def window_sample_counts(
     sample_rate_hz: float,
     pre_ms: float,
@@ -491,6 +720,47 @@ def build_event_windows(
         if event_type != SILENT_SPEECH_WORD_EVENT:
             continue
 
+        payload = parse_event_payload(event)
+        if payload.get("mode") == SCRAMBLE_BREAKS_MODE:
+            label = normalize_word_label(event.get("label_text", ""))
+            if label is None or label == UNKNOWN_WORD_LABEL:
+                skipped += 1
+                continue
+            start_text = event.get("sample_index_start", "")
+            if not start_text:
+                skipped += 1
+                continue
+            start_idx = int(start_text)
+            start_row = index_to_row.get(start_idx)
+            if start_row is None:
+                skipped += 1
+                continue
+            end_idx, end_row = _event_sample_end(
+                event,
+                start_idx,
+                start_row,
+                fs=fs,
+                index_to_row=index_to_row,
+            )
+            skipped += _append_scramble_breaks_word_windows(
+                channels=channels,
+                event=event,
+                word=label,
+                start_idx=start_idx,
+                start_row=start_row,
+                end_idx=end_idx,
+                end_row=end_row,
+                fs=fs,
+                pre_samples=pre_samples,
+                post_samples=post_samples,
+                raw_windows=raw_windows,
+                labels=labels,
+                event_type_list=event_type_list,
+                event_ids=event_ids,
+                center_samples=center_samples,
+            )
+            continue
+
         label = normalize_word_label(event.get("label_text", ""))
         if label is None:
             skipped += 1
@@ -536,6 +806,20 @@ def build_event_windows(
 
     if INCLUDE_SILENCE_LABEL:
         skipped = _append_silence_windows(
+            channels=channels,
+            events=events,
+            index_to_row=index_to_row,
+            fs=fs,
+            pre_samples=pre_samples,
+            post_samples=post_samples,
+            raw_windows=raw_windows,
+            labels=labels,
+            event_type_list=event_type_list,
+            event_ids=event_ids,
+            center_samples=center_samples,
+            skipped=skipped,
+        )
+        skipped = _append_scramble_breaks_silence_windows(
             channels=channels,
             events=events,
             index_to_row=index_to_row,
