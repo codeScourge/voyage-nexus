@@ -28,6 +28,13 @@ from _preprocessors import (
 # Include negative-label classes when building windows and label maps.
 INCLUDE_UNKNOWN_WORD_LABEL = False
 INCLUDE_SILENCE_LABEL = True
+INCLUDE_TRANSITION_LABELS = False
+
+# --- scramble-breaks transition sampling (edit these)
+SCRAMBLE_BREAKS_SHIFTS_PER_TRANSITION = 3
+SCRAMBLE_BREAKS_SHIFT_MIN_S = -1.2
+SCRAMBLE_BREAKS_SHIFT_MAX_S = 1.2
+SCRAMBLE_BREAKS_DOMINANT_FRACTION = 0.75
 
 EEG_RECORD_FORMAT = "<QQ32f"
 EEG_RECORD_FORMAT_CODES_LEGACY = "<QQ32i"
@@ -35,22 +42,26 @@ EEG_RECORD_FORMAT_CODES_LEGACY = "<QQ32i"
 # Match client/app.py — duration of each silent_speech_word "say" window.
 COLLECTION_SAY_S = 1.6
 
-TARGET_WORDS: frozenset[str] = frozenset({"highlight", "bullshit", "gogogo"})
+TARGET_WORDS: tuple[str, ...] = (
+    "highlight",
+    "bullshit",
+    "gogogo",
+    "shitbull",
+    "hangar",
+    "teaspoon",
+)
 UNKNOWN_WORD_LABEL = "unknown word"
 SILENCE_LABEL = "silence"
 WORD_STARTING_LABEL = "word starting"
 WORD_ENDING_LABEL = "word ending"
 SCRAMBLE_BREAKS_MODE = "scramble-breaks"
 SCRAMBLE_BREAKS_BLOCK_START_EVENT = "silent_speech_scramble_start"
-SCRAMBLE_BREAKS_SAMPLES_PER_WORD = 7
-SCRAMBLE_BREAKS_SHIFT_MIN_S = 0.2
-SCRAMBLE_BREAKS_SHIFT_MAX_S = 1.4
-SCRAMBLE_BREAKS_WORD_MIN_SILENCE_S = 0.4
-SCRAMBLE_BREAKS_TRANSITION_MAX_SILENCE_S = 1.2
 
 
 def all_labels() -> tuple[str, ...]:
-    labels: list[str] = ["highlight", "bullshit", "gogogo", WORD_STARTING_LABEL, WORD_ENDING_LABEL]
+    labels: list[str] = list(TARGET_WORDS)
+    if INCLUDE_TRANSITION_LABELS:
+        labels.extend([WORD_STARTING_LABEL, WORD_ENDING_LABEL])
     if INCLUDE_UNKNOWN_WORD_LABEL:
         labels.append(UNKNOWN_WORD_LABEL)
     if INCLUDE_SILENCE_LABEL:
@@ -422,25 +433,49 @@ def _stable_event_seed(event_id: str) -> int:
     return int(digest[:8], 16)
 
 
-def _scramble_breaks_shift_label(*, shift_s: float, word: str) -> str:
-    if shift_s == 0.0:
-        return word
-    silence_s = abs(shift_s)
-    if silence_s <= SCRAMBLE_BREAKS_WORD_MIN_SILENCE_S:
-        return word
-    if silence_s < SCRAMBLE_BREAKS_TRANSITION_MAX_SILENCE_S:
-        return WORD_STARTING_LABEL if shift_s < 0 else WORD_ENDING_LABEL
-    return SILENCE_LABEL
+def _interval_overlap(start_a: float, end_a: float, start_b: float, end_b: float) -> float:
+    return max(0.0, min(end_a, end_b) - max(start_a, start_b))
 
 
-def _scramble_breaks_shifts_s(event_id: str) -> tuple[float, ...]:
-    rng = random.Random(_stable_event_seed(event_id))
-    shifts = [0.0]
-    for _ in range(3):
-        shifts.append(-rng.uniform(SCRAMBLE_BREAKS_SHIFT_MIN_S, SCRAMBLE_BREAKS_SHIFT_MAX_S))
-    for _ in range(3):
-        shifts.append(rng.uniform(SCRAMBLE_BREAKS_SHIFT_MIN_S, SCRAMBLE_BREAKS_SHIFT_MAX_S))
-    return tuple(shifts)
+def _transition_phase_fractions(*, shift_s: float, window_s: float, kind: str) -> tuple[float, float]:
+    """Fraction of a transition-centered window in silence vs word regions."""
+    half = window_s / 2.0
+    win_start = shift_s - half
+    win_end = shift_s + half
+    if kind == "silence_to_word":
+        silence_len = _interval_overlap(win_start, win_end, -1e9, 0.0)
+        word_len = _interval_overlap(win_start, win_end, 0.0, 1e9)
+    else:
+        word_len = _interval_overlap(win_start, win_end, -1e9, 0.0)
+        silence_len = _interval_overlap(win_start, win_end, 0.0, 1e9)
+    total = max(window_s, silence_len + word_len)
+    if total <= 0.0:
+        return 0.5, 0.5
+    return silence_len / total, word_len / total
+
+
+def _transition_shift_label(
+    *,
+    kind: str,
+    word: str,
+    silence_frac: float,
+    word_frac: float,
+) -> str:
+    if silence_frac >= SCRAMBLE_BREAKS_DOMINANT_FRACTION:
+        return SILENCE_LABEL
+    if word_frac >= SCRAMBLE_BREAKS_DOMINANT_FRACTION:
+        return word
+    if kind == "silence_to_word":
+        return WORD_STARTING_LABEL
+    return WORD_ENDING_LABEL
+
+
+def _scramble_breaks_transition_shifts_s(boundary_key: str) -> tuple[float, ...]:
+    rng = random.Random(_stable_event_seed(boundary_key))
+    return tuple(
+        rng.uniform(SCRAMBLE_BREAKS_SHIFT_MIN_S, SCRAMBLE_BREAKS_SHIFT_MAX_S)
+        for _ in range(SCRAMBLE_BREAKS_SHIFTS_PER_TRANSITION)
+    )
 
 
 def _scramble_breaks_blocks(events: Sequence[dict[str, str]]) -> list[dict[str, Any]]:
@@ -487,8 +522,8 @@ def _scramble_breaks_word_spans(
     *,
     fs: float,
     index_to_row: dict[int, int],
-) -> list[tuple[int, int]]:
-    spans: list[tuple[int, int]] = []
+) -> list[tuple[int, int, str]]:
+    spans: list[tuple[int, int, str]] = []
     for event in events:
         if event.get("event_type", "") != SILENT_SPEECH_WORD_EVENT:
             continue
@@ -496,6 +531,9 @@ def _scramble_breaks_word_spans(
         if str(payload.get("collection_block_id", "")).strip() != block_id:
             continue
         if payload.get("mode") != SCRAMBLE_BREAKS_MODE:
+            continue
+        word = normalize_word_label(event.get("label_text", ""))
+        if word is None or word == UNKNOWN_WORD_LABEL:
             continue
         start_text = event.get("sample_index_start", "")
         if not start_text:
@@ -513,38 +551,57 @@ def _scramble_breaks_word_spans(
         )
         if end_idx <= start_idx:
             continue
-        spans.append((start_idx, end_idx))
+        spans.append((start_idx, end_idx, word))
     spans.sort(key=lambda span: span[0])
     return spans
 
 
-def _extract_shifted_channel_window(
+def _scramble_breaks_transitions(
+    word_spans: Sequence[tuple[int, int, str]],
+) -> list[dict[str, Any]]:
+    transitions: list[dict[str, Any]] = []
+    for start_idx, end_idx, word in word_spans:
+        transitions.append(
+            {
+                "boundary_idx": start_idx,
+                "kind": "silence_to_word",
+                "word": word,
+            }
+        )
+        transitions.append(
+            {
+                "boundary_idx": end_idx,
+                "kind": "word_to_silence",
+                "word": word,
+            }
+        )
+    return transitions
+
+
+def _extract_centered_transition_window(
     channels: np.ndarray,
-    start_row: int,
-    end_row: int,
+    boundary_row: int,
     *,
     shift_samples: int,
+    window_half_samples: int,
     pre_samples: int,
     post_samples: int,
 ) -> Optional[np.ndarray]:
+    center_row = boundary_row + shift_samples
     return _extract_channel_window(
         channels,
-        start_row + shift_samples,
-        end_row + shift_samples,
+        center_row - window_half_samples,
+        center_row + window_half_samples,
         pre_samples=pre_samples,
         post_samples=post_samples,
     )
 
 
-def _append_scramble_breaks_word_windows(
+def _append_scramble_breaks_transition_windows(
     *,
     channels: np.ndarray,
-    event: dict[str, str],
-    word: str,
-    start_idx: int,
-    start_row: int,
-    end_idx: int,
-    end_row: int,
+    events: Sequence[dict[str, str]],
+    index_to_row: dict[int, int],
     fs: float,
     pre_samples: int,
     post_samples: int,
@@ -555,30 +612,56 @@ def _append_scramble_breaks_word_windows(
     center_samples: list[int],
 ) -> int:
     skipped = 0
-    event_id = event.get("event_id", "")
-    for shift_s in _scramble_breaks_shifts_s(event_id):
-        shift_samples = int(round(shift_s * fs))
-        window = _extract_shifted_channel_window(
-            channels,
-            start_row,
-            end_row,
-            shift_samples=shift_samples,
-            pre_samples=pre_samples,
-            post_samples=post_samples,
+    window_s = COLLECTION_SAY_S
+    window_half_samples = max(1, int(round(window_s * fs / 2.0)))
+
+    for block in _scramble_breaks_blocks(events):
+        block_id = str(block["block_id"])
+        word_spans = _scramble_breaks_word_spans(
+            events,
+            block_id,
+            fs=fs,
+            index_to_row=index_to_row,
         )
-        if window is None:
-            skipped += 1
-            continue
-        label = _scramble_breaks_shift_label(shift_s=shift_s, word=word)
-        center = start_idx + shift_samples + (end_idx - start_idx) // 2
-        raw_windows.append(window)
-        labels.append(label)
-        event_type_list.append("scramble_breaks_word_shift")
-        if shift_s == 0.0:
-            event_ids.append(event_id)
-        else:
-            event_ids.append(f"{event_id}:shift={shift_s:+.3f}")
-        center_samples.append(center)
+        for transition in _scramble_breaks_transitions(word_spans):
+            boundary_idx = int(transition["boundary_idx"])
+            boundary_row = index_to_row.get(boundary_idx)
+            if boundary_row is None:
+                skipped += SCRAMBLE_BREAKS_SHIFTS_PER_TRANSITION
+                continue
+            kind = str(transition["kind"])
+            word = str(transition["word"])
+            boundary_key = f"{block_id}:{kind}:{boundary_idx}:{word}"
+            for shift_s in _scramble_breaks_transition_shifts_s(boundary_key):
+                shift_samples = int(round(shift_s * fs))
+                window = _extract_centered_transition_window(
+                    channels,
+                    boundary_row,
+                    shift_samples=shift_samples,
+                    window_half_samples=window_half_samples,
+                    pre_samples=pre_samples,
+                    post_samples=post_samples,
+                )
+                if window is None:
+                    skipped += 1
+                    continue
+                silence_frac, word_frac = _transition_phase_fractions(
+                    shift_s=shift_s,
+                    window_s=window_s,
+                    kind=kind,
+                )
+                label = _transition_shift_label(
+                    kind=kind,
+                    word=word,
+                    silence_frac=silence_frac,
+                    word_frac=word_frac,
+                )
+                center = boundary_idx + shift_samples
+                raw_windows.append(window)
+                labels.append(label)
+                event_type_list.append("scramble_breaks_transition")
+                event_ids.append(f"{boundary_key}:shift={shift_s:+.3f}")
+                center_samples.append(center)
     return skipped
 
 
@@ -595,8 +678,8 @@ def _append_scramble_breaks_silence_windows(
     event_type_list: list[str],
     event_ids: list[str],
     center_samples: list[int],
-    skipped: int,
 ) -> int:
+    skipped = 0
     for block in _scramble_breaks_blocks(events):
         block_id = str(block["block_id"])
         word_spans = _scramble_breaks_word_spans(
@@ -605,10 +688,11 @@ def _append_scramble_breaks_silence_windows(
             fs=fs,
             index_to_row=index_to_row,
         )
+        span_pairs = [(start_idx, end_idx) for start_idx, end_idx, _word in word_spans]
         for gap_start, gap_end in _negative_labels_silence_spans(
             int(block["start_idx"]),
             int(block["end_idx"]),
-            word_spans,
+            span_pairs,
         ):
             start_row = index_to_row.get(gap_start)
             if start_row is None:
@@ -721,44 +805,7 @@ def build_event_windows(
             continue
 
         payload = parse_event_payload(event)
-        if payload.get("mode") == SCRAMBLE_BREAKS_MODE:
-            label = normalize_word_label(event.get("label_text", ""))
-            if label is None or label == UNKNOWN_WORD_LABEL:
-                skipped += 1
-                continue
-            start_text = event.get("sample_index_start", "")
-            if not start_text:
-                skipped += 1
-                continue
-            start_idx = int(start_text)
-            start_row = index_to_row.get(start_idx)
-            if start_row is None:
-                skipped += 1
-                continue
-            end_idx, end_row = _event_sample_end(
-                event,
-                start_idx,
-                start_row,
-                fs=fs,
-                index_to_row=index_to_row,
-            )
-            skipped += _append_scramble_breaks_word_windows(
-                channels=channels,
-                event=event,
-                word=label,
-                start_idx=start_idx,
-                start_row=start_row,
-                end_idx=end_idx,
-                end_row=end_row,
-                fs=fs,
-                pre_samples=pre_samples,
-                post_samples=post_samples,
-                raw_windows=raw_windows,
-                labels=labels,
-                event_type_list=event_type_list,
-                event_ids=event_ids,
-                center_samples=center_samples,
-            )
+        if payload.get("mode") == SCRAMBLE_BREAKS_MODE and INCLUDE_TRANSITION_LABELS:
             continue
 
         label = normalize_word_label(event.get("label_text", ""))
@@ -804,8 +851,8 @@ def build_event_windows(
         event_ids.append(event.get("event_id", ""))
         center_samples.append(start_idx)
 
-    if INCLUDE_SILENCE_LABEL:
-        skipped = _append_silence_windows(
+    if INCLUDE_TRANSITION_LABELS:
+        skipped += _append_scramble_breaks_transition_windows(
             channels=channels,
             events=events,
             index_to_row=index_to_row,
@@ -817,9 +864,24 @@ def build_event_windows(
             event_type_list=event_type_list,
             event_ids=event_ids,
             center_samples=center_samples,
-            skipped=skipped,
         )
-        skipped = _append_scramble_breaks_silence_windows(
+    elif INCLUDE_SILENCE_LABEL:
+        skipped += _append_scramble_breaks_silence_windows(
+            channels=channels,
+            events=events,
+            index_to_row=index_to_row,
+            fs=fs,
+            pre_samples=pre_samples,
+            post_samples=post_samples,
+            raw_windows=raw_windows,
+            labels=labels,
+            event_type_list=event_type_list,
+            event_ids=event_ids,
+            center_samples=center_samples,
+        )
+
+    if INCLUDE_SILENCE_LABEL:
+        skipped = _append_silence_windows(
             channels=channels,
             events=events,
             index_to_row=index_to_row,
