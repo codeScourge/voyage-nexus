@@ -1083,10 +1083,13 @@ class AcquisitionService:
             "trailing_break": self._collect_trailing_break if self._collect_phase == "countdown" else False,
             "default_scramble_set": DEFAULT_SCRAMBLE_SET,
             "default_scramble_rep": DEFAULT_SCRAMBLE_REP,
+            "default_single_repetitions": COLLECTION_REPETITIONS,
             "scramble_set_min": SCRAMBLE_SET_MIN,
             "scramble_set_max": SCRAMBLE_SET_MAX,
             "scramble_rep_min": SCRAMBLE_REP_MIN,
             "scramble_rep_max": SCRAMBLE_REP_MAX,
+            "single_rep_min": SCRAMBLE_REP_MIN,
+            "single_rep_max": SCRAMBLE_REP_MAX,
             "word_weights": dict(self._collect_word_weights),
             "default_word_weights": default_collection_word_weights(),
             "word_weight_min": WORD_WEIGHT_MIN,
@@ -1246,13 +1249,15 @@ class AcquisitionService:
             },
         )
 
-    def start_collect_word(self, word: str) -> None:
+    def start_collect_word(self, word: str, repetitions: int = COLLECTION_REPETITIONS) -> None:
         if not self._recorder.enabled:
             raise RuntimeError("Start session recording first")
         if self._collect_phase != "pick_word":
             raise RuntimeError("Finish the current collection before choosing another")
         if self._trial_state != TrialState.IDLE:
             raise RuntimeError("Another trial is already active")
+        if not SCRAMBLE_REP_MIN <= repetitions <= SCRAMBLE_REP_MAX:
+            raise RuntimeError(f"rep must be between {SCRAMBLE_REP_MIN} and {SCRAMBLE_REP_MAX}")
         word = word.strip().lower()
         if word not in COLLECTION_WORDS:
             raise RuntimeError(f"Word must be one of: {', '.join(COLLECTION_WORDS)}")
@@ -1263,7 +1268,7 @@ class AcquisitionService:
         block_id = uuid.uuid4().hex
         self._collect_block_id = block_id
         self._collect_mode = "single"
-        self._collect_reps_total = COLLECTION_REPETITIONS
+        self._collect_reps_total = repetitions
         self._collect_set_idx = 0
         self._collect_set_total = 0
         self._collect_prev_word = ""
@@ -1280,7 +1285,7 @@ class AcquisitionService:
                 "collection_block_id": block_id,
                 "word": word,
                 "mode": "single",
-                "repetitions_planned": COLLECTION_REPETITIONS,
+                "repetitions_planned": repetitions,
             },
         )
 
@@ -2355,7 +2360,8 @@ def create_app(service: AcquisitionService) -> Flask:
     def collect_word() -> Any:
         payload = request.get_json(silent=True) or {}
         word = str(payload.get("word", "")).strip()
-        service.start_collect_word(word)
+        rep_count = int(payload.get("rep", COLLECTION_REPETITIONS))
+        service.start_collect_word(word, repetitions=rep_count)
         return jsonify(service.status()["collect"])
 
     @app.post("/collect/word-weights")

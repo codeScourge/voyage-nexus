@@ -44,6 +44,8 @@ const els = {
   collectPromptSub: document.getElementById("collect-prompt-sub"),
   scrambleFastBtn: document.getElementById("btn-scramble-fast"),
   scrambleBreaksBtn: document.getElementById("btn-scramble-breaks"),
+  singleRep: document.getElementById("single-rep"),
+  singleRepVal: document.getElementById("single-rep-val"),
   scrambleSet: document.getElementById("scramble-set"),
   scrambleRep: document.getElementById("scramble-rep"),
   scrambleSetVal: document.getElementById("scramble-set-val"),
@@ -608,7 +610,10 @@ function ensureWordButtons(words) {
     btn.dataset.word = word;
     btn.addEventListener("click", async () => {
       try {
-        await post("/collect/word", { word });
+        await post("/collect/word", {
+          word,
+          rep: Number(els.singleRep?.value ?? 7),
+        });
       } catch (err) {
         showToast(err.message, true);
       }
@@ -781,6 +786,18 @@ function ensureNegativeLabelMixSliders(collect = {}) {
   });
 }
 
+function syncSingleRepSlider(collect = {}) {
+  if (!els.singleRep) return;
+  els.singleRep.min = String(collect.single_rep_min ?? 1);
+  els.singleRep.max = String(collect.single_rep_max ?? 20);
+  if (!els.singleRep.dataset.touched) {
+    els.singleRep.value = String(collect.default_single_repetitions ?? 7);
+  }
+  if (els.singleRepVal) {
+    els.singleRepVal.textContent = els.singleRep.value;
+  }
+}
+
 function syncScrambleSliderLabels(collect = {}) {
   if (els.scrambleSet) {
     els.scrambleSet.min = String(collect.scramble_set_min ?? 1);
@@ -828,6 +845,7 @@ function updateCollectUi(status) {
     maybeFlashWordSwitch(collect);
   }
 
+  syncSingleRepSlider(collect);
   syncScrambleSliderLabels(collect);
   ensureWordButtons(collect.words || []);
   ensureWordWeightSliders(collect);
@@ -857,6 +875,7 @@ function updateCollectUi(status) {
   });
   if (els.scrambleFastBtn) els.scrambleFastBtn.disabled = !picking;
   if (els.scrambleBreaksBtn) els.scrambleBreaksBtn.disabled = !picking;
+  if (els.singleRep) els.singleRep.disabled = !picking;
   if (els.scrambleSet) els.scrambleSet.disabled = !picking;
   if (els.scrambleRep) els.scrambleRep.disabled = !picking;
   setDistributionSlidersDisabled(els.wordWeightSliders, !picking);
@@ -873,7 +892,7 @@ function updateCollectUi(status) {
   if (busy) {
     const word = collect.word || "";
     const rep = collect.repetition ?? 1;
-    const total = collect.repetitions_total ?? 7;
+    const total = collect.repetitions_total ?? collect.default_single_repetitions ?? 7;
     const setIdx = collect.set_index ?? 1;
     const setTotal = collect.sets_total ?? 1;
     const remaining = collect.phase_remaining_s ?? 0;
@@ -886,7 +905,12 @@ function updateCollectUi(status) {
       els.collectPromptMain.classList.remove("say-it");
       els.collectPromptSub.textContent = "Negative labels — no speech";
     } else {
-      els.collectPromptWord.textContent = wordSwitchCountdown ? "Next word" : word;
+      const trailingBreak = !!collect.trailing_break;
+      els.collectPromptWord.textContent = wordSwitchCountdown
+        ? "Next word"
+        : trailingBreak
+          ? "Silent"
+          : word;
 
       const setPrefix = scramble ? `Set ${setIdx}/${setTotal} · ` : "";
       if (phase === "countdown") {
@@ -894,7 +918,7 @@ function updateCollectUi(status) {
         els.collectPromptMain.classList.remove("say-it");
         els.collectPromptSub.textContent = wordSwitchCountdown
           ? `${setPrefix}${remaining.toFixed(1)}s — new word`
-          : collect.trailing_break
+          : trailingBreak
             ? `${setPrefix}final break — ${remaining.toFixed(1)}s`
           : negativeLabels
             ? `${negKind === "positive_word" ? "Target word" : "Off-list word"} — get ready`
@@ -929,7 +953,9 @@ function updateCollectUi(status) {
   } else if (mode === "scramble" || mode === "scramble-breaks") {
     const scrambleLabel = mode === "scramble-breaks" ? "Scramble Breaks" : "Scramble Fast";
     if (phase === "countdown") {
-      trialText = `${scrambleLabel}: “${collect.word}” set ${collect.set_index}/${collect.sets_total} rep ${collect.repetition}/${collect.repetitions_total} — countdown`;
+      trialText = collect.trailing_break
+        ? `${scrambleLabel}: silent — final break`
+        : `${scrambleLabel}: “${collect.word}” set ${collect.set_index}/${collect.sets_total} rep ${collect.repetition}/${collect.repetitions_total} — countdown`;
     } else if (phase === "say") {
       trialText = `${scrambleLabel}: “${collect.word}” set ${collect.set_index}/${collect.sets_total} rep ${collect.repetition}/${collect.repetitions_total} — say it`;
     }
@@ -1470,6 +1496,13 @@ document.getElementById("btn-record").addEventListener("click", async () => {
     }
   }
 });
+
+if (els.singleRep) {
+  els.singleRep.addEventListener("input", () => {
+    els.singleRep.dataset.touched = "1";
+    if (els.singleRepVal) els.singleRepVal.textContent = els.singleRep.value;
+  });
+}
 
 if (els.scrambleSet) {
   els.scrambleSet.addEventListener("input", () => {
