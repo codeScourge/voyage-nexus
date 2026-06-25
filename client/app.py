@@ -66,23 +66,25 @@ DEFAULT_BAUD = 2_000_000
 DEFAULT_RECORDINGS_DIR = "recordings"
 ALIGNMENT_WINDOW_FRAMES = 512
 THINKING_COUNTDOWN_SECONDS = 3
-COLLECTION_WORDS = ("highlight", "bullshit", "gogogo", "shitbull", "hangar", "teaspoon")
+COLLECTION_WORDS = ("highlight", "bullshit", "gogogo", "shitbull", "hangar", "teaspoon", "naan", "quail")
 COLLECTION_WORD_DEFAULT_WEIGHTS: dict[str, float] = {
-    "highlight": 0.35,
-    "bullshit": 0.35,
-    "gogogo": 0.35,
-    "shitbull": 1.0,
-    "hangar": 1.0,
-    "teaspoon": 1.0,
+    "highlight": 0.20,
+    "bullshit": 0.20,
+    "gogogo": 0.20,
+    "shitbull": 0.7,
+    "hangar": 0.7,
+    "teaspoon": 0.7,
+    "naan": 1.0,
+    "quail": 1.0
 }
 COLLECTION_REPETITIONS = 7
 WORD_WEIGHT_MIN = 0.0
 WORD_WEIGHT_MAX = 1.0
 WORD_WEIGHT_STEP = 0.05
 NEGATIVE_LABEL_MIX_DEFAULT_WEIGHTS: dict[str, float] = {
-    "still": 0.65,
-    "negative_word": 0.25,
-    "positive_word": 0.10,
+    "still": 0.35,
+    "negative_word": 0.35,
+    "positive_word": 0.30,
 }
 NEGATIVE_LABEL_MIX_LABELS: dict[str, str] = {
     "still": "silence",

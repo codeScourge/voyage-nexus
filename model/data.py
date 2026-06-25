@@ -49,6 +49,8 @@ TARGET_WORDS: tuple[str, ...] = (
     "shitbull",
     "hangar",
     "teaspoon",
+    "naan",
+    "quail"
 )
 UNKNOWN_WORD_LABEL = "unknown word"
 SILENCE_LABEL = "silence"
@@ -752,6 +754,45 @@ class EventWindowBatch:
     def channel_count(self) -> int:
         return int(self.x.shape[2]) if self.x.ndim == 3 else 32
 
+
+def _fix_windows_to_length(
+    windows: Union[np.ndarray, Sequence[np.ndarray]],
+    target_len: int,
+    *,
+    n_ch: Optional[int] = None,
+    pad_value: float = 0.0,
+) -> np.ndarray:
+    """Center-crop/pad windows to a common target_len.
+
+    Accepts either a stacked (n, time, channels) array or a list of (time, channels)
+    arrays with possibly different lengths.
+    """
+    if isinstance(windows, np.ndarray):
+        if windows.ndim != 3:
+            raise ValueError(f"expected (n, time, channels), got {windows.shape}")
+        if windows.shape[1] == target_len:
+            return windows
+        raw: Sequence[np.ndarray] = [windows[i] for i in range(windows.shape[0])]
+        n_ch = int(windows.shape[2])
+    else:
+        if not windows:
+            raise ValueError("windows must not be empty")
+        raw = windows
+        if n_ch is None:
+            n_ch = int(raw[0].shape[1])
+
+    fixed = np.full((len(raw), target_len, n_ch), pad_value, dtype=np.float32)
+    for i, w in enumerate(raw):
+        L = w.shape[0]
+        if L >= target_len:
+            off = (L - target_len) // 2
+            fixed[i] = w[off : off + target_len, :]
+        else:
+            off = (target_len - L) // 2
+            fixed[i, off : off + L, :] = w
+    return fixed
+
+
 def build_event_windows(
     session_dir: Path,
     *,
@@ -902,18 +943,12 @@ def build_event_windows(
             target_len = int(np.median([w.shape[0] for w in raw_windows]))
             target_len = max(target_len, 1)
         n_ch = channels.shape[1]
-        fixed = np.full((len(raw_windows), target_len, n_ch), pad_value, dtype=np.float32)
-        for i, w in enumerate(raw_windows):
-            L = w.shape[0]
-            if L >= target_len:
-                # center-crop: trim equally from both ends
-                off = (L - target_len) // 2
-                fixed[i] = w[off:off + target_len, :]
-            else:
-                # center-pad: place window in the middle, pad both sides
-                off = (target_len - L) // 2
-                fixed[i, off:off + L, :] = w
-        x = fixed
+        x = _fix_windows_to_length(
+            raw_windows,
+            target_len,
+            n_ch=n_ch,
+            pad_value=pad_value,
+        )
     else:
         target_len = target_len or 1
         x = np.zeros((0, target_len, channels.shape[1]), dtype=np.float32)
@@ -947,8 +982,16 @@ def _merge_batches(batches: Sequence[EventWindowBatch]) -> EventWindowBatch:
     if len(batches) == 1:
         return batches[0]
 
+    target_len = max(batch.window_len for batch in batches)
+    aligned_x = [
+        _fix_windows_to_length(batch.x, target_len)
+        if batch.window_len != target_len
+        else batch.x
+        for batch in batches
+    ]
+
     return EventWindowBatch(
-        x=np.concatenate([batch.x for batch in batches], axis=0),
+        x=np.concatenate(aligned_x, axis=0),
         labels=tuple(label for batch in batches for label in batch.labels),
         event_types=tuple(event_type for batch in batches for event_type in batch.event_types),
         event_ids=tuple(event_id for batch in batches for event_id in batch.event_ids),
