@@ -6,6 +6,7 @@ import random
 import re
 import time
 import uuid
+from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 
@@ -14,10 +15,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.utils.flop_counter import FlopCounterMode
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-from data import default_label_to_idx, load_dataset_splits
+from data import default_label_to_idx, label_probs_to_vector, load_dataset_splits
 
 # ---
 SEED = 42
@@ -227,7 +229,7 @@ class IntermediateFusionEEGNet(nn.Module):
         kern_eeg: int = 128,   # half the sampling rate per the paper
         kern_emg: int = 128,   # tune: EMG carries higher-freq content
         sep_kernel: int = 16,
-        p_drop: float = 0.5,
+        p_drop: float = 0.25,
     ):
         super().__init__()
         self.eeg_branch = ModalityBranch(n_eeg, F1, D, kern_eeg)
@@ -313,11 +315,18 @@ class FusionDataset(torch.utils.data.Dataset):
         sample = self.base[self.indices[i]]
         x = sample["x"]
         x = (x - x.mean(dim=0, keepdim=True)) / (x.std(dim=0, keepdim=True) + 1e-6)
-                                
+
         eeg = x[:, ACTIVE_EEG_INDICES].T.unsqueeze(0)  # (1, C_eeg, T)
         emg = x[:, ACTIVE_EMG_INDICES].T.unsqueeze(0)  # (1, C_emg, T)
-        y = self.label_to_idx[sample["label"]]
-        return eeg, emg, torch.tensor(y, dtype=torch.long)
+        y_soft = torch.from_numpy(
+            label_probs_to_vector(
+                sample.get("label_probs"),
+                sample["label"],
+                self.label_to_idx,
+            )
+        )
+        y_hard = torch.tensor(self.label_to_idx[sample["label"]], dtype=torch.long)
+        return eeg, emg, y_soft, y_hard
 
 
 def build_label_map(base_dataset, indices) -> dict:
@@ -336,7 +345,7 @@ def construct_model(splits):
     print(f"classes ({n_classes}): {', '.join(label_to_idx)}")
 
     # infer shapes from one sample
-    eeg0, emg0, _ = FusionDataset(splits.dataset, splits.train.indices, label_to_idx)[0]
+    eeg0, emg0, _, _ = FusionDataset(splits.dataset, splits.train.indices, label_to_idx)[0]
     n_eeg, T = eeg0.shape[1], eeg0.shape[2]
     n_emg = emg0.shape[1]
 
@@ -350,7 +359,6 @@ def construct_model(splits):
 
     model = IntermediateFusionEEGNet(
         n_eeg=n_eeg, n_emg=n_emg, n_classes=n_classes, T=T,
-        p_drop=0.5
     ).to(device)
 
     return model, label_to_idx, {
@@ -454,6 +462,7 @@ def save_checkpoint(
     kind: str,
     state_dict: dict | None = None,
     continued_from: dict | None = None,
+    log: bool = True,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -474,9 +483,65 @@ def save_checkpoint(
         payload["continued_from"] = continued_from
     torch.save(payload, path)
 
-    print("\n")
-    print(f"saved checkpoint ({kind}, epoch {epoch}) -> {path}")
-    print("\n")
+    if log:
+        tqdm.write(f"saved checkpoint ({kind}, epoch {epoch}) -> {path}")
+
+
+def format_epoch_summary(
+    epoch_num: int,
+    total_epochs: int,
+    *,
+    train_loss: float,
+    train_acc: float,
+    val_loss: float,
+    val_acc: float,
+    best_acc: float,
+    epoch_time: float,
+    epochs_without_improve: int | None = None,
+    smoothed_stop: float | None = None,
+    notes: list[str] | None = None,
+) -> str:
+    width = len(str(total_epochs))
+    parts = [
+        f"epoch {epoch_num:>{width}}/{total_epochs}",
+        f"train_loss={train_loss:.4f}",
+        f"train_acc={train_acc:.4f}",
+        f"val_loss={val_loss:.4f}",
+        f"val_acc={val_acc:.4f}",
+        f"best={best_acc:.4f}",
+        f"{epoch_time:.1f}s",
+    ]
+    if epochs_without_improve is not None:
+        parts.append(f"no_improve={epochs_without_improve}")
+    if smoothed_stop is not None:
+        parts.append(f"stop_smooth={smoothed_stop:.4f}")
+    if notes:
+        parts.extend(notes)
+    return " | ".join(parts)
+
+
+def format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m {sec:.1f}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{int(hours)}h {int(minutes)}m {sec:.0f}s"
+
+
+def format_flops(flops: int) -> str:
+    for scale, unit in (
+        (1e18, "EFLOPs"),
+        (1e15, "PFLOPs"),
+        (1e12, "TFLOPs"),
+        (1e9, "GFLOPs"),
+        (1e6, "MFLOPs"),
+        (1e3, "kFLOPs"),
+    ):
+        if flops >= scale:
+            return f"{flops / scale:.3f} {unit} ({flops:,} FLOPs)"
+    return f"{flops:,} FLOPs"
 
 
 def smoothed_tail(values: list[float], window: int) -> float | None:
@@ -493,19 +558,34 @@ def init_per_class_counters(n_classes: int, device: torch.device) -> tuple[torch
     )
 
 
+def soft_cross_entropy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    log_probs = F.log_softmax(logits, dim=-1)
+    loss = -(targets * log_probs).sum(dim=-1)
+    if reduction == "none":
+        return loss
+    if reduction == "mean":
+        return loss.mean()
+    raise ValueError(f"unsupported reduction: {reduction!r}")
+
+
 def update_per_class_counters(
     logits: torch.Tensor,
-    y: torch.Tensor,
+    y_hard: torch.Tensor,
     pred: torch.Tensor,
     loss_sum: torch.Tensor,
     correct: torch.Tensor,
     count: torch.Tensor,
 ) -> None:
-    loss_per_sample = F.cross_entropy(logits, y, reduction="none")
-    ones = torch.ones_like(y, dtype=loss_sum.dtype)
-    count.scatter_add_(0, y, ones)
-    loss_sum.scatter_add_(0, y, loss_per_sample)
-    correct.scatter_add_(0, y, (pred == y).to(loss_sum.dtype))
+    loss_per_sample = F.cross_entropy(logits, y_hard, reduction="none")
+    ones = torch.ones_like(y_hard, dtype=loss_sum.dtype)
+    count.scatter_add_(0, y_hard, ones)
+    loss_sum.scatter_add_(0, y_hard, loss_per_sample)
+    correct.scatter_add_(0, y_hard, (pred == y_hard).to(loss_sum.dtype))
 
 
 def per_class_metrics_from_counters(
@@ -659,15 +739,6 @@ def train(
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=num_workers, pin_memory=pin_memory)
     val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
 
-    # class weights for imbalance (inverse frequency)
-    counts = torch.zeros(n_classes)
-    for i in train_ds.indices:
-        counts[label_to_idx[splits.dataset[i]["label"]]] += 1
-    safe_counts = torch.where(counts > 0, counts, torch.ones_like(counts))
-    weights = (counts.sum() / (safe_counts * n_classes)).to(device)
-
-    crit = nn.CrossEntropyLoss(weight=weights)
-
     opt = torch.optim.Adam(model.parameters(), lr=lr)
 
     best_acc = 0.0
@@ -704,6 +775,7 @@ def train(
         val_loss: float,
         val_acc: float,
         state_dict: dict | None = None,
+        log: bool = True,
     ) -> None:
         save_checkpoint(
             path,
@@ -720,152 +792,180 @@ def train(
             kind=kind,
             state_dict=state_dict,
             continued_from=continued_from,
+            log=log,
         )
 
-    epoch_bar = tqdm(range(epochs), desc="epochs", unit="epoch")
-    for epoch in epoch_bar:
-        epoch_start = time.perf_counter()
-        model.train()
-        running = 0.0
-        train_correct = train_total = 0
-        train_loss_sum, train_correct_per_class, train_count_per_class = init_per_class_counters(
-            n_classes, device,
-        )
-        for eeg, emg, y in tqdm(train_dl, desc="train", leave=False):
-            eeg, emg, y = eeg.to(device), emg.to(device), y.to(device)
-            opt.zero_grad()
-            logits = model(eeg, emg)
-            loss = crit(logits, y)
-            loss.backward()
-            opt.step()
-            running += loss.item() * y.size(0)
-            pred = logits.argmax(1)
-            train_correct += (pred == y).sum().item()
-            train_total += y.size(0)
-            update_per_class_counters(
-                logits, y, pred,
-                train_loss_sum, train_correct_per_class, train_count_per_class,
-            )
-
-        train_loss = running / len(train_ds)
-        train_acc = train_correct / train_total if train_total else 0.0
-        train_loss_per_label, train_acc_per_label = per_class_metrics_from_counters(
-            train_loss_sum, train_correct_per_class, train_count_per_class, idx_to_label,
-        )
-
-        
-        model.eval()
-        with torch.no_grad():
-            val_running = 0.0
-            correct = total = 0
-            val_loss_sum, val_correct_per_class, val_count_per_class = init_per_class_counters(
+    epoch_bar = tqdm(
+        range(epochs),
+        desc="epochs",
+        unit="epoch",
+        dynamic_ncols=True,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+    )
+    run_start = time.perf_counter()
+    with ExitStack() as stack:
+        flop_counter = stack.enter_context(FlopCounterMode(display=False))
+        for epoch in epoch_bar:
+            epoch_start = time.perf_counter()
+            model.train()
+            running = 0.0
+            train_correct = train_total = 0
+            train_loss_sum, train_correct_per_class, train_count_per_class = init_per_class_counters(
                 n_classes, device,
             )
-            for eeg, emg, y in tqdm(val_dl, desc="val", leave=False):
-                eeg, emg, y = eeg.to(device), emg.to(device), y.to(device)
+            for eeg, emg, y_soft, y_hard in tqdm(train_dl, desc="train", leave=False):
+                eeg, emg = eeg.to(device), emg.to(device)
+                y_soft = y_soft.to(device)
+                y_hard = y_hard.to(device)
+                opt.zero_grad()
                 logits = model(eeg, emg)
-                val_running += crit(logits, y).item() * y.size(0)
+                loss = soft_cross_entropy(logits, y_soft)
+                loss.backward()
+                opt.step()
+                running += loss.item() * y_hard.size(0)
                 pred = logits.argmax(1)
-                correct += (pred == y).sum().item()
-                total += y.size(0)
+                train_correct += (pred == y_hard).sum().item()
+                train_total += y_hard.size(0)
                 update_per_class_counters(
-                    logits, y, pred,
-                    val_loss_sum, val_correct_per_class, val_count_per_class,
+                    logits, y_hard, pred,
+                    train_loss_sum, train_correct_per_class, train_count_per_class,
                 )
-            val_loss = val_running / len(val_ds) if len(val_ds) else 0.0
-            acc = correct / total if total else 0.0
-            val_loss_per_label, val_acc_per_label = per_class_metrics_from_counters(
-                val_loss_sum, val_correct_per_class, val_count_per_class, idx_to_label,
+
+            train_loss = running / len(train_ds)
+            train_acc = train_correct / train_total if train_total else 0.0
+            train_loss_per_label, train_acc_per_label = per_class_metrics_from_counters(
+                train_loss_sum, train_correct_per_class, train_count_per_class, idx_to_label,
             )
 
-        epoch_num = epoch + 1
+        
+            model.eval()
+            with torch.no_grad():
+                val_running = 0.0
+                correct = total = 0
+                val_loss_sum, val_correct_per_class, val_count_per_class = init_per_class_counters(
+                    n_classes, device,
+                )
+                for eeg, emg, y_soft, y_hard in tqdm(val_dl, desc="val", leave=False):
+                    eeg, emg = eeg.to(device), emg.to(device)
+                    y_soft = y_soft.to(device)
+                    y_hard = y_hard.to(device)
+                    logits = model(eeg, emg)
+                    val_running += soft_cross_entropy(logits, y_soft).item() * y_hard.size(0)
+                    pred = logits.argmax(1)
+                    correct += (pred == y_hard).sum().item()
+                    total += y_hard.size(0)
+                    update_per_class_counters(
+                        logits, y_hard, pred,
+                        val_loss_sum, val_correct_per_class, val_count_per_class,
+                    )
+                val_loss = val_running / len(val_ds) if len(val_ds) else 0.0
+                acc = correct / total if total else 0.0
+                val_loss_per_label, val_acc_per_label = per_class_metrics_from_counters(
+                    val_loss_sum, val_correct_per_class, val_count_per_class, idx_to_label,
+                )
 
-        history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_loss)
-        history["train_acc"].append(train_acc)
-        history["val_acc"].append(acc)
-        for label in label_to_idx:
-            history["train_loss_per_label"][label].append(train_loss_per_label[label])
-            history["val_loss_per_label"][label].append(val_loss_per_label[label])
-            history["train_acc_per_label"][label].append(train_acc_per_label[label])
-            history["val_acc_per_label"][label].append(val_acc_per_label[label])
+            epoch_num = epoch + 1
+            epoch_notes: list[str] = []
 
-        if acc > best_acc:
-            best_acc = acc
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            best_metrics = {
-                "epoch": epoch_num,
-                "train_loss": train_loss,
-                "train_acc": train_acc,
-                "val_loss": val_loss,
-                "val_acc": acc,
-            }
-            write_checkpoint(
-                run_dir / "best.pt",
-                kind="best",
-                epoch_num=epoch_num,
-                train_loss=train_loss,
-                train_acc=train_acc,
-                val_loss=val_loss,
-                val_acc=acc,
-                state_dict=best_state,
-            )
+            history["train_loss"].append(train_loss)
+            history["val_loss"].append(val_loss)
+            history["train_acc"].append(train_acc)
+            history["val_acc"].append(acc)
+            for label in label_to_idx:
+                history["train_loss_per_label"][label].append(train_loss_per_label[label])
+                history["val_loss_per_label"][label].append(val_loss_per_label[label])
+                history["train_acc_per_label"][label].append(train_acc_per_label[label])
+                history["val_acc_per_label"][label].append(val_acc_per_label[label])
 
-        smoothed_stop = smoothed_tail(history[stop_metric_key], early_stopping_smooth_window)
-        if smoothed_stop is not None:
-            if early_stopping_metric == "loss":
-                stop_improved = smoothed_stop < best_smoothed_stop
-            else:
-                stop_improved = smoothed_stop > best_smoothed_stop
-            if stop_improved:
-                best_smoothed_stop = smoothed_stop
-                best_smoothed_stop_epoch = epoch_num
-                epochs_without_improve = 0
-            else:
-                epochs_without_improve += 1
+            if acc > best_acc:
+                best_acc = acc
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                best_metrics = {
+                    "epoch": epoch_num,
+                    "train_loss": train_loss,
+                    "train_acc": train_acc,
+                    "val_loss": val_loss,
+                    "val_acc": acc,
+                }
+                write_checkpoint(
+                    run_dir / "best.pt",
+                    kind="best",
+                    epoch_num=epoch_num,
+                    train_loss=train_loss,
+                    train_acc=train_acc,
+                    val_loss=val_loss,
+                    val_acc=acc,
+                    state_dict=best_state,
+                    log=False,
+                )
+                epoch_notes.append(f"saved best.pt (epoch {epoch_num})")
 
-        if save_interval > 0 and epoch_num % save_interval == 0:
-            write_checkpoint(
-                run_dir / f"epoch_{epoch_num:04d}.pt",
-                kind="epoch",
-                epoch_num=epoch_num,
-                train_loss=train_loss,
-                train_acc=train_acc,
-                val_loss=val_loss,
-                val_acc=acc,
-            )
-
-        epoch_time = time.perf_counter() - epoch_start
-        postfix = {
-            "train_loss": f"{train_loss:.4f}",
-            "val_loss": f"{val_loss:.4f}",
-            "train_acc": f"{train_acc:.4f}",
-            "val_acc": f"{acc:.4f}",
-            "best": f"{best_acc:.4f}",
-            "epoch_s": f"{epoch_time:.1f}s",
-        }
-        if early_stopping_patience > 0:
-            postfix["no_improve"] = epochs_without_improve
+            smoothed_stop = smoothed_tail(history[stop_metric_key], early_stopping_smooth_window)
             if smoothed_stop is not None:
-                postfix["stop_smooth"] = f"{smoothed_stop:.4f}"
-        epoch_bar.set_postfix(**postfix)
+                if early_stopping_metric == "loss":
+                    stop_improved = smoothed_stop < best_smoothed_stop
+                else:
+                    stop_improved = smoothed_stop > best_smoothed_stop
+                if stop_improved:
+                    best_smoothed_stop = smoothed_stop
+                    best_smoothed_stop_epoch = epoch_num
+                    epochs_without_improve = 0
+                else:
+                    epochs_without_improve += 1
 
-        if (
-            early_stopping_patience > 0
-            and smoothed_stop is not None
-            and epochs_without_improve >= early_stopping_patience
-        ):
-            metric_label = "val loss" if early_stopping_metric == "loss" else "val acc"
-            print(
-                f"\nearly stopping at epoch {epoch_num}: "
-                f"no smoothed {metric_label} improvement for {early_stopping_patience} epochs "
-                f"(window={early_stopping_smooth_window}, "
-                f"best_smooth={best_smoothed_stop:.4f} @ epoch {best_smoothed_stop_epoch}; "
-                f"best_acc={best_acc:.4f} @ epoch {best_metrics['epoch']})"
+            if save_interval > 0 and epoch_num % save_interval == 0:
+                ckpt_name = f"epoch_{epoch_num:04d}.pt"
+                write_checkpoint(
+                    run_dir / ckpt_name,
+                    kind="epoch",
+                    epoch_num=epoch_num,
+                    train_loss=train_loss,
+                    train_acc=train_acc,
+                    val_loss=val_loss,
+                    val_acc=acc,
+                    log=False,
+                )
+                epoch_notes.append(f"saved {ckpt_name}")
+
+            epoch_time = time.perf_counter() - epoch_start
+            epoch_bar.write(
+                format_epoch_summary(
+                    epoch_num,
+                    epochs,
+                    train_loss=train_loss,
+                    train_acc=train_acc,
+                    val_loss=val_loss,
+                    val_acc=acc,
+                    best_acc=best_acc,
+                    epoch_time=epoch_time,
+                    epochs_without_improve=epochs_without_improve if early_stopping_patience > 0 else None,
+                    smoothed_stop=smoothed_stop if early_stopping_patience > 0 else None,
+                    notes=epoch_notes or None,
+                )
             )
-            break
+            epoch_bar.write("")
+            epoch_bar.write("")
 
-    last_epoch = len(history["train_loss"])
+            if (
+                early_stopping_patience > 0
+                and smoothed_stop is not None
+                and epochs_without_improve >= early_stopping_patience
+            ):
+                metric_label = "val loss" if early_stopping_metric == "loss" else "val acc"
+                epoch_bar.write(
+                    f"early stopping at epoch {epoch_num}: "
+                    f"no smoothed {metric_label} improvement for {early_stopping_patience} epochs "
+                    f"(window={early_stopping_smooth_window}, "
+                    f"best_smooth={best_smoothed_stop:.4f} @ epoch {best_smoothed_stop_epoch}; "
+                    f"best_acc={best_acc:.4f} @ epoch {best_metrics['epoch']})"
+                )
+                break
+
+    compute_elapsed = time.perf_counter() - run_start
+    total_flops = flop_counter.get_total_flops()
+    epochs_completed = len(history["train_loss"])
+
+    last_epoch = epochs_completed
     write_checkpoint(
         run_dir / "last.pt",
         kind="last",
@@ -895,6 +995,16 @@ def train(
         idx_to_label=idx_to_label,
         best_epoch=best_metrics["epoch"] if best_state is not None else None,
     )
+
+    run_elapsed = time.perf_counter() - run_start
+    tqdm.write("")
+    tqdm.write(
+        f"training finished: {epochs_completed} epoch(s) in {format_duration(run_elapsed)} | "
+        f"total {format_flops(total_flops)}"
+    )
+    if compute_elapsed > 0 and total_flops > 0:
+        tqdm.write(f"  avg throughput: {format_flops(int(total_flops / compute_elapsed))}/s")
+    tqdm.write("")
 
     return model, history, run_dir
 

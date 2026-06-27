@@ -1,6 +1,10 @@
 
 
 
+TODO
+- debug until next iteration, downgrade torch, retrain here first
+- 1830 start modality research
+- scp or not, deploy on runpod for next big run 
 
 
 ### using

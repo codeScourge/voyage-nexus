@@ -35,12 +35,14 @@ INCLUDE_NEGATIVE_LABELS_SILENCE = False
 # --- scramble-breaks transition sampling (edit these)
 # When True, transitions/silence gaps use only TARGET_WORDS spans (default).
 # When False, every labeled word in a scramble-breaks block is used.
-SCRAMBLE_BREAKS_ONLY_TARGET_WORDS = False
+SCRAMBLE_BREAKS_ONLY_TARGET_WORDS = True
 INCLUDE_TRANSITION_LABELS = True
 SCRAMBLE_BREAKS_SHIFTS_PER_TRANSITION = 3
 SCRAMBLE_BREAKS_SHIFT_MIN_S = -1.2
 SCRAMBLE_BREAKS_SHIFT_MAX_S = 1.2
-SCRAMBLE_BREAKS_DOMINANT_FRACTION = 0.75
+# Linear ramp: at this window fraction the corresponding phase gets 100% label mass.
+# Between 0.5 and 1.0 the label blends toward silence / word / transition.
+TRANSITION_PURE_PHASE_FRAC = 0.5
 
 EEG_RECORD_FORMAT = "<QQ32f"
 EEG_RECORD_FORMAT_CODES_LEGACY = "<QQ32i"
@@ -409,6 +411,7 @@ def _append_silence_windows(
     post_samples: int,
     raw_windows: list[np.ndarray],
     labels: list[str],
+    label_probs: list[Optional[dict[str, float]]],
     event_type_list: list[str],
     event_ids: list[str],
     collection_block_ids: list[str],
@@ -448,6 +451,7 @@ def _append_silence_windows(
             center = gap_start + (gap_end - gap_start) // 2
             raw_windows.append(window)
             labels.append(SILENCE_LABEL)
+            label_probs.append(None)
             event_type_list.append("negative_labels_silence")
             event_ids.append(f"silence:{block_id}:{gap_start}-{gap_end}")
             collection_block_ids.append(block_id)
@@ -481,6 +485,38 @@ def _transition_phase_fractions(*, shift_s: float, window_s: float, kind: str) -
     return silence_len / total, word_len / total
 
 
+def _transition_shift_label_probs(
+    *,
+    kind: str,
+    word: str,
+    silence_frac: float,
+    word_frac: float,
+) -> dict[str, float]:
+    """Soft label distribution for a transition-centered window.
+
+    Mass ramps linearly from the 50/50 midpoint to pure silence, pure word, or
+    pure transition (word starting / word ending) at the window endpoints.
+    """
+    midpoint = TRANSITION_PURE_PHASE_FRAC
+    p_silence = max(0.0, (silence_frac - midpoint) / midpoint)
+    p_word = max(0.0, (word_frac - midpoint) / midpoint)
+    p_transition = max(0.0, 1.0 - p_silence - p_word)
+    transition_label = WORD_STARTING_LABEL if kind == "silence_to_word" else WORD_ENDING_LABEL
+
+    probs: dict[str, float] = {}
+    if p_silence > 0.0:
+        probs[SILENCE_LABEL] = p_silence
+    if p_word > 0.0 and (INCLUDE_UNKNOWN_WORD_LABEL or word != UNKNOWN_WORD_LABEL):
+        probs[word] = p_word
+    if p_transition > 0.0:
+        probs[transition_label] = p_transition
+
+    total = sum(probs.values())
+    if total <= 0.0:
+        return {transition_label: 1.0}
+    return {label: weight / total for label, weight in probs.items()}
+
+
 def _transition_shift_label(
     *,
     kind: str,
@@ -488,16 +524,69 @@ def _transition_shift_label(
     silence_frac: float,
     word_frac: float,
 ) -> str:
-    if silence_frac >= SCRAMBLE_BREAKS_DOMINANT_FRACTION:
-        return SILENCE_LABEL
-    if (
-        word_frac >= SCRAMBLE_BREAKS_DOMINANT_FRACTION
-        and (INCLUDE_UNKNOWN_WORD_LABEL or word != UNKNOWN_WORD_LABEL)
-    ):
-        return word
-    if kind == "silence_to_word":
-        return WORD_STARTING_LABEL
-    return WORD_ENDING_LABEL
+    probs = _transition_shift_label_probs(
+        kind=kind,
+        word=word,
+        silence_frac=silence_frac,
+        word_frac=word_frac,
+    )
+    return max(probs, key=probs.get)
+
+
+def _parse_scramble_breaks_transition_event_id(event_id: str) -> Optional[tuple[str, str, float]]:
+    if ":shift=" not in event_id:
+        return None
+    base, shift_text = event_id.rsplit(":shift=", 1)
+    parts = base.split(":")
+    if len(parts) < 4:
+        return None
+    kind = parts[1]
+    if kind not in {"silence_to_word", "word_to_silence"}:
+        return None
+    word = parts[3]
+    return kind, word, float(shift_text)
+
+
+def transition_label_probs_from_event_id(
+    event_id: str,
+    *,
+    window_s: float = COLLECTION_SAY_S,
+) -> Optional[dict[str, float]]:
+    parsed = _parse_scramble_breaks_transition_event_id(event_id)
+    if parsed is None:
+        return None
+    kind, word, shift_s = parsed
+    silence_frac, word_frac = _transition_phase_fractions(
+        shift_s=shift_s,
+        window_s=window_s,
+        kind=kind,
+    )
+    return _transition_shift_label_probs(
+        kind=kind,
+        word=word,
+        silence_frac=silence_frac,
+        word_frac=word_frac,
+    )
+
+
+def label_probs_to_vector(
+    label_probs: Optional[dict[str, float]],
+    hard_label: str,
+    label_to_idx: dict[str, int],
+) -> np.ndarray:
+    n = len(label_to_idx)
+    vec = np.zeros(n, dtype=np.float32)
+    if label_probs:
+        for label, prob in label_probs.items():
+            idx = label_to_idx.get(label)
+            if idx is not None:
+                vec[idx] = prob
+        total = float(vec.sum())
+        if total > 0.0:
+            vec /= total
+            return vec
+    vec[label_to_idx[hard_label]] = 1.0
+    return vec
 
 
 def _scramble_breaks_transition_shifts_s(boundary_key: str) -> tuple[float, ...]:
@@ -639,6 +728,7 @@ def _append_scramble_breaks_transition_windows(
     post_samples: int,
     raw_windows: list[np.ndarray],
     labels: list[str],
+    label_probs: list[Optional[dict[str, float]]],
     event_type_list: list[str],
     event_ids: list[str],
     collection_block_ids: list[str],
@@ -683,15 +773,17 @@ def _append_scramble_breaks_transition_windows(
                     window_s=window_s,
                     kind=kind,
                 )
-                label = _transition_shift_label(
+                probs = _transition_shift_label_probs(
                     kind=kind,
                     word=word,
                     silence_frac=silence_frac,
                     word_frac=word_frac,
                 )
+                label = max(probs, key=probs.get)
                 center = boundary_idx + shift_samples
                 raw_windows.append(window)
                 labels.append(label)
+                label_probs.append(probs)
                 event_type_list.append("scramble_breaks_transition")
                 event_ids.append(f"{boundary_key}:shift={shift_s:+.3f}")
                 collection_block_ids.append(block_id)
@@ -709,6 +801,7 @@ def _append_scramble_breaks_silence_windows(
     post_samples: int,
     raw_windows: list[np.ndarray],
     labels: list[str],
+    label_probs: list[Optional[dict[str, float]]],
     event_type_list: list[str],
     event_ids: list[str],
     collection_block_ids: list[str],
@@ -749,6 +842,7 @@ def _append_scramble_breaks_silence_windows(
             center = gap_start + (gap_end - gap_start) // 2
             raw_windows.append(window)
             labels.append(SILENCE_LABEL)
+            label_probs.append(None)
             event_type_list.append("scramble_breaks_silence")
             event_ids.append(f"silence:{block_id}:{gap_start}-{gap_end}")
             collection_block_ids.append(block_id)
@@ -780,6 +874,7 @@ class EventWindowBatch:
     pre_samples: int
     post_samples: int
     skipped: int
+    label_probs: tuple[Optional[dict[str, float]], ...] = ()
 
     @property
     def window_len(self) -> int:
@@ -868,6 +963,7 @@ def build_event_windows(
 
     raw_windows: list[np.ndarray] = []
     labels: list[str] = []
+    label_probs: list[Optional[dict[str, float]]] = []
     event_type_list: list[str] = []
     event_ids: list[str] = []
     collection_block_ids: list[str] = []
@@ -924,6 +1020,7 @@ def build_event_windows(
 
         raw_windows.append(window)
         labels.append(label)
+        label_probs.append(None)
         event_type_list.append(event_type)
         event_ids.append(event.get("event_id", ""))
         collection_block_ids.append(_payload_block_id(payload))
@@ -939,6 +1036,7 @@ def build_event_windows(
             post_samples=post_samples,
             raw_windows=raw_windows,
             labels=labels,
+            label_probs=label_probs,
             event_type_list=event_type_list,
             event_ids=event_ids,
             collection_block_ids=collection_block_ids,
@@ -954,6 +1052,7 @@ def build_event_windows(
             post_samples=post_samples,
             raw_windows=raw_windows,
             labels=labels,
+            label_probs=label_probs,
             event_type_list=event_type_list,
             event_ids=event_ids,
             collection_block_ids=collection_block_ids,
@@ -970,11 +1069,17 @@ def build_event_windows(
             post_samples=post_samples,
             raw_windows=raw_windows,
             labels=labels,
+            label_probs=label_probs,
             event_type_list=event_type_list,
             event_ids=event_ids,
             collection_block_ids=collection_block_ids,
             center_samples=center_samples,
             skipped=skipped,
+        )
+
+    if raw_windows and len(label_probs) != len(raw_windows):
+        raise RuntimeError(
+            f"label_probs length ({len(label_probs)}) != windows ({len(raw_windows)})"
         )
 
     if raw_windows:
@@ -1005,6 +1110,7 @@ def build_event_windows(
         pre_samples=pre_samples,
         post_samples=post_samples,
         skipped=skipped,
+        label_probs=tuple(label_probs),
     )
 
 def _merge_batches(batches: Sequence[EventWindowBatch]) -> EventWindowBatch:
@@ -1031,6 +1137,11 @@ def _merge_batches(batches: Sequence[EventWindowBatch]) -> EventWindowBatch:
         for batch in batches
     ]
 
+    def _batch_label_probs(batch: EventWindowBatch) -> tuple[Optional[dict[str, float]], ...]:
+        if batch.label_probs:
+            return batch.label_probs
+        return tuple(None for _ in batch.labels)
+
     return EventWindowBatch(
         x=np.concatenate(aligned_x, axis=0),
         labels=tuple(label for batch in batches for label in batch.labels),
@@ -1050,6 +1161,11 @@ def _merge_batches(batches: Sequence[EventWindowBatch]) -> EventWindowBatch:
         pre_samples=pre_samples,
         post_samples=post_samples,
         skipped=sum(batch.skipped for batch in batches),
+        label_probs=tuple(
+            probs
+            for batch in batches
+            for probs in _batch_label_probs(batch)
+        ),
     )
 
 
@@ -1151,9 +1267,13 @@ class SessionEventDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         label = self._batch.labels[index]
+        label_probs = None
+        if self._batch.label_probs:
+            label_probs = self._batch.label_probs[index]
         item: dict[str, Any] = {
             "x": self._window_tensor(index),
             "label": label,
+            "label_probs": label_probs,
             "event_type": self._batch.event_types[index],
             "event_id": self._batch.event_ids[index],
             "center_sample_index": int(self._batch.center_sample_index[index]),
@@ -1628,8 +1748,21 @@ def save_dataset_splits(output_dir: Path, splits: DatasetSplits) -> None:
         center_sample_index=batch.center_sample_index,
     )
 
+    label_probs_manifest: list[Optional[dict[str, float]]] = []
+    for label, event_type, event_id in zip(
+        batch.labels,
+        batch.event_types,
+        batch.event_ids,
+        strict=True,
+    ):
+        if event_type == "scramble_breaks_transition":
+            probs = transition_label_probs_from_event_id(event_id)
+            label_probs_manifest.append(probs)
+        else:
+            label_probs_manifest.append(None)
+
     manifest = {
-        "version": 2,
+        "version": 3,
         "seed": SPLIT_SEED,
         "recordings_path": str(splits.recordings_path.resolve()),
         "pre_ms": splits.pre_ms,
@@ -1644,6 +1777,7 @@ def save_dataset_splits(output_dir: Path, splits: DatasetSplits) -> None:
         "post_samples": batch.post_samples,
         "skipped": batch.skipped,
         "labels": list(batch.labels),
+        "label_probs": label_probs_manifest,
         "event_types": list(batch.event_types),
         "event_ids": list(batch.event_ids),
         "collection_block_ids": list(batch.collection_block_ids),
@@ -1679,6 +1813,23 @@ def load_dataset_splits(splits_dir: Path) -> DatasetSplits:
             _block_id_from_event_id(event_id) for event_id in manifest["event_ids"]
         )
 
+    if "label_probs" in manifest:
+        raw_label_probs = manifest["label_probs"]
+        label_probs = tuple(
+            dict(probs) if probs is not None else None for probs in raw_label_probs
+        )
+    else:
+        label_probs = tuple(
+            transition_label_probs_from_event_id(event_id)
+            if event_type == "scramble_breaks_transition"
+            else None
+            for event_type, event_id in zip(
+                manifest["event_types"],
+                manifest["event_ids"],
+                strict=True,
+            )
+        )
+
     batch = EventWindowBatch(
         x=windows["x"],
         labels=tuple(manifest["labels"]),
@@ -1691,6 +1842,7 @@ def load_dataset_splits(splits_dir: Path) -> DatasetSplits:
         pre_samples=int(manifest["pre_samples"]),
         post_samples=int(manifest["post_samples"]),
         skipped=int(manifest.get("skipped", 0)),
+        label_probs=label_probs,
     )
     dataset = SessionEventDataset.from_batch(
         batch,

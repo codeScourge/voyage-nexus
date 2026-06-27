@@ -23,6 +23,7 @@ from train import (
     default_checkpoint_path,
     get_device,
     seed_everything,
+    soft_cross_entropy,
 )
 
 # --- embeddings / UMAP (always runs after metrics)
@@ -235,22 +236,22 @@ def evaluate_split(
     running_loss = 0.0
     total = 0
 
-    crit = nn.CrossEntropyLoss()
-
     sample_offset = 0
-    for eeg, emg, y in tqdm(loader, desc=split_name, leave=False):
-        eeg, emg, y = eeg.to(device), emg.to(device), y.to(device)
+    for eeg, emg, y_soft, y_hard in tqdm(loader, desc=split_name, leave=False):
+        eeg, emg = eeg.to(device), emg.to(device)
+        y_soft = y_soft.to(device)
+        y_hard = y_hard.to(device)
         logits = model(eeg, emg)
-        running_loss += crit(logits, y).item() * y.size(0)
+        running_loss += soft_cross_entropy(logits, y_soft).item() * y_hard.size(0)
         batch_preds = logits.argmax(1).cpu().tolist()
-        batch_true = y.cpu().tolist()
+        batch_true = y_hard.cpu().tolist()
         y_true.extend(batch_true)
         y_pred.extend(batch_preds)
         for batch_idx in range(len(batch_true)):
             base_idx = dataset.indices[sample_offset + batch_idx]
             session_dirs.append(str(dataset.base[base_idx]["session_dir"]))
         sample_offset += len(batch_true)
-        total += y.size(0)
+        total += y_hard.size(0)
 
     y_true_arr = np.asarray(y_true, dtype=np.int64)
     y_pred_arr = np.asarray(y_pred, dtype=np.int64)
@@ -503,7 +504,7 @@ def print_summary_table(
     header = (
         f"{'label':<20}"
         + "".join(f"{name:>10}" for name in split_names)
-        + "".join(f"{name + ' conf':>{confusion_width}}" for name in split_names)
+        + "".join(f"{name + ' confusion':>{confusion_width}}" for name in split_names)
     )
     print(header)
     for class_idx in range(n_classes):
@@ -582,7 +583,7 @@ def collect_embeddings(
     per_label: dict[str, list[EmbeddingSample]] = defaultdict(list)
     sample_offset = 0
 
-    for eeg, emg, _y in tqdm(loader, desc=f"embeddings:{split_name}", leave=False):
+    for eeg, emg, _y_soft, _y_hard in tqdm(loader, desc=f"embeddings:{split_name}", leave=False):
         eeg, emg = eeg.to(device), emg.to(device)
         taps = model.forward_embeddings(eeg, emg)
 
