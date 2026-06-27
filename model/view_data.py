@@ -7,6 +7,7 @@ from pathlib import Path
 
 from data import (
     COLLECTION_SAY_S,
+    TRANSITION_EVENT_TYPES,
     _parse_scramble_breaks_transition_event_id,
     _transition_phase_fractions,
     load_dataset_splits,
@@ -43,7 +44,7 @@ def _iter_transition_samples(dataset) -> list[dict]:
             strict=True,
         )
     ):
-        if event_type != "scramble_breaks_transition":
+        if event_type not in TRANSITION_EVENT_TYPES:
             continue
 
         parsed = _parse_scramble_breaks_transition_event_id(event_id)
@@ -55,7 +56,10 @@ def _iter_transition_samples(dataset) -> list[dict]:
             window_s=COLLECTION_SAY_S,
             kind=kind,
         )
-        probs = label_probs or transition_label_probs_from_event_id(event_id)
+        probs = label_probs or transition_label_probs_from_event_id(
+            event_id,
+            event_type=event_type,
+        )
         if probs is None:
             continue
 

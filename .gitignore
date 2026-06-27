@@ -1,6 +1,9 @@
 client/recordings/*
 !client/recordings/.gitkeep
 
+client/recordings_unused/*
+!client/recording_unuseds/.gitkeep
+
 model/splits/*
 !model/splits/.gitkeep
 

@@ -109,21 +109,41 @@ def compute_session_metrics(
     y_pred: np.ndarray,
     session_dirs: list[str],
     *,
+    n_classes: int,
     min_samples: int = 1,
 ) -> list[dict]:
-    by_session: dict[str, dict[str, int]] = defaultdict(lambda: {"correct": 0, "total": 0})
+    by_session_cm: dict[str, np.ndarray] = defaultdict(
+        lambda: np.zeros((n_classes, n_classes), dtype=np.int64)
+    )
     for t, p, session_dir in zip(y_true, y_pred, session_dirs, strict=True):
-        row = by_session[session_dir]
-        row["total"] += 1
-        if t == p:
-            row["correct"] += 1
+        by_session_cm[session_dir][t, p] += 1
 
     rows: list[dict] = []
-    for session_dir, counts in by_session.items():
-        total = counts["total"]
+    for session_dir, cm in by_session_cm.items():
+        total = int(cm.sum())
         if total < min_samples:
             continue
-        correct = counts["correct"]
+        correct = int(np.trace(cm))
+
+        per_class: list[dict] = []
+        for class_idx in range(n_classes):
+            tp = cm[class_idx, class_idx]
+            fp = cm[:, class_idx].sum() - tp
+            fn = cm[class_idx, :].sum() - tp
+            support = cm[class_idx, :].sum()
+            pred_support = cm[:, class_idx].sum()
+            precision = tp / (tp + fp) if (tp + fp) else 0.0
+            recall = tp / (tp + fn) if (tp + fn) else 0.0
+            per_class.append(
+                {
+                    "class_idx": class_idx,
+                    "precision": float(precision),
+                    "recall": float(recall),
+                    "support": int(support),
+                    "pred_support": int(pred_support),
+                }
+            )
+
         rows.append(
             {
                 "session": session_name(session_dir),
@@ -131,10 +151,47 @@ def compute_session_metrics(
                 "n_samples": total,
                 "n_correct": correct,
                 "accuracy": correct / total if total else 0.0,
+                "per_class": per_class,
+                "worst_recall": _worst_class_metric(per_class, metric="recall", min_key="support"),
+                "worst_precision": _worst_class_metric(
+                    per_class,
+                    metric="precision",
+                    min_key="pred_support",
+                ),
             }
         )
     rows.sort(key=lambda row: (row["accuracy"], row["n_samples"]), reverse=True)
     return rows
+
+
+def _worst_class_metric(
+    per_class: list[dict],
+    *,
+    metric: str,
+    min_key: str,
+) -> dict | None:
+    candidates = [row for row in per_class if row[min_key] > 0]
+    if not candidates:
+        return None
+    worst = min(candidates, key=lambda row: (row[metric], -row[min_key]))
+    return {
+        "class_idx": worst["class_idx"],
+        metric: worst[metric],
+        "support": worst[min_key],
+    }
+
+
+def _format_worst_session_label(
+    row: dict | None,
+    *,
+    metric: str,
+    idx_to_label: dict[int, str],
+    label_max: int = 12,
+) -> str:
+    if row is None:
+        return "-"
+    label = idx_to_label.get(row["class_idx"], str(row["class_idx"]))
+    return f"{label[:label_max]} {row[metric]:.2f} (n={row['support']})"
 
 
 def _most_confused_with(
@@ -302,6 +359,7 @@ def evaluate_split(
         y_true_arr,
         y_pred_arr,
         session_dirs,
+        n_classes=n_classes,
         min_samples=session_min_samples,
     )
 
@@ -412,6 +470,7 @@ def print_metrics(
 def print_session_rankings(
     metrics: dict,
     *,
+    idx_to_label: dict[int, str],
     top_k: int = 5,
 ) -> None:
     per_session = metrics.get("per_session", [])
@@ -426,15 +485,29 @@ def print_session_rankings(
 
     def print_rows(title: str, rows: list[dict]) -> None:
         print(f"\n{title}:")
-        print(f"{'session':<40} {'accuracy':>10} {'delta':>10} {'correct':>10} {'samples':>10}")
+        print(
+            f"{'session':<32} {'accuracy':>10} {'delta':>10} {'correct':>10} "
+            f"{'samples':>10}  {'worst recall':<24} {'worst precision':<24}"
+        )
         for row in rows:
             delta = row["accuracy"] - overall_acc
+            worst_recall = _format_worst_session_label(
+                row.get("worst_recall"),
+                metric="recall",
+                idx_to_label=idx_to_label,
+            )
+            worst_precision = _format_worst_session_label(
+                row.get("worst_precision"),
+                metric="precision",
+                idx_to_label=idx_to_label,
+            )
             print(
-                f"{row['session']:<40} "
+                f"{row['session']:<32} "
                 f"{row['accuracy']:>10.4f} "
                 f"{delta:>+10.4f} "
                 f"{row['n_correct']:>10d} "
-                f"{row['n_samples']:>10d}"
+                f"{row['n_samples']:>10d}  "
+                f"{worst_recall:<24} {worst_precision:<24}"
             )
 
     best = per_session[:top_k]
@@ -466,11 +539,81 @@ def _format_recall(
     )
 
 
+def _sessions_across_splits(metrics_list: list[dict]) -> list[dict]:
+    combined: list[dict] = []
+    for metrics in metrics_list:
+        split_name = metrics["split"]
+        split_acc = metrics["accuracy"]
+        for row in metrics.get("per_session", []):
+            combined.append(
+                {
+                    **row,
+                    "split": split_name,
+                    "delta": row["accuracy"] - split_acc,
+                }
+            )
+    combined.sort(key=lambda row: (row["accuracy"], row["n_samples"]), reverse=True)
+    return combined
+
+
+def _print_cross_split_session_rankings(
+    metrics_list: list[dict],
+    *,
+    idx_to_label: dict[int, str],
+    top_k: int,
+) -> None:
+    combined = _sessions_across_splits(metrics_list)
+    if not combined:
+        min_samples = metrics_list[0].get("session_min_samples", 1) if metrics_list else 1
+        print(f"\nper-session (all splits): no sessions with >= {min_samples} samples")
+        return
+
+    print(f"\nper-session across splits (top/bottom {top_k} by accuracy):")
+
+    def print_rows(title: str, rows: list[dict]) -> None:
+        print(f"\n{title}:")
+        print(
+            f"{'split':<8} {'session':<24} {'accuracy':>10} "
+            f"{'delta':>10} {'correct':>10} {'samples':>10}  "
+            f"{'worst recall':<24} {'worst precision':<24}"
+        )
+        for row in rows:
+            worst_recall = _format_worst_session_label(
+                row.get("worst_recall"),
+                metric="recall",
+                idx_to_label=idx_to_label,
+            )
+            worst_precision = _format_worst_session_label(
+                row.get("worst_precision"),
+                metric="precision",
+                idx_to_label=idx_to_label,
+            )
+            print(
+                f"{row['split']:<8} "
+                f"{row['session']:<24} "
+                f"{row['accuracy']:>10.4f} "
+                f"{row['delta']:>+10.4f} "
+                f"{row['n_correct']:>10d} "
+                f"{row['n_samples']:>10d}  "
+                f"{worst_recall:<24} {worst_precision:<24}"
+            )
+
+    if len(combined) <= top_k:
+        print_rows(f"all {len(combined)} sessions", combined)
+        return
+
+    best = combined[:top_k]
+    worst = list(reversed(combined[-top_k:]))
+    print_rows(f"best {len(best)} sessions", best)
+    print_rows(f"worst {len(worst)} sessions", worst)
+
+
 def print_summary_table(
     metrics_list: list[dict],
     *,
     idx_to_label: dict[int, str],
     use_color: bool = True,
+    session_top_k: int = 7,
 ) -> None:
     print("\n=== summary ===")
     print(
@@ -540,6 +683,12 @@ def print_summary_table(
                 )
             )
         print(f"{label[:20]:<20}{''.join(recalls)}{''.join(confusions)}")
+
+    _print_cross_split_session_rankings(
+        metrics_list,
+        idx_to_label=idx_to_label,
+        top_k=session_top_k,
+    )
 
 
 EMBEDDING_TAPS: dict[str, str] = {
@@ -781,8 +930,8 @@ def main() -> None:
     parser.add_argument(
         "--session-top-k",
         type=int,
-        default=5,
-        help="Number of best/worst sessions to print per split",
+        default=7,
+        help="Number of best/worst sessions to print per split and in summary",
     )
     parser.add_argument(
         "--session-min-samples",
@@ -832,9 +981,18 @@ def main() -> None:
         )
         all_metrics.append(metrics)
         print_metrics(metrics, idx_to_label=idx_to_label, use_color=use_color)
-        print_session_rankings(metrics, top_k=args.session_top_k)
+        print_session_rankings(
+            metrics,
+            idx_to_label=idx_to_label,
+            top_k=args.session_top_k,
+        )
 
-    print_summary_table(all_metrics, idx_to_label=idx_to_label, use_color=use_color)
+    print_summary_table(
+        all_metrics,
+        idx_to_label=idx_to_label,
+        use_color=use_color,
+        session_top_k=args.session_top_k,
+    )
 
     run_embedding_umap(
         model,

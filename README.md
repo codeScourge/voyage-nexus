@@ -53,7 +53,7 @@ add --continue flag, will continue training with the currently set rules, and cr
 TODO: for loss decresion
 
 ### dataset
-Silence: `INCLUDE_SILENCE_LABEL` (master), plus `INCLUDE_SCRAMBLE_BREAKS_SILENCE` and `INCLUDE_NEGATIVE_LABELS_SILENCE` for per-trial sources.
+Silence: `INCLUDE_SILENCE_FROM_BREAKS` and `INCLUDE_SILENCE_FROM_NEGATIVE`. Transitions: `INCLUDE_TRANSITIONS_FROM_BREAKS` and `INCLUDE_TRANSITIONS_FROM_NEGATIVE` (each requires its matching silence flag).
 
 theres the simple fast approach, which just first cuts away x/y sessions for val, and another one that tries different combinations so that the distribution follows in the end what we want it to have
 
