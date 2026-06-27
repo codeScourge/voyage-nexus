@@ -25,12 +25,18 @@ from _preprocessors import (
     preprocess_session_channels,
 )
 
-# Include negative-label classes when building windows and label maps.
+# from negative and scramble
 INCLUDE_UNKNOWN_WORD_LABEL = False
 INCLUDE_SILENCE_LABEL = True
-INCLUDE_TRANSITION_LABELS = False
+
+INCLUDE_SCRAMBLE_BREAKS_SILENCE = True
+INCLUDE_NEGATIVE_LABELS_SILENCE = False
 
 # --- scramble-breaks transition sampling (edit these)
+# When True, transitions/silence gaps use only TARGET_WORDS spans (default).
+# When False, every labeled word in a scramble-breaks block is used.
+SCRAMBLE_BREAKS_ONLY_TARGET_WORDS = False
+INCLUDE_TRANSITION_LABELS = True
 SCRAMBLE_BREAKS_SHIFTS_PER_TRANSITION = 3
 SCRAMBLE_BREAKS_SHIFT_MIN_S = -1.2
 SCRAMBLE_BREAKS_SHIFT_MAX_S = 1.2
@@ -47,10 +53,10 @@ TARGET_WORDS: tuple[str, ...] = (
     "bullshit",
     "gogogo",
     "shitbull",
-    "hangar",
-    "teaspoon",
+    # "hangar",
+    # "teaspoon",
     "naan",
-    "quail"
+    # "quail"
 )
 UNKNOWN_WORD_LABEL = "unknown word"
 SILENCE_LABEL = "silence"
@@ -69,6 +75,23 @@ def all_labels() -> tuple[str, ...]:
     if INCLUDE_SILENCE_LABEL:
         labels.append(SILENCE_LABEL)
     return tuple(labels)
+
+
+def default_label_max_fractions(fraction: float = 0.20) -> dict[str, float]:
+    return {label: fraction for label in all_labels()}
+
+
+def _block_id_from_event_id(event_id: str) -> str:
+    if event_id.startswith("silence:"):
+        parts = event_id.split(":", 2)
+        return parts[1] if len(parts) > 1 else ""
+    if ":shift=" in event_id:
+        return event_id.split(":", 1)[0]
+    return ""
+
+
+def _payload_block_id(payload: dict[str, Any]) -> str:
+    return str(payload.get("collection_block_id", "")).strip()
 
 
 ALL_LABELS: tuple[str, ...] = all_labels()
@@ -388,6 +411,7 @@ def _append_silence_windows(
     labels: list[str],
     event_type_list: list[str],
     event_ids: list[str],
+    collection_block_ids: list[str],
     center_samples: list[int],
     skipped: int,
 ) -> int:
@@ -426,6 +450,7 @@ def _append_silence_windows(
             labels.append(SILENCE_LABEL)
             event_type_list.append("negative_labels_silence")
             event_ids.append(f"silence:{block_id}:{gap_start}-{gap_end}")
+            collection_block_ids.append(block_id)
             center_samples.append(center)
     return skipped
 
@@ -465,7 +490,10 @@ def _transition_shift_label(
 ) -> str:
     if silence_frac >= SCRAMBLE_BREAKS_DOMINANT_FRACTION:
         return SILENCE_LABEL
-    if word_frac >= SCRAMBLE_BREAKS_DOMINANT_FRACTION:
+    if (
+        word_frac >= SCRAMBLE_BREAKS_DOMINANT_FRACTION
+        and (INCLUDE_UNKNOWN_WORD_LABEL or word != UNKNOWN_WORD_LABEL)
+    ):
         return word
     if kind == "silence_to_word":
         return WORD_STARTING_LABEL
@@ -535,7 +563,9 @@ def _scramble_breaks_word_spans(
         if payload.get("mode") != SCRAMBLE_BREAKS_MODE:
             continue
         word = normalize_word_label(event.get("label_text", ""))
-        if word is None or word == UNKNOWN_WORD_LABEL:
+        if word is None:
+            continue
+        if SCRAMBLE_BREAKS_ONLY_TARGET_WORDS and word == UNKNOWN_WORD_LABEL:
             continue
         start_text = event.get("sample_index_start", "")
         if not start_text:
@@ -611,6 +641,7 @@ def _append_scramble_breaks_transition_windows(
     labels: list[str],
     event_type_list: list[str],
     event_ids: list[str],
+    collection_block_ids: list[str],
     center_samples: list[int],
 ) -> int:
     skipped = 0
@@ -663,6 +694,7 @@ def _append_scramble_breaks_transition_windows(
                 labels.append(label)
                 event_type_list.append("scramble_breaks_transition")
                 event_ids.append(f"{boundary_key}:shift={shift_s:+.3f}")
+                collection_block_ids.append(block_id)
                 center_samples.append(center)
     return skipped
 
@@ -679,6 +711,7 @@ def _append_scramble_breaks_silence_windows(
     labels: list[str],
     event_type_list: list[str],
     event_ids: list[str],
+    collection_block_ids: list[str],
     center_samples: list[int],
 ) -> int:
     skipped = 0
@@ -718,6 +751,7 @@ def _append_scramble_breaks_silence_windows(
             labels.append(SILENCE_LABEL)
             event_type_list.append("scramble_breaks_silence")
             event_ids.append(f"silence:{block_id}:{gap_start}-{gap_end}")
+            collection_block_ids.append(block_id)
             center_samples.append(center)
     return skipped
 
@@ -739,6 +773,7 @@ class EventWindowBatch:
     labels: tuple[str, ...]
     event_types: tuple[str, ...]
     event_ids: tuple[str, ...]
+    collection_block_ids: tuple[str, ...]
     center_sample_index: np.ndarray
     session_dirs: tuple[Path, ...]
     sample_rate_hz: float
@@ -835,6 +870,7 @@ def build_event_windows(
     labels: list[str] = []
     event_type_list: list[str] = []
     event_ids: list[str] = []
+    collection_block_ids: list[str] = []
     center_samples: list[int] = []
     skipped = 0
 
@@ -890,6 +926,7 @@ def build_event_windows(
         labels.append(label)
         event_type_list.append(event_type)
         event_ids.append(event.get("event_id", ""))
+        collection_block_ids.append(_payload_block_id(payload))
         center_samples.append(start_idx)
 
     if INCLUDE_TRANSITION_LABELS:
@@ -904,9 +941,10 @@ def build_event_windows(
             labels=labels,
             event_type_list=event_type_list,
             event_ids=event_ids,
+            collection_block_ids=collection_block_ids,
             center_samples=center_samples,
         )
-    elif INCLUDE_SILENCE_LABEL:
+    elif INCLUDE_SILENCE_LABEL and INCLUDE_SCRAMBLE_BREAKS_SILENCE:
         skipped += _append_scramble_breaks_silence_windows(
             channels=channels,
             events=events,
@@ -918,10 +956,11 @@ def build_event_windows(
             labels=labels,
             event_type_list=event_type_list,
             event_ids=event_ids,
+            collection_block_ids=collection_block_ids,
             center_samples=center_samples,
         )
 
-    if INCLUDE_SILENCE_LABEL:
+    if INCLUDE_SILENCE_LABEL and INCLUDE_NEGATIVE_LABELS_SILENCE:
         skipped = _append_silence_windows(
             channels=channels,
             events=events,
@@ -933,6 +972,7 @@ def build_event_windows(
             labels=labels,
             event_type_list=event_type_list,
             event_ids=event_ids,
+            collection_block_ids=collection_block_ids,
             center_samples=center_samples,
             skipped=skipped,
         )
@@ -958,6 +998,7 @@ def build_event_windows(
         labels=tuple(labels),
         event_types=tuple(event_type_list),
         event_ids=tuple(event_ids),
+        collection_block_ids=tuple(collection_block_ids),
         center_sample_index=np.asarray(center_samples, dtype=np.int64),
         session_dirs=(session_dir,),
         sample_rate_hz=fs,
@@ -995,6 +1036,9 @@ def _merge_batches(batches: Sequence[EventWindowBatch]) -> EventWindowBatch:
         labels=tuple(label for batch in batches for label in batch.labels),
         event_types=tuple(event_type for batch in batches for event_type in batch.event_types),
         event_ids=tuple(event_id for batch in batches for event_id in batch.event_ids),
+        collection_block_ids=tuple(
+            block_id for batch in batches for block_id in batch.collection_block_ids
+        ),
         center_sample_index=np.concatenate(
             [batch.center_sample_index for batch in batches],
             axis=0,
@@ -1186,14 +1230,260 @@ class DatasetSplits:
     post_ms: float
     extra_session_test_split: float
     intra_session_test_split: float
+    stratified_label_split: bool = False
+    label_max_fractions: Optional[dict[str, float]] = None
+    label_cap_dropped: tuple[int, int, int] = (0, 0, 0)
+
+
+def _pick_redundant_index_to_drop(
+    candidates: Sequence[int],
+    *,
+    per_sample_sessions: Sequence[Path],
+    per_sample_block_ids: Sequence[str],
+    per_sample_event_ids: Sequence[str],
+) -> int:
+    """Pick the most redundant sample within a label (same session/block cluster)."""
+    session_counts: dict[str, int] = defaultdict(int)
+    block_counts: dict[tuple[str, str], int] = defaultdict(int)
+    for index in candidates:
+        session_key = str(per_sample_sessions[index])
+        block_key = per_sample_block_ids[index] or per_sample_event_ids[index]
+        session_counts[session_key] += 1
+        block_counts[(session_key, block_key)] += 1
+
+    def redundancy(index: int) -> tuple[int, int, int]:
+        session_key = str(per_sample_sessions[index])
+        block_key = per_sample_block_ids[index] or per_sample_event_ids[index]
+        return (
+            block_counts[(session_key, block_key)],
+            session_counts[session_key],
+            _stable_event_seed(per_sample_event_ids[index]),
+        )
+
+    return max(candidates, key=redundancy)
+
+
+def apply_label_fraction_caps(
+    indices: Sequence[int],
+    per_sample_labels: Sequence[str],
+    per_sample_sessions: Sequence[Path],
+    per_sample_block_ids: Sequence[str],
+    per_sample_event_ids: Sequence[str],
+    label_max_fractions: dict[str, float],
+) -> np.ndarray:
+    """Drop samples until each capped label is at or below its max fraction."""
+    kept = [int(index) for index in indices]
+    if not kept or not label_max_fractions:
+        return np.asarray(kept, dtype=np.int64)
+
+    capped_labels = {
+        label: fraction
+        for label, fraction in label_max_fractions.items()
+        if 0.0 < fraction < 1.0
+    }
+    if not capped_labels:
+        return np.asarray(kept, dtype=np.int64)
+
+    max_drops = len(kept)
+    drops = 0
+    while drops < max_drops:
+        total = len(kept)
+        if total == 0:
+            break
+
+        worst_label: Optional[str] = None
+        worst_excess = 0.0
+        for label, cap in capped_labels.items():
+            count = sum(1 for index in kept if per_sample_labels[index] == label)
+            if count == 0:
+                continue
+            excess = (count / total) - cap
+            if excess > worst_excess + 1e-12:
+                worst_excess = excess
+                worst_label = label
+
+        if worst_label is None:
+            break
+
+        candidates = [index for index in kept if per_sample_labels[index] == worst_label]
+        drop_index = _pick_redundant_index_to_drop(
+            candidates,
+            per_sample_sessions=per_sample_sessions,
+            per_sample_block_ids=per_sample_block_ids,
+            per_sample_event_ids=per_sample_event_ids,
+        )
+        kept.remove(drop_index)
+        drops += 1
+
+    return np.asarray(kept, dtype=np.int64)
+
+
+def _apply_split_label_fraction_caps(
+    train_indices: np.ndarray,
+    val_indices: np.ndarray,
+    test_indices: np.ndarray,
+    *,
+    per_sample_labels: Sequence[str],
+    per_sample_sessions: Sequence[Path],
+    per_sample_block_ids: Sequence[str],
+    per_sample_event_ids: Sequence[str],
+    label_max_fractions: Optional[dict[str, float]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int, int]]:
+    if not label_max_fractions:
+        return train_indices, val_indices, test_indices, (0, 0, 0)
+
+    capped_train = apply_label_fraction_caps(
+        train_indices,
+        per_sample_labels,
+        per_sample_sessions,
+        per_sample_block_ids,
+        per_sample_event_ids,
+        label_max_fractions,
+    )
+    capped_val = apply_label_fraction_caps(
+        val_indices,
+        per_sample_labels,
+        per_sample_sessions,
+        per_sample_block_ids,
+        per_sample_event_ids,
+        label_max_fractions,
+    )
+    capped_test = apply_label_fraction_caps(
+        test_indices,
+        per_sample_labels,
+        per_sample_sessions,
+        per_sample_block_ids,
+        per_sample_event_ids,
+        label_max_fractions,
+    )
+    dropped = (
+        len(train_indices) - len(capped_train),
+        len(val_indices) - len(capped_val),
+        len(test_indices) - len(capped_test),
+    )
+    return capped_train, capped_val, capped_test, dropped
+
+
+def _label_counts_for_indices(
+    indices: Sequence[int],
+    per_sample_labels: Sequence[str],
+) -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+    for index in indices:
+        counts[per_sample_labels[int(index)]] += 1
+    return dict(counts)
+
+
+def _label_distribution_l1_distance(
+    counts: dict[str, int],
+    target_fractions: dict[str, float],
+) -> float:
+    total = sum(counts.values())
+    if total == 0:
+        return float("inf")
+    return sum(
+        abs(counts.get(label, 0) / total - fraction)
+        for label, fraction in target_fractions.items()
+    )
+
+
+def _pick_val_sessions(
+    sessions: list[Path],
+    session_to_indices: dict[Path, list[int]],
+    per_sample_labels: Sequence[str],
+    n_val_sessions: int,
+    *,
+    stratified: bool,
+    n_trials: int = 1000,
+) -> set[Path]:
+    if n_val_sessions <= 0:
+        return set()
+
+    if not stratified:
+        session_order = _rng.permutation(len(sessions))
+        return {sessions[int(i)] for i in session_order[:n_val_sessions]}
+
+    all_indices = [index for session in sessions for index in session_to_indices[session]]
+    global_counts = _label_counts_for_indices(all_indices, per_sample_labels)
+    global_total = sum(global_counts.values())
+    if global_total == 0:
+        session_order = _rng.permutation(len(sessions))
+        return {sessions[int(i)] for i in session_order[:n_val_sessions]}
+
+    target_fractions = {
+        label: count / global_total for label, count in global_counts.items()
+    }
+
+    best_score = float("inf")
+    best_val_sessions: set[Path] = set()
+    for _ in range(n_trials):
+        session_order = _rng.permutation(len(sessions))
+        val_sessions = {sessions[int(i)] for i in session_order[:n_val_sessions]}
+        val_indices = [
+            index for session in val_sessions for index in session_to_indices[session]
+        ]
+        score = _label_distribution_l1_distance(
+            _label_counts_for_indices(val_indices, per_sample_labels),
+            target_fractions,
+        )
+        if score < best_score:
+            best_score = score
+            best_val_sessions = val_sessions
+
+    if best_val_sessions:
+        return best_val_sessions
+
+    session_order = _rng.permutation(len(sessions))
+    return {sessions[int(i)] for i in session_order[:n_val_sessions]}
+
+
+def _split_session_train_test(
+    indices: Sequence[int],
+    per_sample_labels: Sequence[str],
+    *,
+    intra_session_test_split: float,
+    stratified: bool,
+) -> tuple[list[int], list[int]]:
+    indices = list(indices)
+    if len(indices) <= 1 or intra_session_test_split == 0.0:
+        return indices, []
+
+    if not stratified:
+        event_order = _rng.permutation(len(indices))
+        n_test = max(1, int(round(len(indices) * intra_session_test_split)))
+        n_test = min(n_test, len(indices) - 1)
+        test_indices = [indices[int(i)] for i in event_order[:n_test]]
+        train_indices = [indices[int(i)] for i in event_order[n_test:]]
+        return train_indices, test_indices
+
+    by_label: dict[str, list[int]] = defaultdict(list)
+    for index in indices:
+        by_label[per_sample_labels[int(index)]].append(index)
+
+    train_indices: list[int] = []
+    test_indices: list[int] = []
+    for label_indices in by_label.values():
+        label_order = _rng.permutation(len(label_indices))
+        ordered = [label_indices[int(i)] for i in label_order]
+        if len(ordered) == 1:
+            train_indices.extend(ordered)
+            continue
+        n_test = max(1, int(round(len(ordered) * intra_session_test_split)))
+        n_test = min(n_test, len(ordered) - 1)
+        test_indices.extend(ordered[:n_test])
+        train_indices.extend(ordered[n_test:])
+
+    return train_indices, test_indices
 
 
 def split_sample_indices(
     sessions: list[Path],
     per_sample_sessions: Sequence[Path],
+    per_sample_labels: Sequence[str],
     *,
     extra_session_test_split: float = 0.2,
     intra_session_test_split: float = 0.15,
+    stratified_label_split: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[Path, ...], tuple[Path, ...]]:
     """Return disjoint train, val, and test sample indices.
 
@@ -1212,16 +1502,20 @@ def split_sample_indices(
     for index, session_dir in enumerate(per_sample_sessions):
         session_to_indices[Path(session_dir)].append(index)
 
-    session_order = _rng.permutation(len(sessions))
-
     n_val_sessions = int(round(len(sessions) * extra_session_test_split))
     if len(sessions) > 1:
         n_val_sessions = min(n_val_sessions, len(sessions) - 1)
     else:
         n_val_sessions = 0
 
-    val_sessions = {sessions[int(i)] for i in session_order[:n_val_sessions]}
-    remaining_sessions = [sessions[int(i)] for i in session_order[n_val_sessions:]]
+    val_sessions = _pick_val_sessions(
+        sessions,
+        session_to_indices,
+        per_sample_labels,
+        n_val_sessions,
+        stratified=stratified_label_split,
+    )
+    remaining_sessions = [session for session in sessions if session not in val_sessions]
 
     train_indices: list[int] = []
     val_indices: list[int] = []
@@ -1231,18 +1525,14 @@ def split_sample_indices(
         val_indices.extend(session_to_indices[session_dir])
 
     for session_dir in remaining_sessions:
-        indices = session_to_indices.get(session_dir, [])
-        if not indices:
-            continue
-        if len(indices) == 1 or intra_session_test_split == 0.0:
-            train_indices.extend(indices)
-            continue
-
-        event_order = _rng.permutation(len(indices))
-        n_test = max(1, int(round(len(indices) * intra_session_test_split)))
-        n_test = min(n_test, len(indices) - 1)
-        test_indices.extend(indices[int(i)] for i in event_order[:n_test])
-        train_indices.extend(indices[int(i)] for i in event_order[n_test:])
+        session_train, session_test = _split_session_train_test(
+            session_to_indices.get(session_dir, []),
+            per_sample_labels,
+            intra_session_test_split=intra_session_test_split,
+            stratified=stratified_label_split,
+        )
+        train_indices.extend(session_train)
+        test_indices.extend(session_test)
 
     return (
         np.asarray(train_indices, dtype=np.int64),
@@ -1260,6 +1550,8 @@ def build_dataset_splits(
     post_ms: float = 700.0,
     extra_session_test_split: float = 0.2,
     intra_session_test_split: float = 0.15,
+    stratified_label_split: bool = False,
+    label_max_fractions: Optional[dict[str, float]] = None,
     show_progress: bool = True,
 ) -> DatasetSplits:
     from _viewer_core import discover_sessions
@@ -1281,8 +1573,28 @@ def build_dataset_splits(
     ) = split_sample_indices(
         sessions,
         dataset._session_dirs,
+        dataset.batch.labels,
         extra_session_test_split=extra_session_test_split,
         intra_session_test_split=intra_session_test_split,
+        stratified_label_split=stratified_label_split,
+    )
+    block_ids = dataset.batch.collection_block_ids or tuple(
+        _block_id_from_event_id(event_id) for event_id in dataset.batch.event_ids
+    )
+    (
+        train_indices,
+        val_indices,
+        test_indices,
+        label_cap_dropped,
+    ) = _apply_split_label_fraction_caps(
+        train_indices,
+        val_indices,
+        test_indices,
+        per_sample_labels=dataset.batch.labels,
+        per_sample_sessions=dataset._session_dirs,
+        per_sample_block_ids=block_ids,
+        per_sample_event_ids=dataset.batch.event_ids,
+        label_max_fractions=label_max_fractions,
     )
     return DatasetSplits(
         dataset=dataset,
@@ -1299,6 +1611,9 @@ def build_dataset_splits(
         post_ms=post_ms,
         extra_session_test_split=extra_session_test_split,
         intra_session_test_split=intra_session_test_split,
+        stratified_label_split=stratified_label_split,
+        label_max_fractions=label_max_fractions,
+        label_cap_dropped=label_cap_dropped,
     )
 
 
@@ -1321,6 +1636,9 @@ def save_dataset_splits(output_dir: Path, splits: DatasetSplits) -> None:
         "post_ms": splits.post_ms,
         "extra_session_test_split": splits.extra_session_test_split,
         "intra_session_test_split": splits.intra_session_test_split,
+        "stratified_label_split": splits.stratified_label_split,
+        "label_max_fractions": splits.label_max_fractions,
+        "label_cap_dropped": list(splits.label_cap_dropped),
         "sample_rate_hz": batch.sample_rate_hz,
         "pre_samples": batch.pre_samples,
         "post_samples": batch.post_samples,
@@ -1328,6 +1646,7 @@ def save_dataset_splits(output_dir: Path, splits: DatasetSplits) -> None:
         "labels": list(batch.labels),
         "event_types": list(batch.event_types),
         "event_ids": list(batch.event_ids),
+        "collection_block_ids": list(batch.collection_block_ids),
         "session_dirs": [str(path) for path in splits.dataset._session_dirs],
         "train_indices": splits.train_indices.tolist(),
         "val_indices": splits.val_indices.tolist(),
@@ -1353,11 +1672,19 @@ def load_dataset_splits(splits_dir: Path) -> DatasetSplits:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     windows = np.load(windows_path)
 
+    if "collection_block_ids" in manifest:
+        collection_block_ids = tuple(manifest["collection_block_ids"])
+    else:
+        collection_block_ids = tuple(
+            _block_id_from_event_id(event_id) for event_id in manifest["event_ids"]
+        )
+
     batch = EventWindowBatch(
         x=windows["x"],
         labels=tuple(manifest["labels"]),
         event_types=tuple(manifest["event_types"]),
         event_ids=tuple(manifest["event_ids"]),
+        collection_block_ids=collection_block_ids,
         center_sample_index=windows["center_sample_index"],
         session_dirs=tuple(Path(path) for path in manifest["session_dirs"]),
         sample_rate_hz=float(manifest["sample_rate_hz"]),
@@ -1403,6 +1730,9 @@ def load_dataset_splits(splits_dir: Path) -> DatasetSplits:
         post_ms=float(manifest["post_ms"]),
         extra_session_test_split=float(manifest["extra_session_test_split"]),
         intra_session_test_split=float(manifest["intra_session_test_split"]),
+        stratified_label_split=bool(manifest.get("stratified_label_split", False)),
+        label_max_fractions=manifest.get("label_max_fractions"),
+        label_cap_dropped=tuple(manifest.get("label_cap_dropped", (0, 0, 0))),
     )
 
 
@@ -1442,6 +1772,18 @@ def print_split_summary(splits: DatasetSplits) -> None:
     print(
         f"test:  {len(splits.test)} held-out intra-session events from train sessions"
     )
+    print(
+        f"split balancing: {'stratified by label' if splits.stratified_label_split else 'random'}"
+    )
+    if splits.label_max_fractions:
+        dropped = splits.label_cap_dropped
+        print(
+            "label caps: "
+            + ", ".join(f"{label}={fraction:.0%}" for label, fraction in sorted(splits.label_max_fractions.items()))
+        )
+        print(
+            f"dropped by caps: train={dropped[0]}, val={dropped[1]}, test={dropped[2]}"
+        )
     print()
     for name, subset in (
         ("train", splits.train),
@@ -1461,6 +1803,8 @@ PRE_MS = 0.0
 POST_MS = 0.0
 EXTRA_SESSION_TEST_SPLIT = 0.2
 INTRA_SESSION_TEST_SPLIT = 0.15
+STRATIFIED_LABEL_SPLIT = False
+LABEL_MAX_FRACTIONS = default_label_max_fractions(0.22)
 
 
 if __name__ == "__main__":
@@ -1475,6 +1819,8 @@ if __name__ == "__main__":
         post_ms=POST_MS,
         extra_session_test_split=EXTRA_SESSION_TEST_SPLIT,
         intra_session_test_split=INTRA_SESSION_TEST_SPLIT,
+        stratified_label_split=STRATIFIED_LABEL_SPLIT,
+        label_max_fractions=LABEL_MAX_FRACTIONS,
         show_progress=True,
     )
     build_elapsed = time.perf_counter() - build_started

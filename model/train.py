@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import os
 import random
 import re
@@ -141,6 +142,8 @@ def get_device() -> torch.device:
 device = get_device()
 CHECKPOINT_DIR = Path(__file__).resolve().parent / "checkpoints"
 CHECKPOINT_SAVE_INTERVAL = 30
+EARLY_STOPPING_METRIC = "loss"  # "loss" or "acc" — stop signal only, not best.pt selection
+EARLY_STOPPING_SMOOTH_WINDOW = 4
 
 
 # --- architecture
@@ -220,7 +223,7 @@ class IntermediateFusionEEGNet(nn.Module):
         T: int,
         F1: int = 8,
         D: int = 2,
-        F2: int = 16,
+        F2: int = 32,
         kern_eeg: int = 128,   # half the sampling rate per the paper
         kern_emg: int = 128,   # tune: EMG carries higher-freq content
         sep_kernel: int = 16,
@@ -273,6 +276,25 @@ class IntermediateFusionEEGNet(nn.Module):
 
         x = torch.flatten(x, 1)
         return self.classifier(x)
+
+    def forward_embeddings(self, eeg: torch.Tensor, emg: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Flattened fusion embeddings without dropout (use under model.eval())."""
+        e = self.eeg_branch(eeg)
+        m = self.emg_branch(emg)
+        t = min(e.shape[-1], m.shape[-1])
+        e, m = e[..., :t], m[..., :t]
+
+        x = torch.cat([e, m], dim=1)
+        x = self.pool1(x)
+
+        x = self.sep_point(self.sep_depth(x))
+        pre_pool2 = F.elu(self.bn3(x))
+        post_pool2 = self.pool2(pre_pool2)
+
+        return {
+            "pre_pool2": torch.flatten(pre_pool2, start_dim=1),
+            "classifier_input": torch.flatten(post_pool2, start_dim=1),
+        }
 
 
 # --- dataset adapter
@@ -348,8 +370,10 @@ def new_run_dir_name(now: datetime | None = None) -> str:
     return f"{stamp}_run_{uid}"
 
 
-def create_run_dir(root: Path = CHECKPOINT_DIR) -> Path:
+def create_run_dir(root: Path = CHECKPOINT_DIR, *, continued: bool = False) -> Path:
     base_name = new_run_dir_name()
+    if continued:
+        base_name = f"{base_name}-continued"
     run_dir = root / base_name
     suffix = 2
     while run_dir.exists():
@@ -357,6 +381,40 @@ def create_run_dir(root: Path = CHECKPOINT_DIR) -> Path:
         suffix += 1
     run_dir.mkdir(parents=True, exist_ok=False)
     return run_dir
+
+
+def latest_checkpoint_in_run(run_dir: Path) -> Path:
+    for name in ("last.pt", "best.pt"):
+        path = run_dir / name
+        if path.exists():
+            return path
+    epoch_ckpts = sorted(run_dir.glob("epoch_*.pt"))
+    if epoch_ckpts:
+        return epoch_ckpts[-1]
+    raise FileNotFoundError(f"No checkpoint found in {run_dir}")
+
+
+def load_training_checkpoint(path: Path) -> tuple[nn.Module, dict, dict, dict]:
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    model_config = ckpt["model_config"]
+    label_to_idx: dict[str, int] = ckpt["label_to_idx"]
+
+    model = IntermediateFusionEEGNet(
+        n_eeg=model_config["n_eeg"],
+        n_emg=model_config["n_emg"],
+        n_classes=model_config["n_classes"],
+        T=model_config["T"],
+    )
+    model.load_state_dict(ckpt["model_state_dict"])
+
+    resume_meta = {
+        "source_checkpoint": str(path),
+        "source_run_dir": str(path.parent),
+        "source_epoch": int(ckpt.get("epoch", 0)),
+        "source_val_acc": float(ckpt.get("val_acc", float("nan"))),
+        "source_kind": ckpt.get("kind", "unknown"),
+    }
+    return model, label_to_idx, model_config, resume_meta
 
 
 def latest_run_dir(root: Path = CHECKPOINT_DIR) -> Path | None:
@@ -395,37 +453,119 @@ def save_checkpoint(
     total_epochs: int,
     kind: str,
     state_dict: dict | None = None,
+    continued_from: dict | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model_state_dict": state_dict if state_dict is not None else model.state_dict(),
-            "label_to_idx": label_to_idx,
-            "model_config": model_config,
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "train_acc": train_acc,
-            "val_loss": val_loss,
-            "val_acc": val_acc,
-            "best_acc": best_acc,
-            "epochs": total_epochs,
-            "kind": kind,
-            "device": str(device),
-        },
-        path,
-    )
+    payload = {
+        "model_state_dict": state_dict if state_dict is not None else model.state_dict(),
+        "label_to_idx": label_to_idx,
+        "model_config": model_config,
+        "epoch": epoch,
+        "train_loss": train_loss,
+        "train_acc": train_acc,
+        "val_loss": val_loss,
+        "val_acc": val_acc,
+        "best_acc": best_acc,
+        "epochs": total_epochs,
+        "kind": kind,
+        "device": str(device),
+    }
+    if continued_from is not None:
+        payload["continued_from"] = continued_from
+    torch.save(payload, path)
 
     print("\n")
     print(f"saved checkpoint ({kind}, epoch {epoch}) -> {path}")
     print("\n")
 
 
-def plot_training_history(history: dict[str, list[float]], path: Path) -> None:
-    
-    epochs = range(1, len(history["train_loss"]) + 1)
-    path.parent.mkdir(parents=True, exist_ok=True)
+def smoothed_tail(values: list[float], window: int) -> float | None:
+    if len(values) < window:
+        return None
+    return sum(values[-window:]) / window
 
-    fig, (ax_loss, ax_acc) = plt.subplots(1, 2, figsize=(12, 5))
+
+def init_per_class_counters(n_classes: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.zeros(n_classes, device=device),
+        torch.zeros(n_classes, device=device),
+        torch.zeros(n_classes, device=device),
+    )
+
+
+def update_per_class_counters(
+    logits: torch.Tensor,
+    y: torch.Tensor,
+    pred: torch.Tensor,
+    loss_sum: torch.Tensor,
+    correct: torch.Tensor,
+    count: torch.Tensor,
+) -> None:
+    loss_per_sample = F.cross_entropy(logits, y, reduction="none")
+    ones = torch.ones_like(y, dtype=loss_sum.dtype)
+    count.scatter_add_(0, y, ones)
+    loss_sum.scatter_add_(0, y, loss_per_sample)
+    correct.scatter_add_(0, y, (pred == y).to(loss_sum.dtype))
+
+
+def per_class_metrics_from_counters(
+    loss_sum: torch.Tensor,
+    correct: torch.Tensor,
+    count: torch.Tensor,
+    idx_to_label: dict[int, str],
+) -> tuple[dict[str, float], dict[str, float]]:
+    losses: dict[str, float] = {}
+    accs: dict[str, float] = {}
+    for idx, label in idx_to_label.items():
+        n = count[idx].item()
+        if n > 0:
+            losses[label] = (loss_sum[idx] / n).item()
+            accs[label] = (correct[idx] / n).item()
+        else:
+            losses[label] = float("nan")
+            accs[label] = float("nan")
+    return losses, accs
+
+
+def _per_label_colors(n: int) -> list:
+    """Distinct colors for per-label plots; scales beyond the default 10-color cycle."""
+    if n <= 0:
+        return []
+    if n <= 20:
+        return list(plt.colormaps["tab20"].colors[:n])
+    if n <= 40:
+        tab20 = plt.colormaps["tab20"].colors
+        set3 = plt.colormaps["Set3"].colors
+        return list(tab20) + list(set3)[: n - len(tab20)]
+    cmap = plt.colormaps["hsv"]
+    return [cmap(i / n) for i in range(n)]
+
+
+def plot_training_history(
+    history: dict[str, list[float] | dict[str, list[float]]],
+    path: Path,
+    *,
+    idx_to_label: dict[int, str],
+    best_epoch: int | None = None,
+) -> None:
+    n_epochs = len(history["train_loss"])
+    epochs = range(1, n_epochs + 1)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    labels = [idx_to_label[i] for i in sorted(idx_to_label)]
+
+    fig, ((ax_loss, ax_acc), (ax_loss_label, ax_acc_label)) = plt.subplots(2, 2, figsize=(12, 10))
+
+    def mark_best_epoch(ax, *, with_label: bool = False) -> None:
+        if best_epoch is None or not (1 <= best_epoch <= n_epochs):
+            return
+        ax.axvline(
+            best_epoch,
+            color="green",
+            linestyle="--",
+            linewidth=1.5,
+            alpha=0.85,
+            label=f"best val acc (epoch {best_epoch})" if with_label else None,
+        )
 
     ax_loss.plot(epochs, history["train_loss"], label="train loss")
     ax_loss.plot(epochs, history["val_loss"], label="val loss")
@@ -441,8 +581,48 @@ def plot_training_history(history: dict[str, list[float]], path: Path) -> None:
     ax_acc.set_ylabel("accuracy")
     ax_acc.set_title("Training and validation accuracy")
     ax_acc.set_ylim(0.0, 1.0)
-    ax_acc.legend()
     ax_acc.grid(True, alpha=0.3)
+
+    train_loss_per_label = history["train_loss_per_label"]
+    val_loss_per_label = history["val_loss_per_label"]
+    train_acc_per_label = history["train_acc_per_label"]
+    val_acc_per_label = history["val_acc_per_label"]
+
+    label_colors = _per_label_colors(len(labels))
+    for color, label in zip(label_colors, labels):
+        ax_loss_label.plot(
+            epochs, train_loss_per_label[label], color=color, linestyle="-", label=f"train {label}",
+        )
+        ax_loss_label.plot(
+            epochs, val_loss_per_label[label], color=color, linestyle=":", label=f"val {label}",
+        )
+        ax_acc_label.plot(
+            epochs, train_acc_per_label[label], color=color, linestyle="-", label=f"train {label}",
+        )
+        ax_acc_label.plot(
+            epochs, val_acc_per_label[label], color=color, linestyle=":", label=f"val {label}",
+        )
+
+    ax_loss_label.set_xlabel("epoch")
+    ax_loss_label.set_ylabel("loss")
+    ax_loss_label.set_title("Per-label training and validation loss")
+    ax_loss_label.legend(fontsize=7, ncol=2)
+    ax_loss_label.grid(True, alpha=0.3)
+
+    ax_acc_label.set_xlabel("epoch")
+    ax_acc_label.set_ylabel("accuracy")
+    ax_acc_label.set_title("Per-label training and validation accuracy")
+    ax_acc_label.set_ylim(0.0, 1.0)
+    ax_acc_label.legend(fontsize=7, ncol=2)
+    ax_acc_label.grid(True, alpha=0.3)
+
+    mark_best_epoch(ax_loss)
+    mark_best_epoch(ax_acc, with_label=True)
+    mark_best_epoch(ax_loss_label)
+    mark_best_epoch(ax_acc_label)
+    for ax in (ax_loss, ax_acc, ax_loss_label, ax_acc_label):
+        ax.set_xlim(1, n_epochs)
+    ax_acc.legend()
 
     fig.tight_layout()
     fig.savefig(path, dpi=150)
@@ -462,12 +642,16 @@ def train(
     *,
     run_dir: Path,
     save_interval: int = CHECKPOINT_SAVE_INTERVAL,
-    early_stopping_patience: int = 15,
+    early_stopping_patience: int = 10,
+    early_stopping_metric: str = EARLY_STOPPING_METRIC,
+    early_stopping_smooth_window: int = EARLY_STOPPING_SMOOTH_WINDOW,
     num_workers=0,
     pin_memory=False,
+    continued_from: dict | None = None,
 ):
     n_classes = len(label_to_idx)
     model = model.to(device)
+    idx_to_label = {idx: label for label, idx in label_to_idx.items()}
 
     train_ds = FusionDataset(splits.dataset, splits.train.indices, label_to_idx)
     val_ds = FusionDataset(splits.dataset, splits.val.indices, label_to_idx)
@@ -495,13 +679,20 @@ def train(
         "val_loss": 0.0,
         "val_acc": 0.0,
     }
-    history: dict[str, list[float]] = {
+    history: dict[str, list[float] | dict[str, list[float]]] = {
         "train_loss": [],
         "val_loss": [],
         "train_acc": [],
         "val_acc": [],
+        "train_loss_per_label": {label: [] for label in label_to_idx},
+        "val_loss_per_label": {label: [] for label in label_to_idx},
+        "train_acc_per_label": {label: [] for label in label_to_idx},
+        "val_acc_per_label": {label: [] for label in label_to_idx},
     }
     epochs_without_improve = 0
+    stop_metric_key = "val_loss" if early_stopping_metric == "loss" else "val_acc"
+    best_smoothed_stop = float("inf") if early_stopping_metric == "loss" else float("-inf")
+    best_smoothed_stop_epoch = 0
 
     def write_checkpoint(
         path: Path,
@@ -528,6 +719,7 @@ def train(
             total_epochs=epochs,
             kind=kind,
             state_dict=state_dict,
+            continued_from=continued_from,
         )
 
     epoch_bar = tqdm(range(epochs), desc="epochs", unit="epoch")
@@ -536,6 +728,9 @@ def train(
         model.train()
         running = 0.0
         train_correct = train_total = 0
+        train_loss_sum, train_correct_per_class, train_count_per_class = init_per_class_counters(
+            n_classes, device,
+        )
         for eeg, emg, y in tqdm(train_dl, desc="train", leave=False):
             eeg, emg, y = eeg.to(device), emg.to(device), y.to(device)
             opt.zero_grad()
@@ -547,15 +742,25 @@ def train(
             pred = logits.argmax(1)
             train_correct += (pred == y).sum().item()
             train_total += y.size(0)
+            update_per_class_counters(
+                logits, y, pred,
+                train_loss_sum, train_correct_per_class, train_count_per_class,
+            )
 
         train_loss = running / len(train_ds)
         train_acc = train_correct / train_total if train_total else 0.0
+        train_loss_per_label, train_acc_per_label = per_class_metrics_from_counters(
+            train_loss_sum, train_correct_per_class, train_count_per_class, idx_to_label,
+        )
 
         
         model.eval()
         with torch.no_grad():
             val_running = 0.0
             correct = total = 0
+            val_loss_sum, val_correct_per_class, val_count_per_class = init_per_class_counters(
+                n_classes, device,
+            )
             for eeg, emg, y in tqdm(val_dl, desc="val", leave=False):
                 eeg, emg, y = eeg.to(device), emg.to(device), y.to(device)
                 logits = model(eeg, emg)
@@ -563,8 +768,15 @@ def train(
                 pred = logits.argmax(1)
                 correct += (pred == y).sum().item()
                 total += y.size(0)
+                update_per_class_counters(
+                    logits, y, pred,
+                    val_loss_sum, val_correct_per_class, val_count_per_class,
+                )
             val_loss = val_running / len(val_ds) if len(val_ds) else 0.0
             acc = correct / total if total else 0.0
+            val_loss_per_label, val_acc_per_label = per_class_metrics_from_counters(
+                val_loss_sum, val_correct_per_class, val_count_per_class, idx_to_label,
+            )
 
         epoch_num = epoch + 1
 
@@ -572,8 +784,13 @@ def train(
         history["val_loss"].append(val_loss)
         history["train_acc"].append(train_acc)
         history["val_acc"].append(acc)
+        for label in label_to_idx:
+            history["train_loss_per_label"][label].append(train_loss_per_label[label])
+            history["val_loss_per_label"][label].append(val_loss_per_label[label])
+            history["train_acc_per_label"][label].append(train_acc_per_label[label])
+            history["val_acc_per_label"][label].append(val_acc_per_label[label])
 
-        if acc >= best_acc:
+        if acc > best_acc:
             best_acc = acc
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             best_metrics = {
@@ -583,7 +800,6 @@ def train(
                 "val_loss": val_loss,
                 "val_acc": acc,
             }
-            epochs_without_improve = 0
             write_checkpoint(
                 run_dir / "best.pt",
                 kind="best",
@@ -594,8 +810,19 @@ def train(
                 val_acc=acc,
                 state_dict=best_state,
             )
-        else:
-            epochs_without_improve += 1
+
+        smoothed_stop = smoothed_tail(history[stop_metric_key], early_stopping_smooth_window)
+        if smoothed_stop is not None:
+            if early_stopping_metric == "loss":
+                stop_improved = smoothed_stop < best_smoothed_stop
+            else:
+                stop_improved = smoothed_stop > best_smoothed_stop
+            if stop_improved:
+                best_smoothed_stop = smoothed_stop
+                best_smoothed_stop_epoch = epoch_num
+                epochs_without_improve = 0
+            else:
+                epochs_without_improve += 1
 
         if save_interval > 0 and epoch_num % save_interval == 0:
             write_checkpoint(
@@ -619,13 +846,22 @@ def train(
         }
         if early_stopping_patience > 0:
             postfix["no_improve"] = epochs_without_improve
+            if smoothed_stop is not None:
+                postfix["stop_smooth"] = f"{smoothed_stop:.4f}"
         epoch_bar.set_postfix(**postfix)
 
-        if early_stopping_patience > 0 and epochs_without_improve >= early_stopping_patience:
+        if (
+            early_stopping_patience > 0
+            and smoothed_stop is not None
+            and epochs_without_improve >= early_stopping_patience
+        ):
+            metric_label = "val loss" if early_stopping_metric == "loss" else "val acc"
             print(
                 f"\nearly stopping at epoch {epoch_num}: "
-                f"no val acc improvement for {early_stopping_patience} epochs "
-                f"(best={best_acc:.4f} @ epoch {best_metrics['epoch']})"
+                f"no smoothed {metric_label} improvement for {early_stopping_patience} epochs "
+                f"(window={early_stopping_smooth_window}, "
+                f"best_smooth={best_smoothed_stop:.4f} @ epoch {best_smoothed_stop_epoch}; "
+                f"best_acc={best_acc:.4f} @ epoch {best_metrics['epoch']})"
             )
             break
 
@@ -653,7 +889,12 @@ def train(
         )
         model.load_state_dict(best_state)
 
-    plot_training_history(history, run_dir / "training_history.png")
+    plot_training_history(
+        history,
+        run_dir / "training_history.png",
+        idx_to_label=idx_to_label,
+        best_epoch=best_metrics["epoch"] if best_state is not None else None,
+    )
 
     return model, history, run_dir
 
@@ -661,20 +902,52 @@ def train(
 # --- main
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train the fusion EEGNet model.")
+    parser.add_argument(
+        "--continue",
+        action="store_true",
+        dest="continue_training",
+        help="Load the latest checkpoint and train in a new -continued run folder",
+    )
+    args = parser.parse_args()
+
     SPLITS_DIR = Path(__file__).resolve().parent / "splits"
     seed_everything(SEED, TORCH_DETERMINISTIC)
     splits = load_dataset_splits(SPLITS_DIR)
-    # print(splits)
 
-    run_dir = create_run_dir()
-    untrained_model, label_to_idx, model_config = construct_model(splits)
+    continued_from: dict | None = None
+    if args.continue_training:
+        source_run = latest_run_dir()
+        if source_run is None:
+            raise SystemExit("No checkpoint runs found under model/checkpoints; train from scratch first.")
+        ckpt_path = latest_checkpoint_in_run(source_run)
+        model, label_to_idx, model_config, continued_from = load_training_checkpoint(ckpt_path)
+        run_dir = create_run_dir(continued=True)
+        print(f"continuing from {ckpt_path}")
+        print(
+            f"  source run: {continued_from['source_run_dir']} "
+            f"(epoch {continued_from['source_epoch']}, "
+            f"val_acc={continued_from['source_val_acc']:.4f}, "
+            f"kind={continued_from['source_kind']})"
+        )
+    else:
+        run_dir = create_run_dir()
+        model, label_to_idx, model_config = construct_model(splits)
+
     print(f"window T={model_config['T']} samples, classes={model_config['n_classes']}")
 
     print("\n\n")
     print(f"starting training on device {device} at {run_dir}")
     print("\n")
 
-    model, history, run_dir = train(untrained_model, splits, label_to_idx, model_config, run_dir=run_dir)
+    model, history, run_dir = train(
+        model,
+        splits,
+        label_to_idx,
+        model_config,
+        run_dir=run_dir,
+        continued_from=continued_from,
+    )
 
     print("\n")
-    print(f"'artifacts saved under {run_dir}")
+    print(f"artifacts saved under {run_dir}")
