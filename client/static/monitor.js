@@ -19,6 +19,8 @@ const state = {
   modelTestResultFetchKey: null,
   visibleEegBands: new Set(),
   visibleEmgBands: new Set(),
+  lastCollect: null,
+  recordingEnabled: false,
 };
 
 const els = {
@@ -37,6 +39,7 @@ const els = {
   collectHint: document.getElementById("collect-hint"),
   wordButtons: document.getElementById("word-buttons"),
   wordWeightSliders: document.getElementById("word-weight-sliders"),
+  wordWeightWarning: document.getElementById("word-weight-warning"),
   negativeLabelMixSliders: document.getElementById("negative-label-mix-sliders"),
   collectPrompt: document.getElementById("collect-prompt"),
   collectPromptWord: document.getElementById("collect-prompt-word"),
@@ -44,6 +47,7 @@ const els = {
   collectPromptSub: document.getElementById("collect-prompt-sub"),
   scrambleFastBtn: document.getElementById("btn-scramble-fast"),
   scrambleBreaksBtn: document.getElementById("btn-scramble-breaks"),
+  scrambleStopBtn: document.getElementById("btn-scramble-stop"),
   singleRep: document.getElementById("single-rep"),
   singleRepVal: document.getElementById("single-rep-val"),
   scrambleSet: document.getElementById("scramble-set"),
@@ -630,6 +634,82 @@ function formatDistributionWeight(value) {
   return Number(value).toFixed(2);
 }
 
+function readWordWeightSliderValues() {
+  if (!els.wordWeightSliders) return null;
+  const weights = {};
+  els.wordWeightSliders.querySelectorAll("input[type='range']").forEach((input) => {
+    const word = input.dataset.word;
+    if (word) weights[word] = Number(input.value);
+  });
+  return Object.keys(weights).length ? weights : null;
+}
+
+function wordWeightSlidersTouched() {
+  if (!els.wordWeightSliders) return false;
+  return [...els.wordWeightSliders.querySelectorAll("input[type='range']")].some(
+    (input) => input.dataset.touched === "1",
+  );
+}
+
+function syncWordWeightSlidersFromCollect(collect = {}) {
+  if (!els.wordWeightSliders) return;
+  els.wordWeightSliders.querySelectorAll("input[type='range']").forEach((input) => {
+    delete input.dataset.touched;
+  });
+  syncDistributionSliderValues(
+    els.wordWeightSliders,
+    collect,
+    "word_weights",
+    "default_word_weights",
+    "word",
+  );
+}
+
+function countActiveWordWeights(collect = {}) {
+  const weights =
+    readWordWeightSliderValues() || collect.word_weights || collect.default_word_weights || {};
+  return Object.values(weights).filter((value) => Number(value) > 0).length;
+}
+
+function updateWordWeightWarning(collect = {}) {
+  if (!els.wordWeightWarning) return true;
+  const minActive = collect.word_weight_min_active ?? 2;
+  const activeCount = countActiveWordWeights(collect);
+  const localValid = activeCount >= minActive;
+  const serverValid = collect.word_weights_valid !== false;
+  const unsaved = wordWeightSlidersTouched();
+  const canScramble = localValid && serverValid && !unsaved;
+
+  let message;
+  let tone = "ok";
+  if (!localValid) {
+    message = `Warning: at least ${minActive} words must be above 0 (${activeCount} active now) — scrambles are disabled`;
+    tone = "warn";
+  } else if (unsaved) {
+    message = "Saving word distribution…";
+    tone = "pending";
+  } else if (!serverValid) {
+    message = `Warning: at least ${minActive} words must be above 0 — scrambles are disabled`;
+    tone = "warn";
+  } else {
+    message = `Distribution OK — at least ${minActive} words active`;
+    tone = "ok";
+  }
+
+  els.wordWeightWarning.textContent = message;
+  els.wordWeightWarning.classList.remove("ok", "pending", "warn");
+  els.wordWeightWarning.classList.add(tone);
+  return canScramble;
+}
+
+function syncWordWeightControls(collect = {}) {
+  const canScramble = updateWordWeightWarning(collect);
+  const picking = state.recordingEnabled && collect.phase === "pick_word";
+  if (els.scrambleFastBtn) els.scrambleFastBtn.disabled = !picking || !canScramble;
+  if (els.scrambleBreaksBtn) els.scrambleBreaksBtn.disabled = !picking || !canScramble;
+  return canScramble;
+}
+
 function normalizedMixSummary(weights, labels) {
   const entries = Object.entries(weights || {}).filter(([, value]) => Number(value) > 0);
   const total = entries.reduce((sum, [, value]) => sum + Number(value), 0);
@@ -643,20 +723,35 @@ function normalizedMixSummary(weights, labels) {
     .join(", ");
 }
 
-async function postWordWeight(word, weight) {
+async function postAllWordWeights() {
+  const weights = readWordWeightSliderValues();
+  if (!weights) return;
   try {
-    await post("/collect/word-weights", { weights: { [word]: Number(weight) } });
+    const collect = await post("/collect/word-weights", { weights });
+    syncWordWeightSlidersFromCollect(collect);
+    syncWordWeightControls(collect);
   } catch (err) {
     showToast(err.message, true);
+    if (els.wordWeightSliders) {
+      els.wordWeightSliders.querySelectorAll("input[type='range']").forEach((input) => {
+        delete input.dataset.touched;
+      });
+    }
+    try {
+      await refreshStatus();
+    } catch (_) {
+      /* keep existing UI */
+    }
   }
 }
 
-function queueWordWeightPost(word, weight) {
+function queueWordWeightPost() {
+  syncWordWeightControls(state.lastCollect || {});
   if (wordWeightPostTimer) window.clearTimeout(wordWeightPostTimer);
   wordWeightPostTimer = window.setTimeout(() => {
     wordWeightPostTimer = null;
-    postWordWeight(word, weight);
-  }, 120);
+    postAllWordWeights();
+  }, 200);
 }
 
 async function postNegMixWeight(key, weight) {
@@ -704,6 +799,9 @@ function buildDistributionSliders({
     const name = document.createElement("span");
     name.textContent = item.label;
 
+    const controls = document.createElement("div");
+    controls.className = "slider-controls";
+
     const input = document.createElement("input");
     input.type = "range";
     input.min = String(min);
@@ -723,7 +821,8 @@ function buildDistributionSliders({
       onInput(item.key, input.value);
     });
 
-    label.append(name, input, output);
+    label.append(name, controls);
+    controls.append(input, output);
     container.appendChild(label);
   }
   container.dataset.built = builtKey;
@@ -763,7 +862,7 @@ function ensureWordWeightSliders(collect = {}) {
     weightsKey: "word_weights",
     defaultsKey: "default_word_weights",
     inputDatasetKey: "word",
-    onInput: queueWordWeightPost,
+    onInput: () => queueWordWeightPost(),
   });
 }
 
@@ -835,6 +934,8 @@ function maybeFlashWordSwitch(collect) {
 
 function updateCollectUi(status) {
   const collect = status.collect || { phase: "disabled", words: [] };
+  state.lastCollect = collect;
+  state.recordingEnabled = !!status.recording_enabled;
   const recording = status.recording_enabled;
   const phase = collect.phase;
   const mode = collect.mode || "single";
@@ -850,10 +951,13 @@ function updateCollectUi(status) {
   ensureWordButtons(collect.words || []);
   ensureWordWeightSliders(collect);
   ensureNegativeLabelMixSliders(collect);
+  syncWordWeightControls(collect);
 
   const picking = recording && phase === "pick_word";
   const busy = phase === "countdown" || phase === "say" || phase === "still";
   const negativeLabels = mode === "negative_labels";
+  const scrambleActive = busy && (mode === "scramble" || mode === "scramble-breaks");
+  const scrambleStopPending = !!collect.scramble_stop_pending;
   const mixSummary = normalizedMixSummary(
     collect.neg_mix_weights || collect.default_neg_mix_weights,
     collect.neg_mix_labels,
@@ -866,15 +970,23 @@ function updateCollectUi(status) {
   const sayS = collect.say_s ?? 1.6;
   els.collectHint.textContent = negativeLabels && busy
     ? `Negative labels running — target mix: ${mixSummary} — click Stop Negative Labels when finished`
-    : picking
+    : scrambleActive && scrambleStopPending
+      ? `Scramble stopping after the current rep finishes — ${mode === "scramble-breaks" ? "Breaks" : "Fast"}`
+      : scrambleActive
+        ? `Scramble running — click Stop Next Chance to finish the current rep and stop`
+        : picking
       ? `Choose a word, tune distributions below, then Scramble or Negative Labels — Fast: ${beforeS}s / ${betweenS}s / ${wordSwitchS}s gaps; Breaks: ${sayS}s between reps`
       : "Recording active — finish current collection to pick another";
 
   els.wordButtons.querySelectorAll(".word-btn").forEach((btn) => {
     btn.disabled = !picking;
   });
-  if (els.scrambleFastBtn) els.scrambleFastBtn.disabled = !picking;
-  if (els.scrambleBreaksBtn) els.scrambleBreaksBtn.disabled = !picking;
+  if (els.scrambleStopBtn) {
+    els.scrambleStopBtn.classList.toggle("hidden", !scrambleActive);
+    els.scrambleStopBtn.disabled = !scrambleActive || scrambleStopPending;
+    els.scrambleStopBtn.textContent = scrambleStopPending ? "Stopping after rep…" : "Stop Next Chance";
+    els.scrambleStopBtn.classList.toggle("active", scrambleActive);
+  }
   if (els.singleRep) els.singleRep.disabled = !picking;
   if (els.scrambleSet) els.scrambleSet.disabled = !picking;
   if (els.scrambleRep) els.scrambleRep.disabled = !picking;
@@ -1535,6 +1647,16 @@ if (els.scrambleFastBtn) {
 
 if (els.scrambleBreaksBtn) {
   els.scrambleBreaksBtn.addEventListener("click", () => startScramble("/collect/scramble-breaks"));
+}
+
+if (els.scrambleStopBtn) {
+  els.scrambleStopBtn.addEventListener("click", async () => {
+    try {
+      await post("/collect/scramble/stop-next-chance");
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
 }
 
 if (els.negativeLabelsBtn) {

@@ -81,6 +81,7 @@ COLLECTION_REPETITIONS = 7
 WORD_WEIGHT_MIN = 0.0
 WORD_WEIGHT_MAX = 1.0
 WORD_WEIGHT_STEP = 0.05
+WORD_WEIGHT_MIN_ACTIVE = 2
 NEGATIVE_LABEL_MIX_DEFAULT_WEIGHTS: dict[str, float] = {
     "still": 0.35,
     "negative_word": 0.35,
@@ -113,6 +114,14 @@ def clamp_unit_weight(value: float) -> float:
 
 def clamp_collection_word_weight(value: float) -> float:
     return clamp_unit_weight(value)
+
+
+def active_word_weight_count(weights: dict[str, Any]) -> int:
+    return sum(
+        1
+        for word in COLLECTION_WORDS
+        if clamp_collection_word_weight(weights.get(word, 0.0)) > 0.0
+    )
 # Collection timing hyperparameters (seconds) — edit these to tune the protocol
 COLLECTION_BEFORE_S = 1.0
 COLLECTION_BETWEEN_S = 0.4
@@ -719,6 +728,7 @@ class AcquisitionService:
         self._collect_deadline_ns: Optional[int] = None
         self._collect_countdown_word_switch = False
         self._collect_trailing_break = False
+        self._collect_scramble_stop_after_rep = False
         self._collect_neg_words: list[str] = []
         self._collect_neg_segment_kind = ""
         self._collect_neg_still_time_s = 0.0
@@ -967,10 +977,18 @@ class AcquisitionService:
     def set_collect_word_weights(self, weights: dict[str, Any]) -> None:
         if self._collect_phase not in ("disabled", "pick_word"):
             raise RuntimeError("Finish the current collection before changing word weights")
+        merged = dict(self._collect_word_weights)
         for word in COLLECTION_WORDS:
             if word not in weights:
                 continue
-            self._collect_word_weights[word] = clamp_collection_word_weight(weights[word])
+            merged[word] = clamp_collection_word_weight(weights[word])
+        if active_word_weight_count(merged) < WORD_WEIGHT_MIN_ACTIVE:
+            raise RuntimeError(
+                f"At least {WORD_WEIGHT_MIN_ACTIVE} words must have weight above 0"
+            )
+        for word in COLLECTION_WORDS:
+            if word in weights:
+                self._collect_word_weights[word] = merged[word]
 
     def set_collect_negative_label_mix(self, weights: dict[str, Any]) -> None:
         if self._collect_phase not in ("disabled", "pick_word"):
@@ -1083,6 +1101,9 @@ class AcquisitionService:
             "say_s": COLLECTION_SAY_S,
             "word_switch": self._collect_countdown_word_switch if self._collect_phase == "countdown" else False,
             "trailing_break": self._collect_trailing_break if self._collect_phase == "countdown" else False,
+            "scramble_stop_pending": self._collect_scramble_stop_after_rep
+            if busy and self._is_scramble_mode(self._collect_mode)
+            else False,
             "default_scramble_set": DEFAULT_SCRAMBLE_SET,
             "default_scramble_rep": DEFAULT_SCRAMBLE_REP,
             "default_single_repetitions": COLLECTION_REPETITIONS,
@@ -1097,6 +1118,9 @@ class AcquisitionService:
             "word_weight_min": WORD_WEIGHT_MIN,
             "word_weight_max": WORD_WEIGHT_MAX,
             "word_weight_step": WORD_WEIGHT_STEP,
+            "word_weight_min_active": WORD_WEIGHT_MIN_ACTIVE,
+            "word_weights_valid": active_word_weight_count(self._collect_word_weights)
+            >= WORD_WEIGHT_MIN_ACTIVE,
             "neg_mix_weights": dict(self._collect_neg_mix_weights),
             "default_neg_mix_weights": default_negative_label_mix_weights(),
             "neg_mix_labels": dict(NEGATIVE_LABEL_MIX_LABELS),
@@ -1116,6 +1140,7 @@ class AcquisitionService:
         self._collect_deadline_ns = None
         self._collect_countdown_word_switch = False
         self._collect_trailing_break = False
+        self._collect_scramble_stop_after_rep = False
         self._collect_neg_words = []
         self._collect_neg_segment_kind = ""
         self._collect_neg_still_time_s = 0.0
@@ -1138,6 +1163,7 @@ class AcquisitionService:
         self._collect_deadline_ns = None
         self._collect_countdown_word_switch = False
         self._collect_trailing_break = False
+        self._collect_scramble_stop_after_rep = False
         self._collect_mode = "single"
         if finished_block and self._recorder.enabled:
             _event_host_ns, aligned_float, aligned_idx, method = self._aligned_sample_now()
@@ -1182,6 +1208,10 @@ class AcquisitionService:
         if self._collect_mode == "negative_labels":
             self._record_negative_labels_segment_elapsed(self._collect_neg_segment_kind)
             self._begin_negative_labels_segment()
+            return
+
+        if self._is_scramble_mode(self._collect_mode) and self._collect_scramble_stop_after_rep:
+            self._finish_collect_block()
             return
 
         if self._collect_rep < self._collect_reps_total:
@@ -1302,6 +1332,10 @@ class AcquisitionService:
             raise RuntimeError(f"set must be between {SCRAMBLE_SET_MIN} and {SCRAMBLE_SET_MAX}")
         if not SCRAMBLE_REP_MIN <= rep_count <= SCRAMBLE_REP_MAX:
             raise RuntimeError(f"rep must be between {SCRAMBLE_REP_MIN} and {SCRAMBLE_REP_MAX}")
+        if active_word_weight_count(self._collect_word_weights) < WORD_WEIGHT_MIN_ACTIVE:
+            raise RuntimeError(
+                f"At least {WORD_WEIGHT_MIN_ACTIVE} words must have weight above 0 before scrambling"
+            )
         _event_host_ns, aligned_float, aligned_idx, method = self._aligned_sample_now()
         if aligned_idx is None:
             raise RuntimeError("No samples yet; cannot start collection")
@@ -1316,6 +1350,7 @@ class AcquisitionService:
         self._collect_set_idx = 1
         self._collect_word = word
         self._collect_rep = 1
+        self._collect_scramble_stop_after_rep = False
         self._begin_collect_countdown(new_label=True)
         self._recorder.log_event(
             event_type="silent_speech_scramble_start",
@@ -1339,6 +1374,13 @@ class AcquisitionService:
 
     def start_collect_scramble_breaks(self, set_count: int, rep_count: int) -> None:
         self._start_collect_scramble(set_count, rep_count, mode="scramble-breaks")
+
+    def stop_collect_scramble_next_chance(self) -> None:
+        if not self._is_scramble_mode(self._collect_mode):
+            raise RuntimeError("Scramble mode is not active")
+        if self._collect_phase not in ("countdown", "say", "still"):
+            raise RuntimeError("Scramble mode is not active")
+        self._collect_scramble_stop_after_rep = True
 
     def start_collect_negative_labels(self) -> None:
         if not self._recorder.enabled:
@@ -2398,6 +2440,11 @@ def create_app(service: AcquisitionService) -> Flask:
         set_count = int(payload.get("set", DEFAULT_SCRAMBLE_SET))
         rep_count = int(payload.get("rep", DEFAULT_SCRAMBLE_REP))
         service.start_collect_scramble_breaks(set_count=set_count, rep_count=rep_count)
+        return jsonify(service.status()["collect"])
+
+    @app.post("/collect/scramble/stop-next-chance")
+    def collect_scramble_stop_next_chance() -> Any:
+        service.stop_collect_scramble_next_chance()
         return jsonify(service.status()["collect"])
 
     @app.post("/collect/negative-labels/toggle")

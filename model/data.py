@@ -385,6 +385,44 @@ def _negative_labels_word_spans(
     return spans
 
 
+def _negative_labels_word_spans_labeled(
+    events: Sequence[dict[str, str]],
+    block_id: str,
+    *,
+    fs: float,
+    index_to_row: dict[int, int],
+) -> list[tuple[int, int, str]]:
+    spans: list[tuple[int, int, str]] = []
+    for event in events:
+        if event.get("event_type", "") != SILENT_SPEECH_WORD_EVENT:
+            continue
+        payload = parse_event_payload(event)
+        if str(payload.get("collection_block_id", "")).strip() != block_id:
+            continue
+        word = normalize_word_label(event.get("label_text", ""))
+        if word is None:
+            continue
+        start_text = event.get("sample_index_start", "")
+        if not start_text:
+            continue
+        start_idx = int(start_text)
+        start_row = index_to_row.get(start_idx)
+        if start_row is None:
+            continue
+        end_idx, _end_row = _event_sample_end(
+            event,
+            start_idx,
+            start_row,
+            fs=fs,
+            index_to_row=index_to_row,
+        )
+        if end_idx <= start_idx:
+            continue
+        spans.append((start_idx, end_idx, word))
+    spans.sort(key=lambda span: span[0])
+    return spans
+
+
 def _negative_labels_silence_spans(
     block_start_idx: int,
     block_end_idx: int,
@@ -420,16 +458,17 @@ def _append_silence_windows(
 ) -> int:
     for block in _negative_labels_blocks(events):
         block_id = str(block["block_id"])
-        word_spans = _negative_labels_word_spans(
+        word_spans_labeled = _negative_labels_word_spans_labeled(
             events,
             block_id,
             fs=fs,
             index_to_row=index_to_row,
         )
+        span_pairs = [(start_idx, end_idx) for start_idx, end_idx, _word in word_spans_labeled]
         for gap_start, gap_end in _negative_labels_silence_spans(
             int(block["start_idx"]),
             int(block["end_idx"]),
-            word_spans,
+            span_pairs,
         ):
             start_row = index_to_row.get(gap_start)
             if start_row is None:
@@ -449,11 +488,18 @@ def _append_silence_windows(
                 skipped += 1
                 continue
             center = gap_start + (gap_end - gap_start) // 2
+            before_word, after_word = _bordering_words_for_gap(
+                gap_start,
+                gap_end,
+                word_spans_labeled,
+            )
             raw_windows.append(window)
             labels.append(SILENCE_LABEL)
             label_probs.append(None)
             event_type_list.append("negative_labels_silence")
-            event_ids.append(f"silence:{block_id}:{gap_start}-{gap_end}")
+            event_ids.append(
+                f"silence:{block_id}:{gap_start}-{gap_end}:words={before_word}|{after_word}"
+            )
             collection_block_ids.append(block_id)
             center_samples.append(center)
     return skipped
@@ -545,6 +591,111 @@ def _parse_scramble_breaks_transition_event_id(event_id: str) -> Optional[tuple[
         return None
     word = parts[3]
     return kind, word, float(shift_text)
+
+
+def _parse_silence_gap_words(event_id: str) -> tuple[str, ...]:
+    if ":words=" not in event_id:
+        return ()
+    words_part = event_id.rsplit(":words=", 1)[1]
+    return tuple(word for word in words_part.split("|") if word)
+
+
+def _bordering_words_for_gap(
+    gap_start: int,
+    gap_end: int,
+    word_spans: Sequence[tuple[int, int, str]],
+) -> tuple[str, str]:
+    before_word = ""
+    after_word = ""
+    for start_idx, end_idx, word in word_spans:
+        if end_idx <= gap_start:
+            before_word = word
+        if start_idx >= gap_end and not after_word:
+            after_word = word
+    return before_word, after_word
+
+
+def _sample_word_fraction(event_type: str, event_id: str) -> float:
+    if event_type == SILENT_SPEECH_WORD_EVENT:
+        return 1.0
+    if event_type == "scramble_breaks_transition":
+        parsed = _parse_scramble_breaks_transition_event_id(event_id)
+        if parsed is None:
+            return 0.0
+        _kind, _word, shift_s = parsed
+        _silence_frac, word_frac = _transition_phase_fractions(
+            shift_s=shift_s,
+            window_s=COLLECTION_SAY_S,
+            kind=_kind,
+        )
+        return word_frac
+    return 0.0
+
+
+def _sample_silence_fraction(event_type: str, event_id: str) -> float:
+    if event_type in {"scramble_breaks_silence", "negative_labels_silence"}:
+        return 1.0
+    if event_type == SILENT_SPEECH_WORD_EVENT:
+        return 0.0
+    if event_type == "scramble_breaks_transition":
+        parsed = _parse_scramble_breaks_transition_event_id(event_id)
+        if parsed is None:
+            return 0.0
+        kind, _word, shift_s = parsed
+        silence_frac, _word_frac = _transition_phase_fractions(
+            shift_s=shift_s,
+            window_s=COLLECTION_SAY_S,
+            kind=kind,
+        )
+        return silence_frac
+    return 0.0
+
+
+def _is_full_word_label_sample(
+    event_type: str,
+    event_id: str,
+    hard_label: str,
+    word: str,
+) -> bool:
+    if hard_label != word:
+        return False
+    if event_type == SILENT_SPEECH_WORD_EVENT:
+        return True
+    if event_type == "scramble_breaks_transition":
+        return _sample_word_fraction(event_type, event_id) >= 1.0 - 1e-9
+    return False
+
+
+def _associated_words(event_type: str, event_id: str) -> tuple[str, ...]:
+    if event_type == "scramble_breaks_transition":
+        parsed = _parse_scramble_breaks_transition_event_id(event_id)
+        if parsed is not None:
+            return (parsed[1],)
+    gap_words = _parse_silence_gap_words(event_id)
+    if gap_words:
+        return gap_words
+    return ()
+
+
+def _label_prob_mass(
+    label_probs: Optional[dict[str, float]],
+    label: str,
+    hard_label: str,
+) -> float:
+    if label_probs is None:
+        return 1.0 if hard_label == label else 0.0
+    return label_probs.get(label, 0.0)
+
+
+def _label_max_prob(
+    label_probs: Optional[dict[str, float]],
+    hard_label: str,
+) -> float:
+    if label_probs is None:
+        return 1.0
+    if not label_probs:
+        return 1.0
+    return max(label_probs.values())
 
 
 def transition_label_probs_from_event_id(
@@ -840,11 +991,18 @@ def _append_scramble_breaks_silence_windows(
                 skipped += 1
                 continue
             center = gap_start + (gap_end - gap_start) // 2
+            before_word, after_word = _bordering_words_for_gap(
+                gap_start,
+                gap_end,
+                word_spans,
+            )
             raw_windows.append(window)
             labels.append(SILENCE_LABEL)
             label_probs.append(None)
             event_type_list.append("scramble_breaks_silence")
-            event_ids.append(f"silence:{block_id}:{gap_start}-{gap_end}")
+            event_ids.append(
+                f"silence:{block_id}:{gap_start}-{gap_end}:words={before_word}|{after_word}"
+            )
             collection_block_ids.append(block_id)
             center_samples.append(center)
     return skipped
@@ -1888,6 +2046,129 @@ def load_dataset_splits(splits_dir: Path) -> DatasetSplits:
     )
 
 
+def _label_probs_for_sample(
+    batch: EventWindowBatch,
+    index: int,
+) -> Optional[dict[str, float]]:
+    if batch.label_probs:
+        probs = batch.label_probs[index]
+        if probs is not None:
+            return probs
+    if batch.event_types[index] == "scramble_breaks_transition":
+        return transition_label_probs_from_event_id(batch.event_ids[index])
+    return None
+
+
+def _format_word_context(words: tuple[str, ...]) -> str:
+    if not words:
+        return "(none)"
+    if len(words) == 1:
+        return words[0]
+    return " | ".join(words)
+
+
+def print_label_coverage_summary(
+    dataset: SessionEventDataset,
+    indices: Optional[Sequence[int]] = None,
+    *,
+    name: str = "all",
+) -> None:
+    batch = dataset.batch
+    if indices is None:
+        indices = range(len(dataset))
+
+    word_stats: dict[str, dict[str, list[float] | int]] = {
+        word: {
+            "total": 0,
+            "full": 0,
+            "partial_word_fracs": [],
+            "word_probs": [],
+            "max_probs": [],
+        }
+        for word in TARGET_WORDS
+    }
+    transition_stats: dict[str, dict[str, dict[str, list[float] | int]]] = {
+        WORD_STARTING_LABEL: defaultdict(lambda: {"count": 0, "word_fracs": [], "label_probs": [], "max_probs": []}),
+        WORD_ENDING_LABEL: defaultdict(lambda: {"count": 0, "word_fracs": [], "label_probs": [], "max_probs": []}),
+        SILENCE_LABEL: defaultdict(lambda: {"count": 0, "word_fracs": [], "label_probs": [], "max_probs": []}),
+    }
+
+    for index in indices:
+        hard_label = batch.labels[index]
+        event_type = batch.event_types[index]
+        event_id = batch.event_ids[index]
+        label_probs = _label_probs_for_sample(batch, index)
+        word_frac = _sample_word_fraction(event_type, event_id)
+        max_prob = _label_max_prob(label_probs, hard_label)
+
+        if hard_label in TARGET_WORDS:
+            stats = word_stats[hard_label]
+            stats["total"] = int(stats["total"]) + 1
+            stats["word_probs"].append(_label_prob_mass(label_probs, hard_label, hard_label))
+            stats["max_probs"].append(max_prob)
+            if _is_full_word_label_sample(event_type, event_id, hard_label, hard_label):
+                stats["full"] = int(stats["full"]) + 1
+            else:
+                stats["partial_word_fracs"].append(word_frac)
+
+        if hard_label in transition_stats:
+            context = _format_word_context(_associated_words(event_type, event_id))
+            group = transition_stats[hard_label][context]
+            group["count"] = int(group["count"]) + 1
+            group["word_fracs"].append(word_frac)
+            group["label_probs"].append(_label_prob_mass(label_probs, hard_label, hard_label))
+            group["max_probs"].append(max_prob)
+
+    print(f"{name} word label coverage (hard label = target word):")
+    for word in TARGET_WORDS:
+        stats = word_stats[word]
+        total = int(stats["total"])
+        if total == 0:
+            print(f"  {word:12s}  no samples")
+            continue
+        full = int(stats["full"])
+        partial = total - full
+        partial_fracs = stats["partial_word_fracs"]
+        avg_partial = (
+            100.0 * sum(partial_fracs) / len(partial_fracs)
+            if partial_fracs
+            else 0.0
+        )
+        avg_word_prob = 100.0 * sum(stats["word_probs"]) / total
+        avg_max_prob = 100.0 * sum(stats["max_probs"]) / total
+        print(
+            f"  {word:12s}  n={total:4d}  "
+            f"full={full:4d} ({100.0 * full / total:5.1f}%)  "
+            f"partial={partial:4d} ({100.0 * partial / total:5.1f}%)  "
+            f"partial_avg_word={avg_partial:5.1f}%  "
+            f"avg_P({word})={avg_word_prob:5.1f}%  "
+            f"avg_max_prob={avg_max_prob:5.1f}%"
+        )
+
+    print()
+    print(f"{name} transition / silence labels — word content in window:")
+    for label in (WORD_STARTING_LABEL, WORD_ENDING_LABEL, SILENCE_LABEL):
+        groups = transition_stats[label]
+        total = sum(int(group["count"]) for group in groups.values())
+        print(f"  {label} ({total} samples):")
+        if total == 0:
+            print("    (none)")
+            continue
+        for context in sorted(groups, key=lambda key: (-int(groups[key]["count"]), key)):
+            group = groups[context]
+            count = int(group["count"])
+            avg_word = 100.0 * sum(group["word_fracs"]) / count
+            avg_label = 100.0 * sum(group["label_probs"]) / count
+            avg_max = 100.0 * sum(group["max_probs"]) / count
+            print(
+                f"    {context:24s}  n={count:4d} ({100.0 * count / total:5.1f}%)  "
+                f"avg_word_in_window={avg_word:5.1f}%  "
+                f"avg_P({label})={avg_label:5.1f}%  "
+                f"avg_max_prob={avg_max:5.1f}%"
+            )
+    print()
+
+
 def label_distribution(
     dataset: SessionEventDataset,
     indices: Sequence[int],
@@ -1937,6 +2218,7 @@ def print_split_summary(splits: DatasetSplits) -> None:
             f"dropped by caps: train={dropped[0]}, val={dropped[1]}, test={dropped[2]}"
         )
     print()
+    print_label_coverage_summary(splits.dataset, name="all")
     for name, subset in (
         ("train", splits.train),
         ("val", splits.val),
