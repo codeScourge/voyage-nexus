@@ -17,11 +17,12 @@ from collections import defaultdict
 
 from data import load_dataset_splits
 from train import (
+    CHECKPOINT_DIR,
     FusionDataset,
     IntermediateFusionEEGNet,
     _per_label_colors,
-    default_checkpoint_path,
     get_device,
+    latest_run_dir,
     seed_everything,
     soft_cross_entropy,
 )
@@ -102,6 +103,21 @@ def _format_colored_value(
 
 def session_name(session_dir: str | Path) -> str:
     return Path(session_dir).name
+
+
+_SESSION_UID_MARKER = "_session_"
+
+
+def format_session_display(name: str, *, width: int = 14) -> str:
+    """Compact session label: ...{uid} for standard session folder names."""
+    if _SESSION_UID_MARKER in name:
+        uid = name.rsplit(_SESSION_UID_MARKER, 1)[-1]
+        short = f"...{uid}"
+    elif len(name) <= width:
+        return name
+    else:
+        short = f"...{name[-(width - 3) :]}"
+    return short if len(short) <= width else short[:width]
 
 
 def compute_session_metrics(
@@ -486,7 +502,7 @@ def print_session_rankings(
     def print_rows(title: str, rows: list[dict]) -> None:
         print(f"\n{title}:")
         print(
-            f"{'session':<32} {'accuracy':>10} {'delta':>10} {'correct':>10} "
+            f"{'session':<14} {'accuracy':>10} {'delta':>10} {'correct':>10} "
             f"{'samples':>10}  {'worst recall':<24} {'worst precision':<24}"
         )
         for row in rows:
@@ -501,8 +517,9 @@ def print_session_rankings(
                 metric="precision",
                 idx_to_label=idx_to_label,
             )
+            session = format_session_display(row["session"])
             print(
-                f"{row['session']:<32} "
+                f"{session:<14} "
                 f"{row['accuracy']:>10.4f} "
                 f"{delta:>+10.4f} "
                 f"{row['n_correct']:>10d} "
@@ -573,7 +590,7 @@ def _print_cross_split_session_rankings(
     def print_rows(title: str, rows: list[dict]) -> None:
         print(f"\n{title}:")
         print(
-            f"{'split':<8} {'session':<24} {'accuracy':>10} "
+            f"{'split':<8} {'session':<14} {'accuracy':>10} "
             f"{'delta':>10} {'correct':>10} {'samples':>10}  "
             f"{'worst recall':<24} {'worst precision':<24}"
         )
@@ -588,9 +605,10 @@ def _print_cross_split_session_rankings(
                 metric="precision",
                 idx_to_label=idx_to_label,
             )
+            session = format_session_display(row["session"])
             print(
                 f"{row['split']:<8} "
-                f"{row['session']:<24} "
+                f"{session:<14} "
                 f"{row['accuracy']:>10.4f} "
                 f"{row['delta']:>+10.4f} "
                 f"{row['n_correct']:>10d} "
@@ -606,6 +624,192 @@ def _print_cross_split_session_rankings(
     worst = list(reversed(combined[-top_k:]))
     print_rows(f"best {len(best)} sessions", best)
     print_rows(f"worst {len(worst)} sessions", worst)
+
+
+def resolve_run_dir(checkpoint: Path | None, *, root: Path = CHECKPOINT_DIR) -> Path:
+    if checkpoint is not None:
+        return checkpoint.resolve().parent
+    run_dir = latest_run_dir(root)
+    if run_dir is None:
+        raise FileNotFoundError(f"No run directories found under {root}")
+    return run_dir
+
+
+def checkpoint_paths_for_run(run_dir: Path) -> dict[str, Path]:
+    paths: dict[str, Path] = {}
+    for kind in ("best", "last"):
+        path = run_dir / f"{kind}.pt"
+        if path.exists():
+            paths[kind] = path
+    if not paths:
+        raise FileNotFoundError(f"No best.pt or last.pt found in {run_dir}")
+    return paths
+
+
+def print_checkpoint_banner(
+    kind: str,
+    checkpoint_path: Path,
+    ckpt_meta: dict,
+) -> None:
+    bar = "#" * 72
+    print(f"\n{bar}")
+    print(f"# {kind.upper()} CHECKPOINT")
+    print(f"{bar}")
+    print(f"checkpoint: {checkpoint_path.resolve()}")
+    print(
+        f"kind={ckpt_meta['kind']}, epoch={ckpt_meta['epoch']}/{ckpt_meta['epochs']}, "
+        f"val_acc={ckpt_meta['val_acc']:.4f}, best_acc@train-time={ckpt_meta['best_acc']:.4f}"
+    )
+
+
+def _metrics_by_split(metrics_list: list[dict]) -> dict[str, dict]:
+    return {metrics["split"]: metrics for metrics in metrics_list}
+
+
+def _delta_text(delta: float, *, higher_is_better: bool, width: int = 10) -> str:
+    improved = delta > 0 if higher_is_better else delta < 0
+    worse = delta < 0 if higher_is_better else delta > 0
+    text = f"{delta:+.4f}".rjust(width)
+    if abs(delta) < 1e-9:
+        return text
+    if improved:
+        return f"{text} ↑"
+    if worse:
+        return f"{text} ↓"
+    return text
+
+
+def _winner(
+    best_value: float,
+    last_value: float,
+    *,
+    higher_is_better: bool,
+    eps: float = 1e-9,
+) -> str:
+    if abs(best_value - last_value) <= eps:
+        return "tie"
+    if higher_is_better:
+        return "best" if best_value > last_value else "last"
+    return "best" if best_value < last_value else "last"
+
+
+COMPARE_SPLITS = ("train", "val", "test")
+COMPARE_METRICS: tuple[tuple[str, str, bool], ...] = (
+    ("loss", "loss", False),
+    ("accuracy", "accuracy", True),
+    ("bal_acc", "balanced_accuracy", True),
+    ("macro_f1", "macro_f1", True),
+    ("weighted_f1", "weighted_f1", True),
+)
+
+
+def print_model_comparison_meta(
+    best_metrics_list: list[dict],
+    last_metrics_list: list[dict],
+    *,
+    best_meta: dict,
+    last_meta: dict,
+    idx_to_label: dict[int, str],
+) -> None:
+    bar = "=" * 72
+    print(f"\n{bar}")
+    print("=== best vs last ===")
+    print(bar)
+
+    print("\ncheckpoints:")
+    print(f"{'model':<8} {'epoch':>12} {'val_acc@save':>14} {'best_acc@train':>16}")
+    for kind, meta in (("best", best_meta), ("last", last_meta)):
+        print(
+            f"{kind:<8} "
+            f"{meta['epoch']:>5}/{meta['epochs']:<5} "
+            f"{meta['val_acc']:>14.4f} "
+            f"{meta['best_acc']:>16.4f}"
+        )
+
+    best_by_split = _metrics_by_split(best_metrics_list)
+    last_by_split = _metrics_by_split(last_metrics_list)
+    split_names = [name for name in COMPARE_SPLITS if name in best_by_split and name in last_by_split]
+
+    print("\nsplit metrics (delta = last - best; ↑ = last improved, ↓ = last worse):")
+    header = f"{'split':<8}" + "".join(f"{label:>12}" for label, _, _ in COMPARE_METRICS) + f"{'winner':>10}"
+    print(header)
+    for split_name in split_names:
+        best_row = best_by_split[split_name]
+        last_row = last_by_split[split_name]
+        deltas = []
+        winners: list[str] = []
+        for _label, key, higher_is_better in COMPARE_METRICS:
+            delta = last_row[key] - best_row[key]
+            deltas.append(_delta_text(delta, higher_is_better=higher_is_better, width=12))
+            winners.append(_winner(best_row[key], last_row[key], higher_is_better=higher_is_better))
+        acc_winner = _winner(best_row["accuracy"], last_row["accuracy"], higher_is_better=True)
+        winner_summary = acc_winner if acc_winner != "tie" else winners.count("last") - winners.count("best")
+        if isinstance(winner_summary, int):
+            if winner_summary > 0:
+                winner_summary = "last"
+            elif winner_summary < 0:
+                winner_summary = "best"
+            else:
+                winner_summary = "tie"
+        print(f"{split_name:<8}{''.join(deltas)}{str(winner_summary):>10}")
+
+    val_test_splits = [name for name in ("val", "test") if name in split_names]
+    if val_test_splits:
+        n_classes = len(next(iter(best_by_split.values()))["per_class"])
+        print("\nper-class recall delta (last - best):")
+        print(f"{'label':<20}" + "".join(f"{split + ' Δ':>12}" for split in val_test_splits))
+        best_recall_wins = 0
+        last_recall_wins = 0
+        tie_recall_wins = 0
+        for class_idx in range(n_classes):
+            label = idx_to_label.get(class_idx, str(class_idx))
+            cells: list[str] = []
+            for split_name in val_test_splits:
+                best_recall = best_by_split[split_name]["per_class"][class_idx]["recall"]
+                last_recall = last_by_split[split_name]["per_class"][class_idx]["recall"]
+                support = best_by_split[split_name]["per_class"][class_idx]["support"]
+                if support <= 0:
+                    cells.append("     n/a".rjust(12))
+                    continue
+                delta = last_recall - best_recall
+                cells.append(_delta_text(delta, higher_is_better=True, width=12))
+                winner = _winner(best_recall, last_recall, higher_is_better=True)
+                if winner == "best":
+                    best_recall_wins += 1
+                elif winner == "last":
+                    last_recall_wins += 1
+                else:
+                    tie_recall_wins += 1
+            print(f"{label[:20]:<20}{''.join(cells)}")
+        print(
+            f"\nper-class recall head-to-head (val+test, support>0): "
+            f"best={best_recall_wins}, last={last_recall_wins}, tie={tie_recall_wins}"
+        )
+
+    print("\nsession accuracy (last - best, shared sessions only):")
+    for split_name in val_test_splits:
+        best_sessions = {
+            row["session_dir"]: row for row in best_by_split[split_name]["per_session"]
+        }
+        last_sessions = {
+            row["session_dir"]: row for row in last_by_split[split_name]["per_session"]
+        }
+        common = sorted(set(best_sessions) & set(last_sessions))
+        if not common:
+            print(f"  {split_name}: no shared ranked sessions")
+            continue
+        deltas = [
+            last_sessions[session_dir]["accuracy"] - best_sessions[session_dir]["accuracy"]
+            for session_dir in common
+        ]
+        last_wins = sum(1 for delta in deltas if delta > 1e-9)
+        best_wins = sum(1 for delta in deltas if delta < -1e-9)
+        ties = len(deltas) - last_wins - best_wins
+        mean_delta = float(np.mean(deltas))
+        print(
+            f"  {split_name}: n={len(common)}, mean Δacc={mean_delta:+.4f}, "
+            f"last wins={last_wins}, best wins={best_wins}, tie={ties}"
+        )
 
 
 def print_summary_table(
@@ -689,6 +893,74 @@ def print_summary_table(
         idx_to_label=idx_to_label,
         top_k=session_top_k,
     )
+
+
+def evaluate_checkpoint_report(
+    kind: str,
+    checkpoint_path: Path,
+    *,
+    splits,
+    device: torch.device,
+    batch_size: int,
+    session_min_samples: int,
+    session_top_k: int,
+    use_color: bool,
+    seed: int,
+) -> tuple[list[dict], dict[str, int], dict]:
+    model, label_to_idx, ckpt_meta = load_checkpoint(checkpoint_path, device)
+    idx_to_label = {idx: label for label, idx in label_to_idx.items()}
+    print_checkpoint_banner(kind, checkpoint_path, ckpt_meta)
+
+    split_specs = (
+        ("train", splits.train.indices),
+        ("val", splits.val.indices),
+        ("test", splits.test.indices),
+    )
+
+    all_metrics: list[dict] = []
+    for split_name, indices in split_specs:
+        dataset = FusionDataset(splits.dataset, indices, label_to_idx)
+        metrics = evaluate_split(
+            model,
+            dataset,
+            device=device,
+            batch_size=batch_size,
+            split_name=split_name,
+            session_min_samples=session_min_samples,
+        )
+        all_metrics.append(metrics)
+        print_metrics(metrics, idx_to_label=idx_to_label, use_color=use_color)
+        print_session_rankings(
+            metrics,
+            idx_to_label=idx_to_label,
+            top_k=session_top_k,
+        )
+
+    print_summary_table(
+        all_metrics,
+        idx_to_label=idx_to_label,
+        use_color=use_color,
+        session_top_k=session_top_k,
+    )
+
+    embedding_stem = EMBEDDINGS_OUTPUT_NAME.rsplit(".", 1)[0]
+    embedding_suffix = EMBEDDINGS_OUTPUT_NAME.rsplit(".", 1)[-1]
+    embedding_output = checkpoint_path.parent / f"{embedding_stem}_{kind}.{embedding_suffix}"
+    run_embedding_umap(
+        model,
+        splits,
+        label_to_idx,
+        device=device,
+        batch_size=batch_size,
+        embedding_splits=EMBEDDING_SPLITS,
+        max_per_label=EMBEDDING_MAX_PER_LABEL,
+        output_path=embedding_output,
+        seed=seed,
+        n_neighbors=EMBEDDINGS_N_NEIGHBORS,
+        min_dist=EMBEDDINGS_MIN_DIST,
+    )
+
+    return all_metrics, label_to_idx, ckpt_meta
 
 
 EMBEDDING_TAPS: dict[str, str] = {
@@ -912,12 +1184,14 @@ def run_embedding_umap(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate a saved fusion EEGNet checkpoint.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate best.pt and last.pt from a training run.",
+    )
     parser.add_argument(
         "--checkpoint",
         type=Path,
         default=None,
-        help="Path to a checkpoint .pt file (default: best.pt from latest run)",
+        help="Path to any checkpoint in a run dir (default: latest run, evaluates best.pt and last.pt)",
     )
     parser.add_argument(
         "--splits-dir",
@@ -950,63 +1224,58 @@ def main() -> None:
 
     seed_everything(args.seed)
     device = get_device()
-    checkpoint_path = args.checkpoint or default_checkpoint_path("best")
     print(f"device: {device}")
 
-    model, label_to_idx, ckpt_meta = load_checkpoint(checkpoint_path, device)
-    idx_to_label = {idx: label for label, idx in label_to_idx.items()}
-    print(f"checkpoint: {checkpoint_path.resolve()}")
-    print(
-        f"kind={ckpt_meta['kind']}, epoch={ckpt_meta['epoch']}/{ckpt_meta['epochs']}, "
-        f"val_acc={ckpt_meta['val_acc']:.4f}, best_acc@train-time={ckpt_meta['best_acc']:.4f}"
-    )
+    run_dir = resolve_run_dir(args.checkpoint)
+    ckpt_paths = checkpoint_paths_for_run(run_dir)
+    print(f"run_dir: {run_dir.resolve()}")
 
     splits = load_dataset_splits(args.splits_dir)
-    split_specs = (
-        ("train", splits.train.indices),
-        ("val", splits.val.indices),
-        ("test", splits.test.indices),
-    )
 
-    all_metrics: list[dict] = []
-    for split_name, indices in split_specs:
-        dataset = FusionDataset(splits.dataset, indices, label_to_idx)
-        metrics = evaluate_split(
-            model,
-            dataset,
+    evaluated: dict[str, tuple[list[dict], dict[str, int], dict]] = {}
+    for kind in ("best", "last"):
+        if kind not in ckpt_paths:
+            print(f"\nwarning: {kind}.pt not found in {run_dir}, skipping")
+            continue
+
+        checkpoint_path = ckpt_paths[kind]
+        if (
+            kind == "last"
+            and "best" in evaluated
+            and checkpoint_path.resolve() == ckpt_paths["best"].resolve()
+        ):
+            _, label_to_idx, ckpt_meta = load_checkpoint(checkpoint_path, device)
+            print_checkpoint_banner(kind, checkpoint_path, ckpt_meta)
+            print("(identical to best.pt — reusing evaluation results)\n")
+            evaluated[kind] = (evaluated["best"][0], label_to_idx, ckpt_meta)
+            continue
+
+        evaluated[kind] = evaluate_checkpoint_report(
+            kind,
+            checkpoint_path,
+            splits=splits,
             device=device,
             batch_size=args.batch_size,
-            split_name=split_name,
             session_min_samples=args.session_min_samples,
+            session_top_k=args.session_top_k,
+            use_color=use_color,
+            seed=args.seed,
         )
-        all_metrics.append(metrics)
-        print_metrics(metrics, idx_to_label=idx_to_label, use_color=use_color)
-        print_session_rankings(
-            metrics,
+
+    if "best" in evaluated and "last" in evaluated:
+        best_metrics, _best_label_to_idx, best_meta = evaluated["best"]
+        last_metrics, _last_label_to_idx, last_meta = evaluated["last"]
+        idx_to_label = {idx: label for label, idx in _best_label_to_idx.items()}
+        print_model_comparison_meta(
+            best_metrics,
+            last_metrics,
+            best_meta=best_meta,
+            last_meta=last_meta,
             idx_to_label=idx_to_label,
-            top_k=args.session_top_k,
         )
-
-    print_summary_table(
-        all_metrics,
-        idx_to_label=idx_to_label,
-        use_color=use_color,
-        session_top_k=args.session_top_k,
-    )
-
-    run_embedding_umap(
-        model,
-        splits,
-        label_to_idx,
-        device=device,
-        batch_size=args.batch_size,
-        embedding_splits=EMBEDDING_SPLITS,
-        max_per_label=EMBEDDING_MAX_PER_LABEL,
-        output_path=checkpoint_path.parent / EMBEDDINGS_OUTPUT_NAME,
-        seed=args.seed,
-        n_neighbors=EMBEDDINGS_N_NEIGHBORS,
-        min_dist=EMBEDDINGS_MIN_DIST,
-    )
+    elif len(evaluated) == 1:
+        only_kind = next(iter(evaluated))
+        print(f"\n(note: only {only_kind}.pt was evaluated; need both best and last for comparison)")
 
 
 if __name__ == "__main__":

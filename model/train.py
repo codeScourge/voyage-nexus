@@ -496,6 +496,7 @@ def format_epoch_summary(
     val_loss: float,
     val_acc: float,
     best_acc: float,
+    best_epoch: int,
     epoch_time: float,
     epochs_without_improve: int | None = None,
     smoothed_stop: float | None = None,
@@ -508,7 +509,7 @@ def format_epoch_summary(
         f"train_acc={train_acc:.4f}",
         f"val_loss={val_loss:.4f}",
         f"val_acc={val_acc:.4f}",
-        f"best={best_acc:.4f}",
+        f"best={best_acc:.4f} (epoch={best_epoch})",
         f"{epoch_time:.1f}s",
     ]
     if epochs_without_improve is not None:
@@ -937,6 +938,7 @@ def train(
                     val_loss=val_loss,
                     val_acc=acc,
                     best_acc=best_acc,
+                    best_epoch=best_metrics["epoch"],
                     epoch_time=epoch_time,
                     epochs_without_improve=epochs_without_improve if early_stopping_patience > 0 else None,
                     smoothed_stop=smoothed_stop if early_stopping_patience > 0 else None,

@@ -68,14 +68,14 @@ ALIGNMENT_WINDOW_FRAMES = 512
 THINKING_COUNTDOWN_SECONDS = 3
 COLLECTION_WORDS = ("highlight", "bullshit", "gogogo", "shitbull", "hangar", "teaspoon", "naan", "quail")
 COLLECTION_WORD_DEFAULT_WEIGHTS: dict[str, float] = {
-    "highlight": 0.20,
-    "bullshit": 0.20,
-    "gogogo": 0.20,
-    "shitbull": 0.7,
-    "hangar": 0.7,
-    "teaspoon": 0.7,
-    "naan": 1.0,
-    "quail": 1.0
+    "highlight": 1.0,
+    "bullshit": 1.0,
+    "gogogo": 1.0,
+    "shitbull": 0.0,
+    "hangar": 0.0,
+    "teaspoon": 0.0,
+    "naan": 0.0,
+    "quail": 0.0
 }
 COLLECTION_REPETITIONS = 7
 WORD_WEIGHT_MIN = 0.0
