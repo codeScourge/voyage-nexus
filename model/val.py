@@ -26,6 +26,7 @@ from train import (
     seed_everything,
     soft_cross_entropy,
 )
+<<<<<<< Updated upstream
 
 # --- embeddings / UMAP (always runs after metrics)
 EMBEDDING_SPLITS = ("val", "test")
@@ -260,11 +261,16 @@ def _format_top_confusion(
         label_max=label_max,
     ).rjust(width)
 
+=======
+from train_feature_fusion import FeatureFusionEEGEMGNet
+from train_late_fusion import LateFusionEEGEMGNet
+>>>>>>> Stashed changes
 
 def load_checkpoint(path: Path, device: torch.device) -> tuple[nn.Module, dict, dict]:
     ckpt = torch.load(path, map_location=device, weights_only=False)
     model_config = ckpt["model_config"]
     label_to_idx: dict[str, int] = ckpt["label_to_idx"]
+<<<<<<< Updated upstream
     state_dict = ckpt["model_state_dict"]
     f2 = int(state_dict["bn3.weight"].shape[0])
 
@@ -276,6 +282,31 @@ def load_checkpoint(path: Path, device: torch.device) -> tuple[nn.Module, dict, 
         F2=f2,
     )
     model.load_state_dict(state_dict)
+=======
+    print(f"================== MODEL ARCHITECTURE: {model_config["arch"]} ====================")
+    if model_config["arch"] == "late":
+        model = LateFusionEEGEMGNet(
+            n_eeg=model_config["n_eeg"],
+            n_emg=model_config["n_emg"],
+            n_classes=model_config["n_classes"],
+            T=model_config["T"],
+        )
+    elif model_config["arch"] == "feature":
+        model = FeatureFusionEEGEMGNet(
+            n_eeg=model_config["n_eeg"],
+            n_emg=model_config["n_emg"],
+            n_classes=model_config["n_classes"],
+            T=model_config["T"],
+        )
+    else:
+        model = IntermediateFusionEEGNet(
+            n_eeg=model_config["n_eeg"],
+            n_emg=model_config["n_emg"],
+            n_classes=model_config["n_classes"],
+            T=model_config["T"],
+        )
+    model.load_state_dict(ckpt["model_state_dict"])
+>>>>>>> Stashed changes
     model.to(device)
     model.eval()
 

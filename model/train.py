@@ -1047,6 +1047,7 @@ if __name__ == "__main__":
         model, label_to_idx, model_config = construct_model(splits)
 
     print(f"window T={model_config['T']} samples, classes={model_config['n_classes']}")
+<<<<<<< Updated upstream
 
     print("\n\n")
     print(f"starting training on device {device} at {run_dir}")
@@ -1062,4 +1063,8 @@ if __name__ == "__main__":
     )
 
     print("\n")
+=======
+    model_config["arch"] = "Intermediate_Ivan"
+    model, history, run_dir = train(untrained_model, splits, label_to_idx, model_config)
+>>>>>>> Stashed changes
     print(f"artifacts saved under {run_dir}")
