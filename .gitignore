@@ -39,3 +39,19 @@ labels.csv
 # IDE/editor
 .vscode/
 .idea/
+
+# === T-MSPD raw dataset (~30 GB, fetched via download_tmspd.py) ===
+# Folder skeleton kept via .gitkeep; the data itself is never committed.
+*.cdt
+*.ceo
+*.dpo
+*.bdf
+*.wav
+*.pkf
+*.tar.gz
+
+# === Regenerable caches (~2 GB, rebuilt by the model scripts) ===
+model/*.npz
+
+# Always keep directory placeholders
+!.gitkeep

@@ -264,7 +264,8 @@ def _format_top_confusion(
 =======
 from train_feature_fusion import FeatureFusionEEGEMGNet
 from train_late_fusion import LateFusionEEGEMGNet
->>>>>>> Stashed changes
+>>>>>>> Stashed changesfrom train_feature_fusion import FeatureFusionEEGEMGNet
+from train_late_fusion import LateFusionEEGEMGNet
 
 def load_checkpoint(path: Path, device: torch.device) -> tuple[nn.Module, dict, dict]:
     ckpt = torch.load(path, map_location=device, weights_only=False)
@@ -283,6 +284,28 @@ def load_checkpoint(path: Path, device: torch.device) -> tuple[nn.Module, dict, 
     )
     model.load_state_dict(state_dict)
 =======
+    print(f"================== MODEL ARCHITECTURE: {model_config["arch"]} ====================")
+    if model_config["arch"] == "late":
+        model = LateFusionEEGEMGNet(
+            n_eeg=model_config["n_eeg"],
+            n_emg=model_config["n_emg"],
+            n_classes=model_config["n_classes"],
+            T=model_config["T"],
+        )
+    elif model_config["arch"] == "feature":
+        model = FeatureFusionEEGEMGNet(
+            n_eeg=model_config["n_eeg"],
+            n_emg=model_config["n_emg"],
+            n_classes=model_config["n_classes"],
+            T=model_config["T"],
+        )
+    else:
+        model = IntermediateFusionEEGNet(
+            n_eeg=model_config["n_eeg"],
+            n_emg=model_config["n_emg"],
+            n_classes=model_config["n_classes"],
+            T=model_config["T"],
+        )
     print(f"================== MODEL ARCHITECTURE: {model_config["arch"]} ====================")
     if model_config["arch"] == "late":
         model = LateFusionEEGEMGNet(
