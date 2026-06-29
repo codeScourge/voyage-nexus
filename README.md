@@ -63,3 +63,26 @@ we have a dict that limits each label to x% (after put into sets) - algorithm tr
 - 2026-06-25_00-03-53_session_5f75476f, 2026-06-25_00-10-59_session_c019258d - collected slightly sweaty after run, was doing little head nodding half the time
 - 2026-06-25_06-50-40_session_dda4a668 - was laughing at last few samples, might need to delete the latest scrable
 - 2026-06-26_00-09-06_session_9faeac69, 2026-06-26_00-10-59_session_0dbb211f, 
+
+## Chinese Dataset Instructions
+
+This repo does **not** track the raw T-MSPD dataset (~30 GB of EEG, sEMG, and
+speech recordings). Only the directory skeleton is committed — the per-subject
+folders are preserved as empty `.gitkeep` placeholders, and the data itself is
+fetched on demand.
+
+After cloning, populate the folders by running:
+
+```bash
+python download_tmspd.py
+```
+
+This fills in `T-MSPD/V1/multidimensional physiological signals/2.raw_data/`
+across all 30 subjects (`S01`–`S30`):
+
+- `overt speech/` — EEG (`.cdt`), sEMG (`.bdf`), and speech (`.wav`)
+- `silent speech/` — EEG (`.cdt`) and sEMG (`.bdf`)
+- `imagined speech/` — EEG (`.cdt`) only
+
+Model caches (`model/*.npz`) are likewise untracked; they regenerate
+automatically the first time you run the training and evaluation scripts.
