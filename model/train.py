@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from models import ARCHITECTURES, build_fusion_model
 from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
 from tqdm import tqdm
@@ -143,160 +144,10 @@ def get_device() -> torch.device:
 # --- setup
 device = get_device()
 CHECKPOINT_DIR = Path(__file__).resolve().parent / "checkpoints"
-CHECKPOINT_SAVE_INTERVAL = 30
+CHECKPOINT_SAVE_INTERVAL = 5
 EARLY_STOPPING_METRIC = "loss"  # "loss" or "acc" — stop signal only, not best.pt selection
 EARLY_STOPPING_SMOOTH_WINDOW = 4
-
-
-# --- architecture
-class ModalityBranch(nn.Module):
-    """EEGNet Block 1: temporal conv -> depthwise spatial conv.
-
-    Input:  (B, 1, C, T)
-    Output: (B, D*F1, 1, T)   -- spatial axis collapsed, time preserved
-    """
-
-    def __init__(self, n_channels: int, F1: int, D: int, kernel_length: int):
-        super().__init__()
-        # temporal conv: 'same' padding so T is preserved. one shared kernel
-        # across all channels, F1 of them.
-        self.temporal = nn.Conv2d(
-            1, F1, (1, kernel_length),
-            padding=(0, kernel_length // 2), bias=False,
-        )
-        self.bn1 = nn.BatchNorm2d(F1)
-
-        # depthwise spatial conv: kernel (C, 1), valid padding -> collapses
-        # channel axis to 1. groups=F1 ties each spatial filter to one temporal
-        # map. depth multiplier D via out_channels = D*F1.
-        self.spatial = nn.Conv2d(
-            F1, D * F1, (n_channels, 1),
-            groups=F1, bias=False,
-        )
-        self.bn2 = nn.BatchNorm2d(D * F1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.bn1(self.temporal(x))          # (B, F1, C, T)
-        x = self.bn2(self.spatial(x))           # (B, D*F1, 1, T)
-        x = F.elu(x)
-        return x
-
-
-class TimeAvgPool(nn.Module):
-    """Pool along the time axis to a fixed length without AdaptiveAvgPool2d.
-
-    MPS does not implement adaptive pooling when input length is not divisible
-    by the target length (pytorch#96056). Trim trailing samples if needed, then
-    use fixed-kernel average pooling.
-    """
-
-    def __init__(self, out_len: int):
-        super().__init__()
-        self.out_len = out_len
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, 1, T)
-        t = x.shape[-1]
-        out = self.out_len
-        if t == out:
-            return x
-        if t < out:
-            return F.interpolate(x, size=(1, out), mode="linear", align_corners=False)
-
-        trim = t - (t % out)
-        x = x[..., :trim]
-        stride = trim // out
-        return F.avg_pool2d(x, kernel_size=(1, stride), stride=(1, stride))
-
-
-class IntermediateFusionEEGNet(nn.Module):
-    """Two EEGNet Block-1 branches (EEG, EMG) fused before the separable conv.
-
-    Fusion = concat along feature-map axis once both branches are
-    (B, D*F1, 1, T). The shared separable conv then learns cross-modal
-    temporal summaries and mixes EEG+EMG feature maps together.
-    """
-
-    def __init__(
-        self,
-        n_eeg: int,
-        n_emg: int,
-        n_classes: int,
-        T: int,
-        F1: int = 8,
-        D: int = 2,
-        F2: int = 32,
-        kern_eeg: int = 128,   # half the sampling rate per the paper
-        kern_emg: int = 128,   # tune: EMG carries higher-freq content
-        sep_kernel: int = 16,
-        p_drop: float = 0.25,
-    ):
-        super().__init__()
-        self.eeg_branch = ModalityBranch(n_eeg, F1, D, kern_eeg)
-        self.emg_branch = ModalityBranch(n_emg, F1, D, kern_emg)
-
-        fused_maps = 2 * (D * F1)  # concat of both branches
-
-        pool1_out = max(1, T // 4)
-        pool2_out = max(1, pool1_out // 8)
-        self.pool1_out = pool1_out
-        self.pool2_out = pool2_out
-
-        # fixed pools handle short windows and avoid MPS adaptive-pool limits
-        self.pool1 = TimeAvgPool(pool1_out)
-        self.drop1 = nn.Dropout(p_drop)
-
-        # --- Block 2: separable conv on the FUSED maps ---
-        # depthwise temporal part: per-map (1, sep_kernel) summary, 'same' pad
-        self.sep_depth = nn.Conv2d(
-            fused_maps, fused_maps, (1, sep_kernel),
-            padding=(0, sep_kernel // 2), groups=fused_maps, bias=False,
-        )
-        # pointwise: mix all fused maps -> F2 (this is where EEG and EMG
-        # feature maps actually combine)
-        self.sep_point = nn.Conv2d(fused_maps, F2, (1, 1), bias=False)
-        self.bn3 = nn.BatchNorm2d(F2)
-        self.pool2 = TimeAvgPool(pool2_out)
-        self.drop2 = nn.Dropout(p_drop)
-
-        self.classifier = nn.Linear(F2 * pool2_out, n_classes)
-
-    def forward(self, eeg: torch.Tensor, emg: torch.Tensor) -> torch.Tensor:
-        e = self.eeg_branch(eeg)   # (B, D*F1, 1, T)
-        m = self.emg_branch(emg)   # (B, D*F1, 1, T)
-
-        # align time length in case kernels/padding differ by a sample
-        t = min(e.shape[-1], m.shape[-1])
-        e, m = e[..., :t], m[..., :t]
-
-        x = torch.cat([e, m], dim=1)   # (B, 2*D*F1, 1, T) <-- intermediate fusion
-        x = self.drop1(self.pool1(x))
-
-        x = self.sep_point(self.sep_depth(x))
-        x = F.elu(self.bn3(x))
-        x = self.drop2(self.pool2(x))
-
-        x = torch.flatten(x, 1)
-        return self.classifier(x)
-
-    def forward_embeddings(self, eeg: torch.Tensor, emg: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Flattened fusion embeddings without dropout (use under model.eval())."""
-        e = self.eeg_branch(eeg)
-        m = self.emg_branch(emg)
-        t = min(e.shape[-1], m.shape[-1])
-        e, m = e[..., :t], m[..., :t]
-
-        x = torch.cat([e, m], dim=1)
-        x = self.pool1(x)
-
-        x = self.sep_point(self.sep_depth(x))
-        pre_pool2 = F.elu(self.bn3(x))
-        post_pool2 = self.pool2(pre_pool2)
-
-        return {
-            "pre_pool2": torch.flatten(pre_pool2, start_dim=1),
-            "classifier_input": torch.flatten(post_pool2, start_dim=1),
-        }
+MODEL_ARCHITECTURE = "intermediate_fusion_eegnet"  # or "cat_net"
 
 
 # --- dataset adapter
@@ -357,11 +208,16 @@ def construct_model(splits):
     print("------")
     print("\n\n")
 
-    model = IntermediateFusionEEGNet(
-        n_eeg=n_eeg, n_emg=n_emg, n_classes=n_classes, T=T,
+    model = build_fusion_model(
+        MODEL_ARCHITECTURE,
+        n_eeg=n_eeg,
+        n_emg=n_emg,
+        n_classes=n_classes,
+        T=T,
     ).to(device)
 
     return model, label_to_idx, {
+        "architecture": MODEL_ARCHITECTURE,
         "n_eeg": n_eeg,
         "n_emg": n_emg,
         "n_classes": n_classes,
@@ -407,11 +263,14 @@ def load_training_checkpoint(path: Path) -> tuple[nn.Module, dict, dict, dict]:
     model_config = ckpt["model_config"]
     label_to_idx: dict[str, int] = ckpt["label_to_idx"]
 
-    model = IntermediateFusionEEGNet(
+    architecture = model_config.get("architecture", "intermediate_fusion_eegnet")
+    model = build_fusion_model(
+        architecture,
         n_eeg=model_config["n_eeg"],
         n_emg=model_config["n_emg"],
         n_classes=model_config["n_classes"],
         T=model_config["T"],
+        state_dict=ckpt["model_state_dict"],
     )
     model.load_state_dict(ckpt["model_state_dict"])
 
@@ -1014,7 +873,13 @@ def train(
 # --- main
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train the fusion EEGNet model.")
+    parser = argparse.ArgumentParser(description="Train the fusion EEG/EMG model.")
+    parser.add_argument(
+        "--model",
+        choices=sorted(ARCHITECTURES),
+        default=MODEL_ARCHITECTURE,
+        help=f"model architecture (default: {MODEL_ARCHITECTURE})",
+    )
     parser.add_argument(
         "--continue",
         action="store_true",
@@ -1022,6 +887,7 @@ if __name__ == "__main__":
         help="Load the latest checkpoint and train in a new -continued run folder",
     )
     args = parser.parse_args()
+    MODEL_ARCHITECTURE = args.model
 
     SPLITS_DIR = Path(__file__).resolve().parent / "splits"
     seed_everything(SEED, TORCH_DETERMINISTIC)

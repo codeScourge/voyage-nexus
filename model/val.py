@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import TextIO
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,10 +20,10 @@ from tqdm import tqdm
 from collections import defaultdict
 
 from data import load_dataset_splits
+from models import build_fusion_model
 from train import (
     CHECKPOINT_DIR,
     FusionDataset,
-    IntermediateFusionEEGNet,
     _per_label_colors,
     get_device,
     latest_run_dir,
@@ -33,6 +37,9 @@ EMBEDDING_MAX_PER_LABEL = 200
 EMBEDDINGS_N_NEIGHBORS = 15
 EMBEDDINGS_MIN_DIST = 0.1
 EMBEDDINGS_OUTPUT_NAME = "embeddings_umap.png"
+VAL_REPORT_NAME = "validation_report.md"
+
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
 
 RESET = "\033[0m"
@@ -99,6 +106,66 @@ def _format_colored_value(
     if not bg and not bold:
         return text
     return f"{prefix}{text}{RESET}"
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
+
+
+class _TeeStdout:
+    def __init__(self, original: TextIO, buffer: list[str]) -> None:
+        self._original = original
+        self._buffer = buffer
+
+    def write(self, text: str) -> int:
+        self._original.write(text)
+        self._buffer.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        self._original.flush()
+
+    def isatty(self) -> bool:
+        return self._original.isatty()
+
+    def fileno(self) -> int:
+        return self._original.fileno()
+
+    def __getattr__(self, name: str):
+        return getattr(self._original, name)
+
+
+@contextmanager
+def capture_report_output():
+    buffer: list[str] = []
+    original = sys.stdout
+    sys.stdout = _TeeStdout(original, buffer)
+    try:
+        yield buffer
+    finally:
+        sys.stdout = original
+
+
+def save_validation_report(
+    run_dir: Path,
+    *,
+    buffer: list[str],
+    checkpoint_hint: Path | None = None,
+) -> Path:
+    plain = _strip_ansi("".join(buffer)).rstrip()
+    generated_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+    meta_lines = [
+        "# Validation Report",
+        "",
+        f"- **Generated:** {generated_at}",
+        f"- **Run directory:** `{run_dir.resolve()}`",
+    ]
+    if checkpoint_hint is not None:
+        meta_lines.append(f"- **Checkpoint hint:** `{checkpoint_hint.resolve()}`")
+    meta_lines.extend(["", "---", "", "```text", plain, "```", ""])
+    output_path = run_dir / VAL_REPORT_NAME
+    output_path.write_text("\n".join(meta_lines), encoding="utf-8")
+    return output_path
 
 
 def session_name(session_dir: str | Path) -> str:
@@ -266,14 +333,15 @@ def load_checkpoint(path: Path, device: torch.device) -> tuple[nn.Module, dict, 
     model_config = ckpt["model_config"]
     label_to_idx: dict[str, int] = ckpt["label_to_idx"]
     state_dict = ckpt["model_state_dict"]
-    f2 = int(state_dict["bn3.weight"].shape[0])
+    architecture = model_config.get("architecture", "intermediate_fusion_eegnet")
 
-    model = IntermediateFusionEEGNet(
+    model = build_fusion_model(
+        architecture,
         n_eeg=model_config["n_eeg"],
         n_emg=model_config["n_emg"],
         n_classes=model_config["n_classes"],
         T=model_config["T"],
-        F2=f2,
+        state_dict=state_dict,
     )
     model.load_state_dict(state_dict)
     model.to(device)
@@ -943,23 +1011,6 @@ def evaluate_checkpoint_report(
         session_top_k=session_top_k,
     )
 
-    embedding_stem = EMBEDDINGS_OUTPUT_NAME.rsplit(".", 1)[0]
-    embedding_suffix = EMBEDDINGS_OUTPUT_NAME.rsplit(".", 1)[-1]
-    embedding_output = checkpoint_path.parent / f"{embedding_stem}_{kind}.{embedding_suffix}"
-    run_embedding_umap(
-        model,
-        splits,
-        label_to_idx,
-        device=device,
-        batch_size=batch_size,
-        embedding_splits=EMBEDDING_SPLITS,
-        max_per_label=EMBEDDING_MAX_PER_LABEL,
-        output_path=embedding_output,
-        seed=seed,
-        n_neighbors=EMBEDDINGS_N_NEIGHBORS,
-        min_dist=EMBEDDINGS_MIN_DIST,
-    )
-
     return all_metrics, label_to_idx, ckpt_meta
 
 
@@ -1043,96 +1094,7 @@ def _stack_embeddings(
     return matrix, labels, splits
 
 
-def plot_embedding_umap(
-    samples: list[EmbeddingSample],
-    *,
-    output_path: Path,
-    seed: int,
-    n_neighbors: int,
-    min_dist: float,
-) -> None:
-    import umap
-
-    if not samples:
-        print("embeddings: no samples collected; skipping UMAP plot")
-        return
-
-    labels_present = sorted({sample.label for sample in samples})
-    label_colors = dict(zip(labels_present, _per_label_colors(len(labels_present)), strict=True))
-
-    fig, axes = plt.subplots(1, len(EMBEDDING_TAPS), figsize=(7 * len(EMBEDDING_TAPS), 6))
-    if len(EMBEDDING_TAPS) == 1:
-        axes = [axes]
-
-    for ax, (tap_key, tap_title) in zip(axes, EMBEDDING_TAPS.items(), strict=True):
-        matrix, labels, splits = _stack_embeddings(samples, tap_key)
-        reducer = umap.UMAP(
-            n_components=2,
-            n_neighbors=min(n_neighbors, max(2, len(samples) - 1)),
-            min_dist=min_dist,
-            random_state=seed,
-        )
-        coords = reducer.fit_transform(matrix)
-
-        for split_name, marker in SPLIT_MARKERS.items():
-            split_mask = np.array([split == split_name for split in splits])
-            if not split_mask.any():
-                continue
-            for label in labels_present:
-                mask = split_mask & np.array([label_name == label for label_name in labels])
-                if not mask.any():
-                    continue
-                ax.scatter(
-                    coords[mask, 0],
-                    coords[mask, 1],
-                    c=[label_colors[label]],
-                    marker=marker,
-                    s=28,
-                    alpha=0.75,
-                    linewidths=0.4,
-                    edgecolors="white",
-                    label=f"{label} ({split_name})",
-                )
-
-        ax.set_title(tap_title)
-        ax.set_xlabel("UMAP 1")
-        ax.set_ylabel("UMAP 2")
-        ax.grid(True, alpha=0.25)
-
-    split_handles = [
-        plt.Line2D(
-            [0],
-            [0],
-            marker=marker,
-            color="gray",
-            linestyle="None",
-            markersize=7,
-            label=f"{split_name} ({'dot' if marker == 'o' else 'square'})",
-        )
-        for split_name, marker in SPLIT_MARKERS.items()
-        if any(sample.split == split_name for sample in samples)
-    ]
-    label_handles = [
-        plt.Line2D([0], [0], marker="o", color=color, linestyle="None", markersize=7, label=label)
-        for label, color in label_colors.items()
-    ]
-
-    fig.legend(
-        handles=split_handles + label_handles,
-        loc="center left",
-        bbox_to_anchor=(1.02, 0.5),
-        fontsize=8,
-        frameon=False,
-    )
-    fig.suptitle("Fusion embeddings (dropout off)", y=1.02)
-    fig.tight_layout()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=160, bbox_inches="tight")
-    plt.close(fig)
-    print(f"embeddings: saved UMAP plot to {output_path.resolve()}")
-
-
-def run_embedding_umap(
+def collect_embedding_samples(
     model: nn.Module,
     splits,
     label_to_idx: dict[str, int],
@@ -1141,11 +1103,8 @@ def run_embedding_umap(
     batch_size: int,
     embedding_splits: tuple[str, ...],
     max_per_label: int,
-    output_path: Path,
     seed: int,
-    n_neighbors: int,
-    min_dist: float,
-) -> None:
+) -> list[EmbeddingSample]:
     split_indices = {
         "val": splits.val.indices,
         "test": splits.test.indices,
@@ -1168,14 +1127,174 @@ def run_embedding_umap(
                 rng=rng,
             )
         )
+    return samples
 
-    print(
-        f"embeddings: collected {len(samples)} samples "
-        f"from {', '.join(embedding_splits)} "
-        f"(max {max_per_label} per label per split)"
+
+def _draw_umap_panel(
+    ax: plt.Axes,
+    samples: list[EmbeddingSample],
+    *,
+    tap_key: str,
+    tap_title: str,
+    label_colors: dict[str, str],
+    seed: int,
+    n_neighbors: int,
+    min_dist: float,
+) -> None:
+    import umap
+
+    labels_present = sorted({sample.label for sample in samples})
+    matrix, labels, splits = _stack_embeddings(samples, tap_key)
+    reducer = umap.UMAP(
+        n_components=2,
+        n_neighbors=min(n_neighbors, max(2, len(samples) - 1)),
+        min_dist=min_dist,
+        random_state=seed,
     )
+    coords = reducer.fit_transform(matrix)
+
+    for split_name, marker in SPLIT_MARKERS.items():
+        split_mask = np.array([split == split_name for split in splits])
+        if not split_mask.any():
+            continue
+        for label in labels_present:
+            mask = split_mask & np.array([label_name == label for label_name in labels])
+            if not mask.any():
+                continue
+            ax.scatter(
+                coords[mask, 0],
+                coords[mask, 1],
+                c=[label_colors[label]],
+                marker=marker,
+                s=28,
+                alpha=0.75,
+                linewidths=0.4,
+                edgecolors="white",
+            )
+
+    ax.set_title(tap_title)
+    ax.set_xlabel("UMAP 1")
+    ax.set_ylabel("UMAP 2")
+    ax.grid(True, alpha=0.25)
+
+
+def plot_embedding_umap(
+    checkpoint_samples: list[tuple[str, list[EmbeddingSample]]],
+    *,
+    output_path: Path,
+    seed: int,
+    n_neighbors: int,
+    min_dist: float,
+) -> None:
+    checkpoint_samples = [(kind, samples) for kind, samples in checkpoint_samples if samples]
+    if not checkpoint_samples:
+        print("embeddings: no samples collected; skipping UMAP plot")
+        return
+
+    all_samples = [sample for _, samples in checkpoint_samples for sample in samples]
+    labels_present = sorted({sample.label for sample in all_samples})
+    label_colors = dict(zip(labels_present, _per_label_colors(len(labels_present)), strict=True))
+
+    n_rows = len(checkpoint_samples) * len(EMBEDDING_TAPS)
+    fig, axes = plt.subplots(n_rows, 1, figsize=(7, 5 * n_rows))
+    if n_rows == 1:
+        axes = [axes]
+
+    row_idx = 0
+    for kind, samples in checkpoint_samples:
+        for tap_key, tap_title in EMBEDDING_TAPS.items():
+            title = f"{kind.upper()} — {tap_title}"
+            _draw_umap_panel(
+                axes[row_idx],
+                samples,
+                tap_key=tap_key,
+                tap_title=title,
+                label_colors=label_colors,
+                seed=seed,
+                n_neighbors=n_neighbors,
+                min_dist=min_dist,
+            )
+            row_idx += 1
+
+    split_handles = [
+        plt.Line2D(
+            [0],
+            [0],
+            marker=marker,
+            color="gray",
+            linestyle="None",
+            markersize=7,
+            label=f"{split_name} ({'dot' if marker == 'o' else 'square'})",
+        )
+        for split_name, marker in SPLIT_MARKERS.items()
+        if any(sample.split == split_name for sample in all_samples)
+    ]
+    label_handles = [
+        plt.Line2D([0], [0], marker="o", color=color, linestyle="None", markersize=7, label=label)
+        for label, color in label_colors.items()
+    ]
+
+    fig.legend(
+        handles=split_handles + label_handles,
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+        fontsize=8,
+        frameon=False,
+    )
+    fig.suptitle("Fusion embeddings (dropout off)", y=1.0)
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print(f"embeddings: saved UMAP plot to {output_path.resolve()}")
+
+
+def run_embedding_umap(
+    ckpt_paths: dict[str, Path],
+    splits,
+    *,
+    device: torch.device,
+    batch_size: int,
+    embedding_splits: tuple[str, ...],
+    max_per_label: int,
+    output_path: Path,
+    seed: int,
+    n_neighbors: int,
+    min_dist: float,
+) -> None:
+    kinds = [kind for kind in ("best", "last") if kind in ckpt_paths]
+    if not kinds:
+        return
+
+    checkpoint_samples: list[tuple[str, list[EmbeddingSample]]] = []
+    seen_paths: set[Path] = set()
+    for kind in kinds:
+        checkpoint_path = ckpt_paths[kind]
+        resolved = checkpoint_path.resolve()
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+
+        model, label_to_idx, _ = load_checkpoint(checkpoint_path, device)
+        samples = collect_embedding_samples(
+            model,
+            splits,
+            label_to_idx,
+            device=device,
+            batch_size=batch_size,
+            embedding_splits=embedding_splits,
+            max_per_label=max_per_label,
+            seed=seed,
+        )
+        print(
+            f"embeddings ({kind}): collected {len(samples)} samples "
+            f"from {', '.join(embedding_splits)} "
+            f"(max {max_per_label} per label per split)"
+        )
+        checkpoint_samples.append((kind, samples))
+
     plot_embedding_umap(
-        samples,
+        checkpoint_samples,
         output_path=output_path,
         seed=seed,
         n_neighbors=n_neighbors,
@@ -1224,58 +1343,82 @@ def main() -> None:
 
     seed_everything(args.seed)
     device = get_device()
-    print(f"device: {device}")
 
     run_dir = resolve_run_dir(args.checkpoint)
     ckpt_paths = checkpoint_paths_for_run(run_dir)
-    print(f"run_dir: {run_dir.resolve()}")
-
     splits = load_dataset_splits(args.splits_dir)
 
-    evaluated: dict[str, tuple[list[dict], dict[str, int], dict]] = {}
-    for kind in ("best", "last"):
-        if kind not in ckpt_paths:
-            print(f"\nwarning: {kind}.pt not found in {run_dir}, skipping")
-            continue
+    with capture_report_output() as report_buffer:
+        print(f"device: {device}")
+        print(f"run_dir: {run_dir.resolve()}")
 
-        checkpoint_path = ckpt_paths[kind]
-        if (
-            kind == "last"
-            and "best" in evaluated
-            and checkpoint_path.resolve() == ckpt_paths["best"].resolve()
-        ):
-            _, label_to_idx, ckpt_meta = load_checkpoint(checkpoint_path, device)
-            print_checkpoint_banner(kind, checkpoint_path, ckpt_meta)
-            print("(identical to best.pt — reusing evaluation results)\n")
-            evaluated[kind] = (evaluated["best"][0], label_to_idx, ckpt_meta)
-            continue
+        evaluated: dict[str, tuple[list[dict], dict[str, int], dict]] = {}
+        for kind in ("best", "last"):
+            if kind not in ckpt_paths:
+                print(f"\nwarning: {kind}.pt not found in {run_dir}, skipping")
+                continue
 
-        evaluated[kind] = evaluate_checkpoint_report(
-            kind,
-            checkpoint_path,
-            splits=splits,
+            checkpoint_path = ckpt_paths[kind]
+            if (
+                kind == "last"
+                and "best" in evaluated
+                and checkpoint_path.resolve() == ckpt_paths["best"].resolve()
+            ):
+                _, label_to_idx, ckpt_meta = load_checkpoint(checkpoint_path, device)
+                print_checkpoint_banner(kind, checkpoint_path, ckpt_meta)
+                print("(identical to best.pt — reusing evaluation results)\n")
+                evaluated[kind] = (evaluated["best"][0], label_to_idx, ckpt_meta)
+                continue
+
+            evaluated[kind] = evaluate_checkpoint_report(
+                kind,
+                checkpoint_path,
+                splits=splits,
+                device=device,
+                batch_size=args.batch_size,
+                session_min_samples=args.session_min_samples,
+                session_top_k=args.session_top_k,
+                use_color=use_color,
+                seed=args.seed,
+            )
+
+        if "best" in evaluated and "last" in evaluated:
+            best_metrics, _best_label_to_idx, best_meta = evaluated["best"]
+            last_metrics, _last_label_to_idx, last_meta = evaluated["last"]
+            idx_to_label = {idx: label for label, idx in _best_label_to_idx.items()}
+            print_model_comparison_meta(
+                best_metrics,
+                last_metrics,
+                best_meta=best_meta,
+                last_meta=last_meta,
+                idx_to_label=idx_to_label,
+            )
+        elif len(evaluated) == 1:
+            only_kind = next(iter(evaluated))
+            print(
+                f"\n(note: only {only_kind}.pt was evaluated; "
+                "need both best and last for comparison)"
+            )
+
+        run_embedding_umap(
+            ckpt_paths,
+            splits,
             device=device,
             batch_size=args.batch_size,
-            session_min_samples=args.session_min_samples,
-            session_top_k=args.session_top_k,
-            use_color=use_color,
+            embedding_splits=EMBEDDING_SPLITS,
+            max_per_label=EMBEDDING_MAX_PER_LABEL,
+            output_path=run_dir / EMBEDDINGS_OUTPUT_NAME,
             seed=args.seed,
+            n_neighbors=EMBEDDINGS_N_NEIGHBORS,
+            min_dist=EMBEDDINGS_MIN_DIST,
         )
 
-    if "best" in evaluated and "last" in evaluated:
-        best_metrics, _best_label_to_idx, best_meta = evaluated["best"]
-        last_metrics, _last_label_to_idx, last_meta = evaluated["last"]
-        idx_to_label = {idx: label for label, idx in _best_label_to_idx.items()}
-        print_model_comparison_meta(
-            best_metrics,
-            last_metrics,
-            best_meta=best_meta,
-            last_meta=last_meta,
-            idx_to_label=idx_to_label,
-        )
-    elif len(evaluated) == 1:
-        only_kind = next(iter(evaluated))
-        print(f"\n(note: only {only_kind}.pt was evaluated; need both best and last for comparison)")
+    report_path = save_validation_report(
+        run_dir,
+        buffer=report_buffer,
+        checkpoint_hint=args.checkpoint,
+    )
+    print(f"report: saved validation report to {report_path.resolve()}")
 
 
 if __name__ == "__main__":

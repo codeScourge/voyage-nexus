@@ -71,9 +71,10 @@ EEG_RECORD_FORMAT_CODES_LEGACY = "<QQ32i"
 SCRAMBLE_BREAKS_SHIFTS_PER_TRANSITION = 3
 SCRAMBLE_BREAKS_SHIFT_MIN_S = -1.2
 SCRAMBLE_BREAKS_SHIFT_MAX_S = 1.2
-# Linear ramp: at this window fraction the corresponding phase gets 100% label mass.
-# Between 0.5 and 1.0 the label blends toward silence / word / transition.
-TRANSITION_PURE_PHASE_FRAC = 0.5
+# Silence/word mass stays zero until a phase exceeds this fraction; below it
+# p_transition = 1.0. At 0.7 with COLLECTION_SAY_S=1.6s, shifts within ~±0.3s
+# of the boundary remain pure transition.
+TRANSITION_PURE_PHASE_FRAC = 0.7
 
 
 SCRAMBLE_BREAKS_ONLY_TARGET_WORDS = True
@@ -587,12 +588,14 @@ def _transition_shift_label_probs(
 ) -> dict[str, float]:
     """Soft label distribution for a transition-centered window.
 
-    Mass ramps linearly from the 50/50 midpoint to pure silence, pure word, or
-    pure transition (word starting / word ending) at the window endpoints.
+    Below TRANSITION_PURE_PHASE_FRAC in both phases, all mass stays on the
+    transition label. Above that threshold, silence/word mass ramps linearly
+    to 1.0 at a pure phase window.
     """
-    midpoint = TRANSITION_PURE_PHASE_FRAC
-    p_silence = max(0.0, (silence_frac - midpoint) / midpoint)
-    p_word = max(0.0, (word_frac - midpoint) / midpoint)
+    threshold = TRANSITION_PURE_PHASE_FRAC
+    ramp_span = max(1.0 - threshold, 1e-9)
+    p_silence = max(0.0, (silence_frac - threshold) / ramp_span)
+    p_word = max(0.0, (word_frac - threshold) / ramp_span)
     p_transition = max(0.0, 1.0 - p_silence - p_word)
     transition_label = WORD_STARTING_LABEL if kind == "silence_to_word" else WORD_ENDING_LABEL
 
