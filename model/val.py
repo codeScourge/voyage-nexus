@@ -20,7 +20,7 @@ from tqdm import tqdm
 from collections import defaultdict
 
 from data import load_dataset_splits
-from models import build_fusion_model
+from models import build_fusion_model, get_embedding_taps
 from train import (
     CHECKPOINT_DIR,
     FusionDataset,
@@ -1062,11 +1062,6 @@ def evaluate_checkpoint_report(
     return all_metrics, label_to_idx, ckpt_meta
 
 
-EMBEDDING_TAPS: dict[str, str] = {
-    "classifier_input": "post-ELU / post-pool2 (classifier input)",
-    "pre_pool2": "bn3 ELU (pre-pool2)",
-}
-
 SPLIT_MARKERS = {
     "val": "o",
     "test": "s",
@@ -1075,8 +1070,7 @@ SPLIT_MARKERS = {
 
 @dataclass(frozen=True, slots=True)
 class EmbeddingSample:
-    pre_pool2: np.ndarray
-    classifier_input: np.ndarray
+    vectors: dict[str, np.ndarray]
     label: str
     split: str
 
@@ -1098,6 +1092,7 @@ def collect_embeddings(
     rng: np.random.Generator,
 ) -> list[EmbeddingSample]:
     model.eval()
+    tap_keys = list(get_embedding_taps(model))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     per_label: dict[str, list[EmbeddingSample]] = defaultdict(list)
@@ -1106,17 +1101,14 @@ def collect_embeddings(
     for eeg, emg, _y_soft, _y_hard in tqdm(loader, desc=f"embeddings:{split_name}", leave=False):
         eeg, emg = eeg.to(device), emg.to(device)
         taps = model.forward_embeddings(eeg, emg)
-
-        pre_pool2 = taps["pre_pool2"].cpu().numpy()
-        classifier_input = taps["classifier_input"].cpu().numpy()
-        batch_size_actual = pre_pool2.shape[0]
+        batch_arrays = {key: taps[key].cpu().numpy() for key in tap_keys}
+        batch_size_actual = next(iter(batch_arrays.values())).shape[0]
 
         for batch_idx in range(batch_size_actual):
             label = _sample_label(dataset, sample_offset + batch_idx)
             per_label[label].append(
                 EmbeddingSample(
-                    pre_pool2=pre_pool2[batch_idx],
-                    classifier_input=classifier_input[batch_idx],
+                    vectors={key: batch_arrays[key][batch_idx] for key in tap_keys},
                     label=label,
                     split=split_name,
                 )
@@ -1136,7 +1128,7 @@ def _stack_embeddings(
     samples: list[EmbeddingSample],
     tap: str,
 ) -> tuple[np.ndarray, list[str], list[str]]:
-    matrix = np.stack([getattr(sample, tap) for sample in samples], axis=0)
+    matrix = np.stack([sample.vectors[tap] for sample in samples], axis=0)
     labels = [sample.label for sample in samples]
     splits = [sample.split for sample in samples]
     return matrix, labels, splits
@@ -1229,6 +1221,7 @@ def _draw_umap_panel(
 def plot_embedding_umap(
     checkpoint_samples: list[tuple[str, list[EmbeddingSample]]],
     *,
+    embedding_taps: dict[str, str],
     output_path: Path,
     seed: int,
     n_neighbors: int,
@@ -1243,14 +1236,14 @@ def plot_embedding_umap(
     labels_present = sorted({sample.label for sample in all_samples})
     label_colors = dict(zip(labels_present, _per_label_colors(len(labels_present)), strict=True))
 
-    n_rows = len(checkpoint_samples) * len(EMBEDDING_TAPS)
+    n_rows = len(checkpoint_samples) * len(embedding_taps)
     fig, axes = plt.subplots(n_rows, 1, figsize=(7, 5 * n_rows))
     if n_rows == 1:
         axes = [axes]
 
     row_idx = 0
     for kind, samples in checkpoint_samples:
-        for tap_key, tap_title in EMBEDDING_TAPS.items():
+        for tap_key, tap_title in embedding_taps.items():
             title = f"{kind.upper()} — {tap_title}"
             _draw_umap_panel(
                 axes[row_idx],
@@ -1316,6 +1309,7 @@ def run_embedding_umap(
 
     checkpoint_samples: list[tuple[str, list[EmbeddingSample]]] = []
     seen_paths: set[Path] = set()
+    embedding_taps: dict[str, str] | None = None
     for kind in kinds:
         checkpoint_path = ckpt_paths[kind]
         resolved = checkpoint_path.resolve()
@@ -1324,6 +1318,8 @@ def run_embedding_umap(
         seen_paths.add(resolved)
 
         model, label_to_idx, _ = load_checkpoint(checkpoint_path, device)
+        if embedding_taps is None:
+            embedding_taps = get_embedding_taps(model)
         samples = collect_embedding_samples(
             model,
             splits,
@@ -1341,8 +1337,12 @@ def run_embedding_umap(
         )
         checkpoint_samples.append((kind, samples))
 
+    if embedding_taps is None:
+        return
+
     plot_embedding_umap(
         checkpoint_samples,
+        embedding_taps=embedding_taps,
         output_path=output_path,
         seed=seed,
         n_neighbors=n_neighbors,

@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+EMBEDDING_TAP_LABELS: dict[str, str] = {
+    "eeg": "EEG only",
+    "emg": "EMG only",
+    "fused": "Fused (pre-classifier)",
+}
 
 
 class ModalityBranch(nn.Module):
@@ -75,6 +83,8 @@ class IntermediateFusionEEGNet(nn.Module):
     temporal summaries and mixes EEG+EMG feature maps together.
     """
 
+    EMBEDDING_TAPS: ClassVar[dict[str, str]] = EMBEDDING_TAP_LABELS
+
     def __init__(
         self,
         n_eeg: int,
@@ -119,41 +129,43 @@ class IntermediateFusionEEGNet(nn.Module):
 
         self.classifier = nn.Linear(F2 * pool2_out, n_classes)
 
-    def forward(self, eeg: torch.Tensor, emg: torch.Tensor) -> torch.Tensor:
-        e = self.eeg_branch(eeg)   # (B, D*F1, 1, T)
-        m = self.emg_branch(emg)   # (B, D*F1, 1, T)
-
-        # align time length in case kernels/padding differ by a sample
-        t = min(e.shape[-1], m.shape[-1])
-        e, m = e[..., :t], m[..., :t]
-
-        x = torch.cat([e, m], dim=1)   # (B, 2*D*F1, 1, T) <-- intermediate fusion
-        x = self.drop1(self.pool1(x))
-
-        x = self.sep_point(self.sep_depth(x))
-        x = F.elu(self.bn3(x))
-        x = self.drop2(self.pool2(x))
-
-        x = torch.flatten(x, 1)
-        return self.classifier(x)
-
-    def forward_embeddings(self, eeg: torch.Tensor, emg: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Flattened fusion embeddings without dropout (use under model.eval())."""
+    def _encode_branches(
+        self, eeg: torch.Tensor, emg: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         e = self.eeg_branch(eeg)
         m = self.emg_branch(emg)
         t = min(e.shape[-1], m.shape[-1])
-        e, m = e[..., :t], m[..., :t]
+        return e[..., :t], m[..., :t]
 
+    def _fusion_embed(
+        self, e: torch.Tensor, m: torch.Tensor, *, apply_dropout: bool,
+    ) -> torch.Tensor:
         x = torch.cat([e, m], dim=1)
         x = self.pool1(x)
+        if apply_dropout:
+            x = self.drop1(x)
 
         x = self.sep_point(self.sep_depth(x))
-        pre_pool2 = F.elu(self.bn3(x))
-        post_pool2 = self.pool2(pre_pool2)
+        x = F.elu(self.bn3(x))
+        x = self.pool2(x)
+        if apply_dropout:
+            x = self.drop2(x)
+        return torch.flatten(x, start_dim=1)
 
+    def forward(self, eeg: torch.Tensor, emg: torch.Tensor) -> torch.Tensor:
+        e, m = self._encode_branches(eeg, emg)
+        fused = self._fusion_embed(e, m, apply_dropout=True)
+        return self.classifier(fused)
+
+    def forward_embeddings(self, eeg: torch.Tensor, emg: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Per-modality and fused embeddings without dropout (use under model.eval())."""
+        e, m = self._encode_branches(eeg, emg)
+        zero_e = torch.zeros_like(e)
+        zero_m = torch.zeros_like(m)
         return {
-            "pre_pool2": torch.flatten(pre_pool2, start_dim=1),
-            "classifier_input": torch.flatten(post_pool2, start_dim=1),
+            "eeg": self._fusion_embed(e, zero_m, apply_dropout=False),
+            "emg": self._fusion_embed(zero_e, m, apply_dropout=False),
+            "fused": self._fusion_embed(e, m, apply_dropout=False),
         }
 
 
@@ -239,6 +251,8 @@ class CATNet(nn.Module):
     bidirectional cross-attention fusion, and a tone classifier only.
     """
 
+    EMBEDDING_TAPS: ClassVar[dict[str, str]] = EMBEDDING_TAP_LABELS
+
     def __init__(
         self,
         n_eeg: int,
@@ -308,19 +322,24 @@ class CATNet(nn.Module):
         return self.classifier(fused)
 
     def forward_embeddings(self, eeg: torch.Tensor, emg: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Branch and fused embeddings without dropout (use under model.eval())."""
+        """Per-modality and fused embeddings without dropout (use under model.eval())."""
         z_eeg, z_emg = self._encode_pair(eeg, emg)
         f_eeg, f_emg, fused = self._cross_fuse(z_eeg, z_emg, apply_dropout=False)
-        return {
-            "pre_pool2": torch.cat([f_eeg, f_emg], dim=-1),
-            "classifier_input": fused,
-        }
+        return {"eeg": f_eeg, "emg": f_emg, "fused": fused}
 
 
 ARCHITECTURES: dict[str, type[nn.Module]] = {
     "intermediate_fusion_eegnet": IntermediateFusionEEGNet,
     "cat_net": CATNet,
 }
+
+
+def get_embedding_taps(model: nn.Module) -> dict[str, str]:
+    """Return ordered tap key -> plot title for a fusion model."""
+    taps = getattr(type(model), "EMBEDDING_TAPS", None)
+    if not taps:
+        raise TypeError(f"{type(model).__name__} does not define EMBEDDING_TAPS")
+    return dict(taps)
 
 
 def build_fusion_model(
@@ -356,9 +375,11 @@ __all__ = [
     "ARCHITECTURES",
     "CATNet",
     "ChannelAttention1d",
+    "EMBEDDING_TAP_LABELS",
     "IntermediateFusionEEGNet",
     "ModalityBranch",
     "ModalityEncoder",
     "TimeAvgPool",
     "build_fusion_model",
+    "get_embedding_taps",
 ]
