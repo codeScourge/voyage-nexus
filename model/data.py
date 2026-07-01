@@ -44,10 +44,7 @@ TARGET_WORDS: tuple[str, ...] = (
     "bullshit",
     "gogogo",
     "shitbull",
-    # "hangar",
-    # "teaspoon",
     "naan",
-    # "quail"
     "halloween",
     "glue",
 )

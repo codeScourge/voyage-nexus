@@ -66,16 +66,13 @@ DEFAULT_BAUD = 2_000_000
 DEFAULT_RECORDINGS_DIR = "recordings"
 ALIGNMENT_WINDOW_FRAMES = 512
 THINKING_COUNTDOWN_SECONDS = 3
-COLLECTION_WORDS = ("highlight", "bullshit", "gogogo", "shitbull", "hangar", "teaspoon", "naan", "quail")
+COLLECTION_WORDS = ("highlight", "bullshit", "gogogo", "shitbull", "naan", "halloween", "glue")
 COLLECTION_WORD_DEFAULT_WEIGHTS: dict[str, float] = {
     "highlight": 1.0,
     "bullshit": 1.0,
     "gogogo": 1.0,
     "shitbull": 1.0,
-    "hangar": 1.0,
-    "teaspoon": 1.0,
     "naan": 1.0,
-    "quail": 1.0,
     "halloween": 1.0,
     "glue": 1.0
 }
