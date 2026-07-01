@@ -27,6 +27,13 @@ SEED = 42
 TORCH_DETERMINISTIC = False
 RUN_DIR_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}")
 
+# --- modality selection (set True to drop an entire modality from training)
+NOT_USE_EEG = True
+NOT_USE_EMG = False
+
+if NOT_USE_EEG and NOT_USE_EMG:
+    raise ValueError("At least one of EEG or EMG must be enabled")
+
 # --- channel selection (set False to exclude from training)
 # EEG1 = 0
 # EEG2 = 1
@@ -104,13 +111,13 @@ _EMG_CHANNEL_USE = (
     EMG1, EMG2, EMG3, EMG4, EMG5, EMG6, EMG7, EMG8,
     EMG9, EMG10, EMG11, EMG12, EMG13, EMG14, EMG15, EMG16,
 )
-ACTIVE_EEG_INDICES = [i for i, use in enumerate(_EEG_CHANNEL_USE) if use]
-ACTIVE_EMG_INDICES = [16 + i for i, use in enumerate(_EMG_CHANNEL_USE) if use]
+ACTIVE_EEG_INDICES = [] if NOT_USE_EEG else [i for i, use in enumerate(_EEG_CHANNEL_USE) if use]
+ACTIVE_EMG_INDICES = [] if NOT_USE_EMG else [16 + i for i, use in enumerate(_EMG_CHANNEL_USE) if use]
 
-if not ACTIVE_EEG_INDICES:
-    raise ValueError("At least one EEG channel must be enabled")
-if not ACTIVE_EMG_INDICES:
-    raise ValueError("At least one EMG channel must be enabled")
+if not NOT_USE_EEG and not ACTIVE_EEG_INDICES:
+    raise ValueError("At least one EEG channel must be enabled when EEG is used")
+if not NOT_USE_EMG and not ACTIVE_EMG_INDICES:
+    raise ValueError("At least one EMG channel must be enabled when EMG is used")
 
 
 def seed_everything(seed: int = 0, deterministic: bool = True) -> None:
@@ -150,6 +157,17 @@ EARLY_STOPPING_SMOOTH_WINDOW = 4
 MODEL_ARCHITECTURE = "intermediate_fusion_eegnet"  # or "cat_net"
 
 
+# Dummy width for a disabled modality branch (models require n_channels >= 1).
+DISABLED_MODALITY_CHANNELS = 1
+
+
+def _modality_input(x: torch.Tensor, indices: list[int], *, disabled: bool) -> torch.Tensor:
+    """Return (1, C, T) for one modality; zeros when the modality is disabled."""
+    if disabled:
+        return torch.zeros(1, DISABLED_MODALITY_CHANNELS, x.shape[0], dtype=x.dtype)
+    return x[:, indices].T.unsqueeze(0)
+
+
 # --- dataset adapter
 class FusionDataset(torch.utils.data.Dataset):
     """Wraps the split so __getitem__ returns (eeg, emg, label) batched-ready."""
@@ -167,8 +185,8 @@ class FusionDataset(torch.utils.data.Dataset):
         x = sample["x"]
         x = (x - x.mean(dim=0, keepdim=True)) / (x.std(dim=0, keepdim=True) + 1e-6)
 
-        eeg = x[:, ACTIVE_EEG_INDICES].T.unsqueeze(0)  # (1, C_eeg, T)
-        emg = x[:, ACTIVE_EMG_INDICES].T.unsqueeze(0)  # (1, C_emg, T)
+        eeg = _modality_input(x, ACTIVE_EEG_INDICES, disabled=NOT_USE_EEG)
+        emg = _modality_input(x, ACTIVE_EMG_INDICES, disabled=NOT_USE_EMG)
         y_soft = torch.from_numpy(
             label_probs_to_vector(
                 sample.get("label_probs"),
@@ -190,15 +208,16 @@ def build_label_map(base_dataset, indices) -> dict:
 
 
 # --- train
-def construct_model(splits):
+def construct_model(splits, architecture: str = MODEL_ARCHITECTURE):
     label_to_idx = build_label_map(splits.dataset, splits.train.indices)
     n_classes = len(label_to_idx)
     print(f"classes ({n_classes}): {', '.join(label_to_idx)}")
 
     # infer shapes from one sample
     eeg0, emg0, _, _ = FusionDataset(splits.dataset, splits.train.indices, label_to_idx)[0]
-    n_eeg, T = eeg0.shape[1], eeg0.shape[2]
-    n_emg = emg0.shape[1]
+    n_eeg = DISABLED_MODALITY_CHANNELS if NOT_USE_EEG else eeg0.shape[1]
+    n_emg = DISABLED_MODALITY_CHANNELS if NOT_USE_EMG else emg0.shape[1]
+    T = eeg0.shape[2]
 
     print("\n\n")
     print("--- example sample ---")
@@ -209,7 +228,7 @@ def construct_model(splits):
     print("\n\n")
 
     model = build_fusion_model(
-        MODEL_ARCHITECTURE,
+        architecture,
         n_eeg=n_eeg,
         n_emg=n_emg,
         n_classes=n_classes,
@@ -217,13 +236,15 @@ def construct_model(splits):
     ).to(device)
 
     return model, label_to_idx, {
-        "architecture": MODEL_ARCHITECTURE,
+        "architecture": architecture,
         "n_eeg": n_eeg,
         "n_emg": n_emg,
         "n_classes": n_classes,
         "T": T,
         "active_eeg_indices": ACTIVE_EEG_INDICES,
         "active_emg_indices": ACTIVE_EMG_INDICES,
+        "not_use_eeg": NOT_USE_EEG,
+        "not_use_emg": NOT_USE_EMG,
     }
 
 def new_run_dir_name(now: datetime | None = None) -> str:
@@ -870,6 +891,75 @@ def train(
     return model, history, run_dir
 
 
+def run_training(
+    *,
+    architecture: str = MODEL_ARCHITECTURE,
+    splits,
+    run_dir: Path | None = None,
+    continue_from: Path | None = None,
+    seed: int = SEED,
+    deterministic: bool = TORCH_DETERMINISTIC,
+    train_kwargs: dict | None = None,
+) -> dict:
+    """Train one model on the given splits; return model, history, and run metadata."""
+    seed_everything(seed, deterministic)
+    continued_from: dict | None = None
+    kwargs = dict(train_kwargs or {})
+
+    if continue_from is not None:
+        ckpt_path = Path(continue_from)
+        model, label_to_idx, model_config, continued_from = load_training_checkpoint(ckpt_path)
+        if run_dir is None:
+            run_dir = create_run_dir(continued=True)
+        print(f"continuing from {ckpt_path}")
+        print(
+            f"  source run: {continued_from['source_run_dir']} "
+            f"(epoch {continued_from['source_epoch']}, "
+            f"val_acc={continued_from['source_val_acc']:.4f}, "
+            f"kind={continued_from['source_kind']})"
+        )
+    else:
+        if run_dir is None:
+            run_dir = create_run_dir()
+        else:
+            run_dir = Path(run_dir)
+            run_dir.mkdir(parents=True, exist_ok=False)
+        model, label_to_idx, model_config = construct_model(splits, architecture=architecture)
+
+    print(f"window T={model_config['T']} samples, classes={model_config['n_classes']}")
+    print("\n\n")
+    print(f"starting training on device {device} at {run_dir}")
+    print("\n")
+
+    model, history, run_dir = train(
+        model,
+        splits,
+        label_to_idx,
+        model_config,
+        run_dir=run_dir,
+        continued_from=continued_from,
+        **kwargs,
+    )
+
+    best_epoch = 0
+    best_val_acc = 0.0
+    if history["val_acc"]:
+        best_val_acc = max(history["val_acc"])
+        best_epoch = history["val_acc"].index(best_val_acc) + 1
+
+    return {
+        "model": model,
+        "history": history,
+        "run_dir": run_dir,
+        "label_to_idx": label_to_idx,
+        "model_config": model_config,
+        "architecture": architecture,
+        "best_val_acc": best_val_acc,
+        "best_epoch": best_epoch,
+        "continued_from": continued_from,
+    }
+
+
 # --- main
 
 if __name__ == "__main__":
@@ -887,45 +977,22 @@ if __name__ == "__main__":
         help="Load the latest checkpoint and train in a new -continued run folder",
     )
     args = parser.parse_args()
-    MODEL_ARCHITECTURE = args.model
 
     SPLITS_DIR = Path(__file__).resolve().parent / "splits"
-    seed_everything(SEED, TORCH_DETERMINISTIC)
     splits = load_dataset_splits(SPLITS_DIR)
 
-    continued_from: dict | None = None
+    continue_from: Path | None = None
     if args.continue_training:
         source_run = latest_run_dir()
         if source_run is None:
             raise SystemExit("No checkpoint runs found under model/checkpoints; train from scratch first.")
-        ckpt_path = latest_checkpoint_in_run(source_run)
-        model, label_to_idx, model_config, continued_from = load_training_checkpoint(ckpt_path)
-        run_dir = create_run_dir(continued=True)
-        print(f"continuing from {ckpt_path}")
-        print(
-            f"  source run: {continued_from['source_run_dir']} "
-            f"(epoch {continued_from['source_epoch']}, "
-            f"val_acc={continued_from['source_val_acc']:.4f}, "
-            f"kind={continued_from['source_kind']})"
-        )
-    else:
-        run_dir = create_run_dir()
-        model, label_to_idx, model_config = construct_model(splits)
+        continue_from = latest_checkpoint_in_run(source_run)
 
-    print(f"window T={model_config['T']} samples, classes={model_config['n_classes']}")
-
-    print("\n\n")
-    print(f"starting training on device {device} at {run_dir}")
-    print("\n")
-
-    model, history, run_dir = train(
-        model,
-        splits,
-        label_to_idx,
-        model_config,
-        run_dir=run_dir,
-        continued_from=continued_from,
+    result = run_training(
+        architecture=args.model,
+        splits=splits,
+        continue_from=continue_from,
     )
 
     print("\n")
-    print(f"artifacts saved under {run_dir}")
+    print(f"artifacts saved under {result['run_dir']}")

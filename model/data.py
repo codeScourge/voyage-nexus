@@ -37,6 +37,10 @@ INCLUDE_SILENCE_FROM_OCCASIONAL_WORD = False
 INCLUDE_TRANSITIONS_FROM_BREAKS = True
 INCLUDE_TRANSITIONS_FROM_OCCASIONAL_WORD = False
 
+# When True, transition windows use silence (not word starting/ending) as the
+# non-word label, with the same soft word mass near the boundary.
+MERGE_TRANSITIONS_INTO_SILENCE = True
+
 
 
 TARGET_WORDS: tuple[str, ...] = (
@@ -45,8 +49,8 @@ TARGET_WORDS: tuple[str, ...] = (
     "gogogo",
     "shitbull",
     "naan",
-    "halloween",
-    "glue",
+    # "halloween",
+    # "glue",
 )
 
 # how it goes in - CHANGE HERE
@@ -110,19 +114,29 @@ def _validate_label_source_config() -> None:
 _validate_label_source_config()
 
 
+def _transitions_in_label_space() -> bool:
+    return INCLUDE_TRANSITIONS_FROM_BREAKS or INCLUDE_TRANSITIONS_FROM_OCCASIONAL_WORD
+
+
+def _silence_in_label_space() -> bool:
+    if INCLUDE_SILENCE_FROM_BREAKS or INCLUDE_SILENCE_FROM_OCCASIONAL_WORD:
+        return True
+    return MERGE_TRANSITIONS_INTO_SILENCE and _transitions_in_label_space()
+
+
 def all_labels() -> tuple[str, ...]:
     labels: list[str] = list(TARGET_WORDS)
-    if INCLUDE_TRANSITIONS_FROM_BREAKS or INCLUDE_TRANSITIONS_FROM_OCCASIONAL_WORD:
+    if _transitions_in_label_space() and not MERGE_TRANSITIONS_INTO_SILENCE:
         labels.extend([WORD_STARTING_LABEL, WORD_ENDING_LABEL])
     if INCLUDE_UNKNOWN_WORD_LABEL:
         labels.append(UNKNOWN_WORD_LABEL)
-    if INCLUDE_SILENCE_FROM_BREAKS or INCLUDE_SILENCE_FROM_OCCASIONAL_WORD:
+    if _silence_in_label_space():
         labels.append(SILENCE_LABEL)
     return tuple(labels)
 
 def default_label_max_fractions(fraction: float = 0.20) -> dict[str, float]:
     return {label: fraction for label in all_labels()}
-LABEL_MAX_FRACTIONS = default_label_max_fractions(0.22)
+LABEL_MAX_FRACTIONS = default_label_max_fractions(0.25)
 
 def _block_id_from_event_id(event_id: str) -> str:
     if event_id.startswith("silence:"):
@@ -594,8 +608,9 @@ def _transition_shift_label_probs(
     """Soft label distribution for a transition-centered window.
 
     Below TRANSITION_PURE_PHASE_FRAC in both phases, all mass stays on the
-    transition label. Above that threshold, silence/word mass ramps linearly
-    to 1.0 at a pure phase window.
+    transition label (or silence when MERGE_TRANSITIONS_INTO_SILENCE). Above
+    that threshold, silence/word mass ramps linearly to 1.0 at a pure phase
+    window.
     """
     threshold = TRANSITION_PURE_PHASE_FRAC
     ramp_span = max(1.0 - threshold, 1e-9)
@@ -605,15 +620,22 @@ def _transition_shift_label_probs(
     transition_label = WORD_STARTING_LABEL if kind == "silence_to_word" else WORD_ENDING_LABEL
 
     probs: dict[str, float] = {}
-    if include_silence_label and p_silence > 0.0:
-        probs[SILENCE_LABEL] = p_silence
+    if MERGE_TRANSITIONS_INTO_SILENCE:
+        p_silence_merged = p_silence + p_transition
+        if p_silence_merged > 0.0:
+            probs[SILENCE_LABEL] = p_silence_merged
+    else:
+        if include_silence_label and p_silence > 0.0:
+            probs[SILENCE_LABEL] = p_silence
+        if p_transition > 0.0:
+            probs[transition_label] = p_transition
     if p_word > 0.0 and (INCLUDE_UNKNOWN_WORD_LABEL or word != UNKNOWN_WORD_LABEL):
         probs[word] = p_word
-    if p_transition > 0.0:
-        probs[transition_label] = p_transition
 
     total = sum(probs.values())
     if total <= 0.0:
+        if MERGE_TRANSITIONS_INTO_SILENCE:
+            return {SILENCE_LABEL: 1.0}
         return {transition_label: 1.0}
     return {label: weight / total for label, weight in probs.items()}
 

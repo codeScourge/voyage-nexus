@@ -71,10 +71,10 @@ COLLECTION_WORD_DEFAULT_WEIGHTS: dict[str, float] = {
     "highlight": 1.0,
     "bullshit": 1.0,
     "gogogo": 1.0,
-    "shitbull": 1.0,
-    "naan": 1.0,
-    "halloween": 1.0,
-    "glue": 1.0
+    "shitbull": 0.0,
+    "naan": 0.0,
+    # "halloween": 1.0,
+    # "glue": 1.0
 }
 COLLECTION_REPETITIONS = 7
 WORD_WEIGHT_MIN = 0.0
