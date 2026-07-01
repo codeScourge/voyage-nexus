@@ -32,10 +32,10 @@ from _preprocessors import (
 INCLUDE_UNKNOWN_WORD_LABEL = False
 
 INCLUDE_SILENCE_FROM_BREAKS = True
-INCLUDE_SILENCE_FROM_NEGATIVE = False
+INCLUDE_SILENCE_FROM_OCCASIONAL_WORD = False
 
 INCLUDE_TRANSITIONS_FROM_BREAKS = True
-INCLUDE_TRANSITIONS_FROM_NEGATIVE = False
+INCLUDE_TRANSITIONS_FROM_OCCASIONAL_WORD = False
 
 
 
@@ -48,6 +48,8 @@ TARGET_WORDS: tuple[str, ...] = (
     # "teaspoon",
     "naan",
     # "quail"
+    "halloween",
+    "glue",
 )
 
 # how it goes in - CHANGE HERE
@@ -102,9 +104,9 @@ def _validate_label_source_config() -> None:
         raise ValueError(
             "INCLUDE_TRANSITIONS_FROM_BREAKS requires INCLUDE_SILENCE_FROM_BREAKS"
         )
-    if INCLUDE_TRANSITIONS_FROM_NEGATIVE and not INCLUDE_SILENCE_FROM_NEGATIVE:
+    if INCLUDE_TRANSITIONS_FROM_OCCASIONAL_WORD and not INCLUDE_SILENCE_FROM_OCCASIONAL_WORD:
         raise ValueError(
-            "INCLUDE_TRANSITIONS_FROM_NEGATIVE requires INCLUDE_SILENCE_FROM_NEGATIVE"
+            "INCLUDE_TRANSITIONS_FROM_OCCASIONAL_WORD requires INCLUDE_SILENCE_FROM_OCCASIONAL_WORD"
         )
 
 
@@ -113,11 +115,11 @@ _validate_label_source_config()
 
 def all_labels() -> tuple[str, ...]:
     labels: list[str] = list(TARGET_WORDS)
-    if INCLUDE_TRANSITIONS_FROM_BREAKS or INCLUDE_TRANSITIONS_FROM_NEGATIVE:
+    if INCLUDE_TRANSITIONS_FROM_BREAKS or INCLUDE_TRANSITIONS_FROM_OCCASIONAL_WORD:
         labels.extend([WORD_STARTING_LABEL, WORD_ENDING_LABEL])
     if INCLUDE_UNKNOWN_WORD_LABEL:
         labels.append(UNKNOWN_WORD_LABEL)
-    if INCLUDE_SILENCE_FROM_BREAKS or INCLUDE_SILENCE_FROM_NEGATIVE:
+    if INCLUDE_SILENCE_FROM_BREAKS or INCLUDE_SILENCE_FROM_OCCASIONAL_WORD:
         labels.append(SILENCE_LABEL)
     return tuple(labels)
 
@@ -140,13 +142,19 @@ def _payload_block_id(payload: dict[str, Any]) -> str:
 
 ALL_LABELS: tuple[str, ...] = all_labels()
 SILENT_SPEECH_WORD_EVENT = "silent_speech_word"
-NEGATIVE_LABELS_BLOCK_START_EVENT = "silent_speech_block_start"
-NEGATIVE_LABELS_BLOCK_END_EVENT = "silent_speech_block_end"
+OCCASIONAL_WORD_MODE = "occasional_word"
+LEGACY_OCCASIONAL_WORD_MODE = "negative_labels"
+OCCASIONAL_WORD_BLOCK_START_EVENT = "silent_speech_block_start"
+OCCASIONAL_WORD_BLOCK_END_EVENT = "silent_speech_block_end"
 SCRAMBLE_BREAKS_TRANSITION_EVENT = "scramble_breaks_transition"
-NEGATIVE_LABELS_TRANSITION_EVENT = "negative_labels_transition"
+OCCASIONAL_WORD_TRANSITION_EVENT = "negative_labels_transition"
 TRANSITION_EVENT_TYPES = frozenset(
-    {SCRAMBLE_BREAKS_TRANSITION_EVENT, NEGATIVE_LABELS_TRANSITION_EVENT}
+    {SCRAMBLE_BREAKS_TRANSITION_EVENT, OCCASIONAL_WORD_TRANSITION_EVENT}
 )
+
+
+def _is_occasional_word_mode(mode: Any) -> bool:
+    return mode in (OCCASIONAL_WORD_MODE, LEGACY_OCCASIONAL_WORD_MODE)
 
 EEG_RECORD_DTYPE = np.dtype(
     [
@@ -359,7 +367,7 @@ def _extract_channel_window(
     return window
 
 
-def _negative_labels_blocks(events: Sequence[dict[str, str]]) -> list[dict[str, Any]]:
+def _occasional_word_blocks(events: Sequence[dict[str, str]]) -> list[dict[str, Any]]:
     pending: dict[str, int] = {}
     blocks: list[dict[str, Any]] = []
     for event in events:
@@ -372,14 +380,14 @@ def _negative_labels_blocks(events: Sequence[dict[str, str]]) -> list[dict[str, 
         if not start_text:
             continue
         if (
-            event_type == NEGATIVE_LABELS_BLOCK_START_EVENT
-            and payload.get("mode") == "negative_labels"
+            event_type == OCCASIONAL_WORD_BLOCK_START_EVENT
+            and _is_occasional_word_mode(payload.get("mode"))
         ):
             pending[block_id] = int(start_text)
             continue
         if (
-            event_type == NEGATIVE_LABELS_BLOCK_END_EVENT
-            and payload.get("mode") == "negative_labels"
+            event_type == OCCASIONAL_WORD_BLOCK_END_EVENT
+            and _is_occasional_word_mode(payload.get("mode"))
         ):
             block_start = pending.pop(block_id, None)
             if block_start is None:
@@ -397,7 +405,7 @@ def _negative_labels_blocks(events: Sequence[dict[str, str]]) -> list[dict[str, 
     return blocks
 
 
-def _negative_labels_word_spans(
+def _occasional_word_word_spans(
     events: Sequence[dict[str, str]],
     block_id: str,
     *,
@@ -432,7 +440,7 @@ def _negative_labels_word_spans(
     return spans
 
 
-def _negative_labels_word_spans_labeled(
+def _occasional_word_word_spans_labeled(
     events: Sequence[dict[str, str]],
     block_id: str,
     *,
@@ -470,7 +478,7 @@ def _negative_labels_word_spans_labeled(
     return spans
 
 
-def _negative_labels_silence_spans(
+def _occasional_word_silence_spans(
     block_start_idx: int,
     block_end_idx: int,
     word_spans: Sequence[tuple[int, int]],
@@ -503,16 +511,16 @@ def _append_silence_windows(
     center_samples: list[int],
     skipped: int,
 ) -> int:
-    for block in _negative_labels_blocks(events):
+    for block in _occasional_word_blocks(events):
         block_id = str(block["block_id"])
-        word_spans_labeled = _negative_labels_word_spans_labeled(
+        word_spans_labeled = _occasional_word_word_spans_labeled(
             events,
             block_id,
             fs=fs,
             index_to_row=index_to_row,
         )
         span_pairs = [(start_idx, end_idx) for start_idx, end_idx, _word in word_spans_labeled]
-        for gap_start, gap_end in _negative_labels_silence_spans(
+        for gap_start, gap_end in _occasional_word_silence_spans(
             int(block["start_idx"]),
             int(block["end_idx"]),
             span_pairs,
@@ -543,7 +551,7 @@ def _append_silence_windows(
             raw_windows.append(window)
             labels.append(SILENCE_LABEL)
             label_probs.append(None)
-            event_type_list.append("negative_labels_silence")
+            event_type_list.append("occasional_word_silence")
             event_ids.append(
                 f"silence:{block_id}:{gap_start}-{gap_end}:words={before_word}|{after_word}"
             )
@@ -681,7 +689,7 @@ def _sample_word_fraction(event_type: str, event_id: str) -> float:
             kind=_kind,
         )
         return word_frac
-    if event_type == NEGATIVE_LABELS_TRANSITION_EVENT:
+    if event_type == OCCASIONAL_WORD_TRANSITION_EVENT:
         parsed = _parse_scramble_breaks_transition_event_id(event_id)
         if parsed is None:
             return 0.0
@@ -696,7 +704,7 @@ def _sample_word_fraction(event_type: str, event_id: str) -> float:
 
 
 def _sample_silence_fraction(event_type: str, event_id: str) -> float:
-    if event_type in {"scramble_breaks_silence", "negative_labels_silence"}:
+    if event_type in {"scramble_breaks_silence", "occasional_word_silence", "negative_labels_silence"}:
         return 1.0
     if event_type == SILENT_SPEECH_WORD_EVENT:
         return 0.0
@@ -764,8 +772,8 @@ def _label_max_prob(
 def _transition_event_include_silence(event_type: str) -> bool:
     if event_type == SCRAMBLE_BREAKS_TRANSITION_EVENT:
         return INCLUDE_SILENCE_FROM_BREAKS
-    if event_type == NEGATIVE_LABELS_TRANSITION_EVENT:
-        return INCLUDE_SILENCE_FROM_NEGATIVE
+    if event_type == OCCASIONAL_WORD_TRANSITION_EVENT:
+        return INCLUDE_SILENCE_FROM_OCCASIONAL_WORD
     return False
 
 
@@ -840,7 +848,7 @@ def _scramble_breaks_blocks(events: Sequence[dict[str, str]]) -> list[dict[str, 
             pending[block_id] = int(start_text)
             continue
         if (
-            event_type == NEGATIVE_LABELS_BLOCK_END_EVENT
+            event_type == OCCASIONAL_WORD_BLOCK_END_EVENT
             and payload.get("mode") == SCRAMBLE_BREAKS_MODE
         ):
             block_start = pending.pop(block_id, None)
@@ -1055,7 +1063,7 @@ def _append_scramble_breaks_transition_windows(
     )
 
 
-def _append_negative_labels_transition_windows(
+def _append_occasional_word_transition_windows(
     *,
     channels: np.ndarray,
     events: Sequence[dict[str, str]],
@@ -1072,8 +1080,8 @@ def _append_negative_labels_transition_windows(
     center_samples: list[int],
 ) -> int:
     return _append_block_transition_windows(
-        blocks=_negative_labels_blocks(events),
-        word_spans_for_block=lambda block_id: _negative_labels_word_spans_labeled(
+        blocks=_occasional_word_blocks(events),
+        word_spans_for_block=lambda block_id: _occasional_word_word_spans_labeled(
             events,
             block_id,
             fs=fs,
@@ -1091,8 +1099,8 @@ def _append_negative_labels_transition_windows(
         event_ids=event_ids,
         collection_block_ids=collection_block_ids,
         center_samples=center_samples,
-        event_type=NEGATIVE_LABELS_TRANSITION_EVENT,
-        include_silence_label=INCLUDE_SILENCE_FROM_NEGATIVE,
+        event_type=OCCASIONAL_WORD_TRANSITION_EVENT,
+        include_silence_label=INCLUDE_SILENCE_FROM_OCCASIONAL_WORD,
     )
 
 
@@ -1122,7 +1130,7 @@ def _append_scramble_breaks_silence_windows(
             index_to_row=index_to_row,
         )
         span_pairs = [(start_idx, end_idx) for start_idx, end_idx, _word in word_spans]
-        for gap_start, gap_end in _negative_labels_silence_spans(
+        for gap_start, gap_end in _occasional_word_silence_spans(
             int(block["start_idx"]),
             int(block["end_idx"]),
             span_pairs,
@@ -1293,7 +1301,7 @@ def build_event_windows(
         mode = payload.get("mode")
         if mode == SCRAMBLE_BREAKS_MODE and INCLUDE_TRANSITIONS_FROM_BREAKS:
             continue
-        if mode == "negative_labels" and INCLUDE_TRANSITIONS_FROM_NEGATIVE:
+        if _is_occasional_word_mode(mode) and INCLUDE_TRANSITIONS_FROM_OCCASIONAL_WORD:
             continue
 
         label = normalize_word_label(event.get("label_text", ""))
@@ -1374,8 +1382,8 @@ def build_event_windows(
             center_samples=center_samples,
         )
 
-    if INCLUDE_TRANSITIONS_FROM_NEGATIVE:
-        skipped += _append_negative_labels_transition_windows(
+    if INCLUDE_TRANSITIONS_FROM_OCCASIONAL_WORD:
+        skipped += _append_occasional_word_transition_windows(
             channels=channels,
             events=events,
             index_to_row=index_to_row,
@@ -1390,7 +1398,7 @@ def build_event_windows(
             collection_block_ids=collection_block_ids,
             center_samples=center_samples,
         )
-    elif INCLUDE_SILENCE_FROM_NEGATIVE:
+    elif INCLUDE_SILENCE_FROM_OCCASIONAL_WORD:
         skipped = _append_silence_windows(
             channels=channels,
             events=events,

@@ -40,7 +40,9 @@ const els = {
   wordButtons: document.getElementById("word-buttons"),
   wordWeightSliders: document.getElementById("word-weight-sliders"),
   wordWeightWarning: document.getElementById("word-weight-warning"),
-  negativeLabelMixSliders: document.getElementById("negative-label-mix-sliders"),
+  negativeWordRate: document.getElementById("negative-word-rate"),
+  negativeWordRateVal: document.getElementById("negative-word-rate-val"),
+  occasionalWordMixSliders: document.getElementById("occasional-word-mix-sliders"),
   collectPrompt: document.getElementById("collect-prompt"),
   collectPromptWord: document.getElementById("collect-prompt-word"),
   collectPromptMain: document.getElementById("collect-prompt-main"),
@@ -54,7 +56,7 @@ const els = {
   scrambleRep: document.getElementById("scramble-rep"),
   scrambleSetVal: document.getElementById("scramble-set-val"),
   scrambleRepVal: document.getElementById("scramble-rep-val"),
-  negativeLabelsBtn: document.getElementById("btn-negative-labels"),
+  occasionalWordBtn: document.getElementById("btn-occasional-word"),
   wordSwitchFlash: document.getElementById("word-switch-flash"),
   alignmentBtn: document.getElementById("btn-alignment-test"),
   alignmentDismiss: document.getElementById("btn-alignment-dismiss"),
@@ -629,6 +631,7 @@ function ensureWordButtons(words) {
 
 let wordWeightPostTimer = null;
 let negMixPostTimer = null;
+let negativeWordRatePostTimer = null;
 
 function formatDistributionWeight(value) {
   return Number(value).toFixed(2);
@@ -756,9 +759,42 @@ function queueWordWeightPost() {
 
 async function postNegMixWeight(key, weight) {
   try {
-    await post("/collect/negative-label-mix", { weights: { [key]: Number(weight) } });
+    await post("/collect/occasional-word-mix", { weights: { [key]: Number(weight) } });
   } catch (err) {
     showToast(err.message, true);
+  }
+}
+
+async function postNegativeWordRate(rate) {
+  try {
+    await post("/collect/negative-word-rate", { rate: Number(rate) });
+  } catch (err) {
+    showToast(err.message, true);
+  }
+}
+
+function queueNegativeWordRatePost(rate) {
+  if (negativeWordRatePostTimer) window.clearTimeout(negativeWordRatePostTimer);
+  negativeWordRatePostTimer = window.setTimeout(() => {
+    negativeWordRatePostTimer = null;
+    postNegativeWordRate(rate);
+  }, 120);
+}
+
+function syncNegativeWordRateSlider(collect = {}) {
+  if (!els.negativeWordRate) return;
+  const min = collect.word_weight_min ?? 0;
+  const max = collect.word_weight_max ?? 1;
+  const step = collect.word_weight_step ?? 0.05;
+  els.negativeWordRate.min = String(min);
+  els.negativeWordRate.max = String(max);
+  els.negativeWordRate.step = String(step);
+  if (!els.negativeWordRate.dataset.touched) {
+    const rate = collect.negative_word_rate ?? collect.default_negative_word_rate ?? 0;
+    els.negativeWordRate.value = String(rate);
+  }
+  if (els.negativeWordRateVal) {
+    els.negativeWordRateVal.textContent = formatDistributionWeight(els.negativeWordRate.value);
   }
 }
 
@@ -866,20 +902,20 @@ function ensureWordWeightSliders(collect = {}) {
   });
 }
 
-function ensureNegativeLabelMixSliders(collect = {}) {
-  const keys = collect.neg_mix_keys || ["still", "negative_word", "positive_word"];
-  const labels = collect.neg_mix_labels || {};
+function ensureOccasionalWordMixSliders(collect = {}) {
+  const keys = collect.occ_mix_keys || ["still", "collection_word"];
+  const labels = collect.occ_mix_labels || {};
   buildDistributionSliders({
-    container: els.negativeLabelMixSliders,
+    container: els.occasionalWordMixSliders,
     builtKey: keys.join(","),
     items: keys.map((key) => ({
       key,
       label: labels[key] || key,
-      idPrefix: "neg-mix",
+      idPrefix: "occ-mix",
     })),
     collect,
-    weightsKey: "neg_mix_weights",
-    defaultsKey: "default_neg_mix_weights",
+    weightsKey: "occ_mix_weights",
+    defaultsKey: "default_occ_mix_weights",
     inputDatasetKey: "mixKey",
     onInput: queueNegMixWeightPost,
   });
@@ -950,32 +986,34 @@ function updateCollectUi(status) {
   syncScrambleSliderLabels(collect);
   ensureWordButtons(collect.words || []);
   ensureWordWeightSliders(collect);
-  ensureNegativeLabelMixSliders(collect);
+  ensureOccasionalWordMixSliders(collect);
+  syncNegativeWordRateSlider(collect);
   syncWordWeightControls(collect);
 
   const picking = recording && phase === "pick_word";
   const busy = phase === "countdown" || phase === "say" || phase === "still";
-  const negativeLabels = mode === "negative_labels";
+  const occasionalWord = mode === "occasional_word";
   const scrambleActive = busy && (mode === "scramble" || mode === "scramble-breaks");
   const scrambleStopPending = !!collect.scramble_stop_pending;
   const mixSummary = normalizedMixSummary(
-    collect.neg_mix_weights || collect.default_neg_mix_weights,
-    collect.neg_mix_labels,
+    collect.occ_mix_weights || collect.default_occ_mix_weights,
+    collect.occ_mix_labels,
   );
+  const offList = !!collect.word_is_off_list;
 
   els.collectPanel.classList.toggle("hidden", !recording);
   const beforeS = collect.before_s ?? 1;
   const betweenS = collect.between_s ?? 0.4;
   const wordSwitchS = collect.word_switch_s ?? beforeS + 0.3;
   const sayS = collect.say_s ?? 1.6;
-  els.collectHint.textContent = negativeLabels && busy
-    ? `Negative labels running — target mix: ${mixSummary} — click Stop Negative Labels when finished`
+  els.collectHint.textContent = occasionalWord && busy
+    ? `Occasional word running — target mix: ${mixSummary} — click Stop Occasional Word when finished`
     : scrambleActive && scrambleStopPending
       ? `Scramble stopping after the current rep finishes — ${mode === "scramble-breaks" ? "Breaks" : "Fast"}`
       : scrambleActive
         ? `Scramble running — click Stop Next Chance to finish the current rep and stop`
         : picking
-      ? `Choose a word, tune distributions below, then Scramble or Negative Labels — Fast: ${beforeS}s / ${betweenS}s / ${wordSwitchS}s gaps; Breaks: ${sayS}s between reps`
+      ? `Choose a word, tune distributions below, then Scramble or Occasional Word — Fast: ${beforeS}s / ${betweenS}s / ${wordSwitchS}s gaps; Breaks: ${sayS}s between reps`
       : "Recording active — finish current collection to pick another";
 
   els.wordButtons.querySelectorAll(".word-btn").forEach((btn) => {
@@ -991,11 +1029,12 @@ function updateCollectUi(status) {
   if (els.scrambleSet) els.scrambleSet.disabled = !picking;
   if (els.scrambleRep) els.scrambleRep.disabled = !picking;
   setDistributionSlidersDisabled(els.wordWeightSliders, !picking);
-  setDistributionSlidersDisabled(els.negativeLabelMixSliders, !picking);
-  if (els.negativeLabelsBtn) {
-    els.negativeLabelsBtn.disabled = !recording || (!picking && !negativeLabels);
-    els.negativeLabelsBtn.textContent = negativeLabels && busy ? "Stop Negative Labels" : "Negative Labels";
-    els.negativeLabelsBtn.classList.toggle("active", negativeLabels && busy);
+  setDistributionSlidersDisabled(els.occasionalWordMixSliders, !picking);
+  if (els.negativeWordRate) els.negativeWordRate.disabled = !picking;
+  if (els.occasionalWordBtn) {
+    els.occasionalWordBtn.disabled = !recording || (!picking && !occasionalWord);
+    els.occasionalWordBtn.textContent = occasionalWord && busy ? "Stop Occasional Word" : "Occasional Word";
+    els.occasionalWordBtn.classList.toggle("active", occasionalWord && busy);
   }
 
   els.collectPrompt.classList.toggle("hidden", !busy);
@@ -1009,13 +1048,12 @@ function updateCollectUi(status) {
     const setTotal = collect.sets_total ?? 1;
     const remaining = collect.phase_remaining_s ?? 0;
     const scramble = mode === "scramble" || mode === "scramble-breaks";
-    const negKind = collect.neg_segment_kind || "";
 
     if (phase === "still") {
       els.collectPromptWord.textContent = "Sit still";
       els.collectPromptMain.textContent = remaining.toFixed(1);
       els.collectPromptMain.classList.remove("say-it");
-      els.collectPromptSub.textContent = "Negative labels — no speech";
+      els.collectPromptSub.textContent = "Occasional word — no speech";
     } else {
       const trailingBreak = !!collect.trailing_break;
       els.collectPromptWord.textContent = wordSwitchCountdown
@@ -1032,16 +1070,20 @@ function updateCollectUi(status) {
           ? `${setPrefix}${remaining.toFixed(1)}s — new word`
           : trailingBreak
             ? `${setPrefix}final break — ${remaining.toFixed(1)}s`
-          : negativeLabels
-            ? `${negKind === "positive_word" ? "Target word" : "Off-list word"} — get ready`
+          : occasionalWord
+            ? `${offList ? "Off-list word" : "Target word"} — get ready`
+            : offList
+              ? "Off-list word — get ready"
             : scramble && rep === 1
               ? `${setPrefix}new word — get ready`
               : `${setPrefix}Rep ${rep}/${total} — get ready`;
       } else {
         els.collectPromptMain.textContent = "SAY IT";
         els.collectPromptMain.classList.add("say-it");
-        els.collectPromptSub.textContent = negativeLabels
-          ? `${negKind === "positive_word" ? "Target word" : "Off-list word"} — speak “${word}” now`
+        els.collectPromptSub.textContent = occasionalWord
+          ? `${offList ? "Off-list word" : "Target word"} — speak “${word}” now`
+          : offList
+            ? `Off-list word — speak “${word}” now`
           : scramble
             ? `${setPrefix}Rep ${rep}/${total} — speak “${word}” now`
             : `Repetition ${rep}/${total} — speak “${word}” now`;
@@ -1053,14 +1095,14 @@ function updateCollectUi(status) {
   if (!recording) {
     trialText = "Collection: not recording";
   } else if (phase === "pick_word") {
-    trialText = "Collection: choose a word, scramble fast/breaks, or negative labels";
-  } else if (negativeLabels) {
+    trialText = "Collection: choose a word, scramble fast/breaks, or occasional word";
+  } else if (occasionalWord) {
     if (phase === "still") {
-      trialText = "Negative labels: sit still";
+      trialText = "Occasional word: sit still";
     } else if (phase === "countdown") {
-      trialText = `Negative labels: “${collect.word}” — countdown`;
+      trialText = `Occasional word: “${collect.word}” — countdown`;
     } else if (phase === "say") {
-      trialText = `Negative labels: “${collect.word}” — say it`;
+      trialText = `Occasional word: “${collect.word}” — say it`;
     }
   } else if (mode === "scramble" || mode === "scramble-breaks") {
     const scrambleLabel = mode === "scramble-breaks" ? "Scramble Breaks" : "Scramble Fast";
@@ -1659,13 +1701,23 @@ if (els.scrambleStopBtn) {
   });
 }
 
-if (els.negativeLabelsBtn) {
-  els.negativeLabelsBtn.addEventListener("click", async () => {
+if (els.occasionalWordBtn) {
+  els.occasionalWordBtn.addEventListener("click", async () => {
     try {
-      await post("/collect/negative-labels/toggle");
+      await post("/collect/occasional-word/toggle");
     } catch (err) {
       showToast(err.message, true);
     }
+  });
+}
+
+if (els.negativeWordRate) {
+  els.negativeWordRate.addEventListener("input", () => {
+    els.negativeWordRate.dataset.touched = "1";
+    if (els.negativeWordRateVal) {
+      els.negativeWordRateVal.textContent = formatDistributionWeight(els.negativeWordRate.value);
+    }
+    queueNegativeWordRatePost(els.negativeWordRate.value);
   });
 }
 

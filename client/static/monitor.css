@@ -486,7 +486,7 @@ button.primary {
   background: #1a2238;
 }
 
-.negative-labels-column {
+.occasional-word-column {
   background: #182622;
 }
 
@@ -531,7 +531,7 @@ button.primary {
   background: #553a3a;
 }
 
-.negative-labels-btn {
+.occasional-word-btn {
   min-width: 8.5rem;
   font-weight: 700;
   background: #2f3f3a;
@@ -539,7 +539,7 @@ button.primary {
   margin-bottom: 0.55rem;
 }
 
-.negative-labels-btn.active {
+.occasional-word-btn.active {
   position: fixed;
   bottom: 1.5rem;
   left: 50%;
@@ -551,15 +551,15 @@ button.primary {
   pointer-events: auto;
 }
 
-.negative-labels-btn:hover:not(:disabled) {
+.occasional-word-btn:hover:not(:disabled) {
   background: #3a5548;
 }
 
-.negative-labels-column .distribution-slider input[type="range"] {
+.occasional-word-column .distribution-slider input[type="range"] {
   accent-color: #6fbf8f;
 }
 
-.negative-labels-column .distribution-slider {
+.occasional-word-column .distribution-slider {
   flex: 0 0 8.5rem;
 }
 

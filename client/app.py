@@ -71,27 +71,28 @@ COLLECTION_WORD_DEFAULT_WEIGHTS: dict[str, float] = {
     "highlight": 1.0,
     "bullshit": 1.0,
     "gogogo": 1.0,
-    "shitbull": 0.0,
-    "hangar": 0.0,
-    "teaspoon": 0.0,
-    "naan": 0.0,
-    "quail": 0.0
+    "shitbull": 1.0,
+    "hangar": 1.0,
+    "teaspoon": 1.0,
+    "naan": 1.0,
+    "quail": 1.0,
+    "halloween": 1.0,
+    "glue": 1.0
 }
 COLLECTION_REPETITIONS = 7
 WORD_WEIGHT_MIN = 0.0
 WORD_WEIGHT_MAX = 1.0
 WORD_WEIGHT_STEP = 0.05
 WORD_WEIGHT_MIN_ACTIVE = 2
-NEGATIVE_LABEL_MIX_DEFAULT_WEIGHTS: dict[str, float] = {
-    "still": 0.35,
-    "negative_word": 0.35,
-    "positive_word": 0.30,
+OCCASIONAL_WORD_MIX_DEFAULT_WEIGHTS: dict[str, float] = {
+    "still": 0.50,
+    "collection_word": 0.50,
 }
-NEGATIVE_LABEL_MIX_LABELS: dict[str, str] = {
+OCCASIONAL_WORD_MIX_LABELS: dict[str, str] = {
     "still": "silence",
-    "negative_word": "negative words",
-    "positive_word": "collection words",
+    "collection_word": "collection words",
 }
+DEFAULT_NEGATIVE_WORD_RATE = 0.0
 
 
 def default_collection_word_weights() -> dict[str, float]:
@@ -101,10 +102,10 @@ def default_collection_word_weights() -> dict[str, float]:
     }
 
 
-def default_negative_label_mix_weights() -> dict[str, float]:
+def default_occasional_word_mix_weights() -> dict[str, float]:
     return {
-        key: clamp_unit_weight(NEGATIVE_LABEL_MIX_DEFAULT_WEIGHTS.get(key, 0.0))
-        for key in NEGATIVE_LABEL_MIX_DEFAULT_WEIGHTS
+        key: clamp_unit_weight(OCCASIONAL_WORD_MIX_DEFAULT_WEIGHTS.get(key, 0.0))
+        for key in OCCASIONAL_WORD_MIX_DEFAULT_WEIGHTS
     }
 
 
@@ -137,10 +138,10 @@ SCRAMBLE_SET_MIN = 1
 SCRAMBLE_SET_MAX = 20
 SCRAMBLE_REP_MIN = 1
 SCRAMBLE_REP_MAX = 20
-NEGATIVE_LABELS_STILL_MIN_S = 1.0
-NEGATIVE_LABELS_STILL_MAX_S = 20.0
-NEGATIVE_LABEL_WORD_COUNT = 15
-NEGATIVE_LABEL_WORD_POOL = (
+OCCASIONAL_WORD_STILL_MIN_S = 1.0
+OCCASIONAL_WORD_STILL_MAX_S = 20.0
+OCCASIONAL_WORD_WORD_COUNT = 15
+OCCASIONAL_WORD_POOL = (
     "sidewalk",
     "umbrella",
     "keyboard",
@@ -729,14 +730,15 @@ class AcquisitionService:
         self._collect_countdown_word_switch = False
         self._collect_trailing_break = False
         self._collect_scramble_stop_after_rep = False
-        self._collect_neg_words: list[str] = []
-        self._collect_neg_segment_kind = ""
-        self._collect_neg_still_time_s = 0.0
-        self._collect_neg_negative_word_time_s = 0.0
-        self._collect_neg_positive_word_time_s = 0.0
-        self._collect_neg_segment_started_ns: Optional[int] = None
+        self._collect_occ_words: list[str] = []
+        self._collect_occ_segment_kind = ""
+        self._collect_occ_still_time_s = 0.0
+        self._collect_occ_collection_word_time_s = 0.0
+        self._collect_occ_segment_started_ns: Optional[int] = None
         self._collect_word_weights = default_collection_word_weights()
-        self._collect_neg_mix_weights = default_negative_label_mix_weights()
+        self._collect_occ_mix_weights = default_occasional_word_mix_weights()
+        self._collect_negative_word_rate = DEFAULT_NEGATIVE_WORD_RATE
+        self._collect_word_is_off_list = False
 
         self._align_test_phase = "idle"
         self._align_test_deadline_ns: Optional[int] = None
@@ -939,6 +941,8 @@ class AcquisitionService:
         return mode in ("scramble", "scramble-breaks")
 
     def _countdown_seconds(self, *, new_label: bool, word_switch: bool = False) -> float:
+        if self._collect_mode == "occasional_word" and new_label:
+            return COLLECTION_SAY_S
         if self._collect_mode == "scramble-breaks":
             return COLLECTION_SAY_S
         if not new_label:
@@ -952,6 +956,15 @@ class AcquisitionService:
         self._collect_countdown_word_switch = word_switch
         countdown_s = self._countdown_seconds(new_label=new_label, word_switch=word_switch)
         self._collect_deadline_ns = time.perf_counter_ns() + int(countdown_s * 1_000_000_000)
+
+    def _pick_off_list_word(self) -> str:
+        return random.choice(OCCASIONAL_WORD_POOL)
+
+    def _pick_auto_collection_word(self, *, exclude: Optional[str] = None) -> tuple[str, bool]:
+        rate = clamp_unit_weight(self._collect_negative_word_rate)
+        if rate > 0.0 and random.random() < rate:
+            return self._pick_off_list_word(), True
+        return self._pick_weighted_collection_word(exclude=exclude), False
 
     def _pick_weighted_collection_word(self, *, exclude: Optional[str] = None) -> str:
         choices: list[str] = []
@@ -972,7 +985,9 @@ class AcquisitionService:
         return random.choices(choices, weights=weights, k=1)[0]
 
     def _pick_scramble_word(self) -> str:
-        return self._pick_weighted_collection_word(exclude=self._collect_prev_word or None)
+        word, is_off_list = self._pick_auto_collection_word(exclude=self._collect_prev_word or None)
+        self._collect_word_is_off_list = is_off_list
+        return word
 
     def set_collect_word_weights(self, weights: dict[str, Any]) -> None:
         if self._collect_phase not in ("disabled", "pick_word"):
@@ -990,18 +1005,23 @@ class AcquisitionService:
             if word in weights:
                 self._collect_word_weights[word] = merged[word]
 
-    def set_collect_negative_label_mix(self, weights: dict[str, Any]) -> None:
+    def set_collect_negative_word_rate(self, rate: float) -> None:
         if self._collect_phase not in ("disabled", "pick_word"):
-            raise RuntimeError("Finish the current collection before changing negative label mix")
-        for key in NEGATIVE_LABEL_MIX_DEFAULT_WEIGHTS:
+            raise RuntimeError("Finish the current collection before changing negative word rate")
+        self._collect_negative_word_rate = clamp_unit_weight(rate)
+
+    def set_collect_occasional_word_mix(self, weights: dict[str, Any]) -> None:
+        if self._collect_phase not in ("disabled", "pick_word"):
+            raise RuntimeError("Finish the current collection before changing occasional word mix")
+        for key in OCCASIONAL_WORD_MIX_DEFAULT_WEIGHTS:
             if key not in weights:
                 continue
-            self._collect_neg_mix_weights[key] = clamp_unit_weight(weights[key])
+            self._collect_occ_mix_weights[key] = clamp_unit_weight(weights[key])
 
-    def _negative_labels_segment_targets(self) -> dict[str, float]:
+    def _occasional_word_segment_targets(self) -> dict[str, float]:
         active = {
-            key: clamp_unit_weight(self._collect_neg_mix_weights.get(key, 0.0))
-            for key in NEGATIVE_LABEL_MIX_DEFAULT_WEIGHTS
+            key: clamp_unit_weight(self._collect_occ_mix_weights.get(key, 0.0))
+            for key in OCCASIONAL_WORD_MIX_DEFAULT_WEIGHTS
         }
         active = {key: weight for key, weight in active.items() if weight > 0.0}
         if not active:
@@ -1009,14 +1029,13 @@ class AcquisitionService:
         total = sum(active.values())
         return {key: weight / total for key, weight in active.items()}
 
-    def _pick_negative_labels_segment(self) -> str:
-        targets = self._negative_labels_segment_targets()
+    def _pick_occasional_word_segment(self) -> str:
+        targets = self._occasional_word_segment_targets()
         if len(targets) == 1:
             return "still"
         elapsed = {
-            "still": self._collect_neg_still_time_s,
-            "negative_word": self._collect_neg_negative_word_time_s,
-            "positive_word": self._collect_neg_positive_word_time_s,
+            "still": self._collect_occ_still_time_s,
+            "collection_word": self._collect_occ_collection_word_time_s,
         }
         total_elapsed = sum(elapsed[kind] for kind in targets)
         if total_elapsed <= 0:
@@ -1033,56 +1052,54 @@ class AcquisitionService:
         kinds = list(weights.keys())
         return random.choices(kinds, weights=[weights[kind] for kind in kinds], k=1)[0]
 
-    def _pick_negative_label_words(self) -> list[str]:
-        pool = list(NEGATIVE_LABEL_WORD_POOL)
+    def _pick_occasional_word_pool(self) -> list[str]:
+        pool = list(OCCASIONAL_WORD_POOL)
         random.shuffle(pool)
-        return pool[:NEGATIVE_LABEL_WORD_COUNT]
+        return pool[:OCCASIONAL_WORD_WORD_COUNT]
 
-    def _mark_negative_labels_segment_start(self) -> None:
-        self._collect_neg_segment_started_ns = time.perf_counter_ns()
+    def _mark_occasional_word_segment_start(self) -> None:
+        self._collect_occ_segment_started_ns = time.perf_counter_ns()
 
-    def _record_negative_labels_segment_elapsed(self, segment_kind: str) -> None:
-        started_ns = self._collect_neg_segment_started_ns
+    def _record_occasional_word_segment_elapsed(self, segment_kind: str) -> None:
+        started_ns = self._collect_occ_segment_started_ns
         if started_ns is None:
             return
         elapsed_s = max(0.0, (time.perf_counter_ns() - started_ns) / 1e9)
-        self._collect_neg_segment_started_ns = None
+        self._collect_occ_segment_started_ns = None
         if segment_kind == "still":
-            self._collect_neg_still_time_s += elapsed_s
-        elif segment_kind == "negative_word":
-            self._collect_neg_negative_word_time_s += elapsed_s
-        elif segment_kind == "positive_word":
-            self._collect_neg_positive_word_time_s += elapsed_s
+            self._collect_occ_still_time_s += elapsed_s
+        elif segment_kind == "collection_word":
+            self._collect_occ_collection_word_time_s += elapsed_s
 
-    def _begin_negative_labels_still(self) -> None:
-        duration_s = random.uniform(NEGATIVE_LABELS_STILL_MIN_S, NEGATIVE_LABELS_STILL_MAX_S)
-        self._collect_neg_segment_kind = "still"
+    def _begin_occasional_word_still(self) -> None:
+        duration_s = random.uniform(OCCASIONAL_WORD_STILL_MIN_S, OCCASIONAL_WORD_STILL_MAX_S)
+        self._collect_occ_segment_kind = "still"
         self._collect_word = ""
+        self._collect_word_is_off_list = False
         self._collect_phase = "still"
         self._collect_deadline_ns = time.perf_counter_ns() + int(duration_s * 1_000_000_000)
-        self._mark_negative_labels_segment_start()
+        self._mark_occasional_word_segment_start()
 
-    def _begin_negative_labels_word_segment(self, segment_kind: str) -> None:
-        if segment_kind == "negative_word":
-            self._collect_word = random.choice(self._collect_neg_words)
-        else:
-            self._collect_word = self._pick_weighted_collection_word()
-        self._collect_neg_segment_kind = segment_kind
+    def _begin_occasional_word_word_segment(self) -> None:
+        word, is_off_list = self._pick_auto_collection_word()
+        self._collect_word = word
+        self._collect_word_is_off_list = is_off_list
+        self._collect_occ_segment_kind = "collection_word"
         self._collect_rep = 1
         self._collect_reps_total = 1
         self._begin_collect_countdown(new_label=True)
-        self._mark_negative_labels_segment_start()
+        self._mark_occasional_word_segment_start()
 
-    def _begin_negative_labels_segment(self) -> None:
-        segment_kind = self._pick_negative_labels_segment()
+    def _begin_occasional_word_segment(self) -> None:
+        segment_kind = self._pick_occasional_word_segment()
         if segment_kind == "still":
-            self._begin_negative_labels_still()
+            self._begin_occasional_word_still()
         else:
-            self._begin_negative_labels_word_segment(segment_kind)
+            self._begin_occasional_word_word_segment()
 
     def _collect_status(self) -> dict[str, Any]:
         busy = self._collect_phase in ("countdown", "say", "still")
-        negative_labels_active = self._collect_mode == "negative_labels" and busy
+        occasional_word_active = self._collect_mode == "occasional_word" and busy
         return {
             "phase": self._collect_phase,
             "mode": self._collect_mode if busy else None,
@@ -1091,8 +1108,9 @@ class AcquisitionService:
             "repetitions_total": self._collect_reps_total if busy else COLLECTION_REPETITIONS,
             "set_index": self._collect_set_idx if busy and self._is_scramble_mode(self._collect_mode) else None,
             "sets_total": self._collect_set_total if busy and self._is_scramble_mode(self._collect_mode) else None,
-            "neg_segment_kind": self._collect_neg_segment_kind if negative_labels_active else None,
-            "negative_labels_active": negative_labels_active,
+            "occ_segment_kind": self._collect_occ_segment_kind if occasional_word_active else None,
+            "word_is_off_list": self._collect_word_is_off_list if busy and self._collect_word else False,
+            "occasional_word_active": occasional_word_active,
             "phase_remaining_s": self._collect_phase_remaining_s(),
             "words": list(COLLECTION_WORDS),
             "before_s": COLLECTION_BEFORE_S,
@@ -1121,10 +1139,12 @@ class AcquisitionService:
             "word_weight_min_active": WORD_WEIGHT_MIN_ACTIVE,
             "word_weights_valid": active_word_weight_count(self._collect_word_weights)
             >= WORD_WEIGHT_MIN_ACTIVE,
-            "neg_mix_weights": dict(self._collect_neg_mix_weights),
-            "default_neg_mix_weights": default_negative_label_mix_weights(),
-            "neg_mix_labels": dict(NEGATIVE_LABEL_MIX_LABELS),
-            "neg_mix_keys": list(NEGATIVE_LABEL_MIX_DEFAULT_WEIGHTS.keys()),
+            "negative_word_rate": self._collect_negative_word_rate,
+            "default_negative_word_rate": DEFAULT_NEGATIVE_WORD_RATE,
+            "occ_mix_weights": dict(self._collect_occ_mix_weights),
+            "default_occ_mix_weights": default_occasional_word_mix_weights(),
+            "occ_mix_labels": dict(OCCASIONAL_WORD_MIX_LABELS),
+            "occ_mix_keys": list(OCCASIONAL_WORD_MIX_DEFAULT_WEIGHTS.keys()),
         }
 
     def _reset_collect(self) -> None:
@@ -1141,12 +1161,12 @@ class AcquisitionService:
         self._collect_countdown_word_switch = False
         self._collect_trailing_break = False
         self._collect_scramble_stop_after_rep = False
-        self._collect_neg_words = []
-        self._collect_neg_segment_kind = ""
-        self._collect_neg_still_time_s = 0.0
-        self._collect_neg_negative_word_time_s = 0.0
-        self._collect_neg_positive_word_time_s = 0.0
-        self._collect_neg_segment_started_ns = None
+        self._collect_occ_words = []
+        self._collect_occ_segment_kind = ""
+        self._collect_occ_still_time_s = 0.0
+        self._collect_occ_collection_word_time_s = 0.0
+        self._collect_occ_segment_started_ns = None
+        self._collect_word_is_off_list = False
 
     def _finish_collect_block(self) -> None:
         finished_word = self._collect_word
@@ -1189,9 +1209,9 @@ class AcquisitionService:
             return
 
         if self._collect_phase == "still":
-            self._record_negative_labels_segment_elapsed("still")
-            if self._collect_mode == "negative_labels":
-                self._begin_negative_labels_segment()
+            self._record_occasional_word_segment_elapsed("still")
+            if self._collect_mode == "occasional_word":
+                self._begin_occasional_word_segment()
             return
 
         if self._collect_phase == "countdown":
@@ -1205,9 +1225,9 @@ class AcquisitionService:
             self._log_silent_speech_rep()
             return
 
-        if self._collect_mode == "negative_labels":
-            self._record_negative_labels_segment_elapsed(self._collect_neg_segment_kind)
-            self._begin_negative_labels_segment()
+        if self._collect_mode == "occasional_word":
+            self._record_occasional_word_segment_elapsed(self._collect_occ_segment_kind)
+            self._begin_occasional_word_segment()
             return
 
         if self._is_scramble_mode(self._collect_mode) and self._collect_scramble_stop_after_rep:
@@ -1255,6 +1275,7 @@ class AcquisitionService:
                 "repetition": self._collect_rep,
                 "word": self._collect_word,
                 "mode": self._collect_mode,
+                "is_off_list": self._collect_word_is_off_list,
                 "set_index": self._collect_set_idx if self._is_scramble_mode(self._collect_mode) else None,
                 "sets_total": self._collect_set_total if self._is_scramble_mode(self._collect_mode) else None,
             },
@@ -1306,6 +1327,7 @@ class AcquisitionService:
         self._collect_prev_word = ""
         self._collect_word = word
         self._collect_rep = 1
+        self._collect_word_is_off_list = False
         self._begin_collect_countdown(new_label=True)
         self._recorder.log_event(
             event_type="silent_speech_block_start",
@@ -1365,6 +1387,7 @@ class AcquisitionService:
                 "sets_planned": set_count,
                 "repetitions_per_set": rep_count,
                 "word_weights": dict(self._collect_word_weights),
+                "negative_word_rate": self._collect_negative_word_rate,
             },
         )
         self._log_scramble_word()
@@ -1382,7 +1405,7 @@ class AcquisitionService:
             raise RuntimeError("Scramble mode is not active")
         self._collect_scramble_stop_after_rep = True
 
-    def start_collect_negative_labels(self) -> None:
+    def start_collect_occasional_word(self) -> None:
         if not self._recorder.enabled:
             raise RuntimeError("Start session recording first")
         if self._collect_phase != "pick_word":
@@ -1395,13 +1418,13 @@ class AcquisitionService:
 
         block_id = uuid.uuid4().hex
         self._collect_block_id = block_id
-        self._collect_mode = "negative_labels"
-        self._collect_neg_words = self._pick_negative_label_words()
-        self._collect_neg_segment_kind = ""
-        self._collect_neg_still_time_s = 0.0
-        self._collect_neg_negative_word_time_s = 0.0
-        self._collect_neg_positive_word_time_s = 0.0
-        self._collect_neg_segment_started_ns = None
+        self._collect_mode = "occasional_word"
+        self._collect_occ_words = self._pick_occasional_word_pool()
+        self._collect_occ_segment_kind = ""
+        self._collect_occ_still_time_s = 0.0
+        self._collect_occ_collection_word_time_s = 0.0
+        self._collect_occ_segment_started_ns = None
+        self._collect_word_is_off_list = False
         self._recorder.log_event(
             event_type="silent_speech_block_start",
             label_text="",
@@ -1410,21 +1433,22 @@ class AcquisitionService:
             alignment_method=method,
             payload={
                 "collection_block_id": block_id,
-                "mode": "negative_labels",
-                "negative_words": list(self._collect_neg_words),
-                "neg_mix_weights": dict(self._collect_neg_mix_weights),
+                "mode": "occasional_word",
+                "off_list_words": list(self._collect_occ_words),
+                "occ_mix_weights": dict(self._collect_occ_mix_weights),
                 "word_weights": dict(self._collect_word_weights),
+                "negative_word_rate": self._collect_negative_word_rate,
             },
         )
-        self._begin_negative_labels_segment()
+        self._begin_occasional_word_segment()
 
-    def stop_collect_negative_labels(self) -> None:
-        if self._collect_mode != "negative_labels":
-            raise RuntimeError("Negative labels mode is not active")
+    def stop_collect_occasional_word(self) -> None:
+        if self._collect_mode != "occasional_word":
+            raise RuntimeError("Occasional word mode is not active")
         if self._collect_phase == "still":
-            self._record_negative_labels_segment_elapsed("still")
-        elif self._collect_phase == "say" and self._collect_neg_segment_kind in ("negative_word", "positive_word"):
-            self._record_negative_labels_segment_elapsed(self._collect_neg_segment_kind)
+            self._record_occasional_word_segment_elapsed("still")
+        elif self._collect_phase == "say" and self._collect_occ_segment_kind == "collection_word":
+            self._record_occasional_word_segment_elapsed("collection_word")
         block_id = self._collect_block_id
         _event_host_ns, aligned_float, aligned_idx, method = self._aligned_sample_now()
         if aligned_idx is not None and block_id and self._recorder.enabled:
@@ -1436,7 +1460,7 @@ class AcquisitionService:
                 alignment_method=method,
                 payload={
                     "collection_block_id": block_id,
-                    "mode": "negative_labels",
+                    "mode": "occasional_word",
                 },
             )
         self._collect_phase = "pick_word"
@@ -1451,18 +1475,18 @@ class AcquisitionService:
         self._collect_deadline_ns = None
         self._collect_countdown_word_switch = False
         self._collect_trailing_break = False
-        self._collect_neg_words = []
-        self._collect_neg_segment_kind = ""
-        self._collect_neg_still_time_s = 0.0
-        self._collect_neg_negative_word_time_s = 0.0
-        self._collect_neg_positive_word_time_s = 0.0
-        self._collect_neg_segment_started_ns = None
+        self._collect_occ_words = []
+        self._collect_occ_segment_kind = ""
+        self._collect_occ_still_time_s = 0.0
+        self._collect_occ_collection_word_time_s = 0.0
+        self._collect_occ_segment_started_ns = None
+        self._collect_word_is_off_list = False
 
-    def toggle_collect_negative_labels(self) -> None:
-        if self._collect_mode == "negative_labels":
-            self.stop_collect_negative_labels()
+    def toggle_collect_occasional_word(self) -> None:
+        if self._collect_mode == "occasional_word":
+            self.stop_collect_occasional_word()
         else:
-            self.start_collect_negative_labels()
+            self.start_collect_occasional_word()
 
     def _alignment_test_busy(self) -> bool:
         return self._align_test_phase in ("countdown", "blink")
@@ -2417,13 +2441,20 @@ def create_app(service: AcquisitionService) -> Flask:
         service.set_collect_word_weights(raw_weights)
         return jsonify(service.status()["collect"])
 
-    @app.post("/collect/negative-label-mix")
-    def collect_negative_label_mix() -> Any:
+    @app.post("/collect/negative-word-rate")
+    def collect_negative_word_rate() -> Any:
+        payload = request.get_json(silent=True) or {}
+        rate = payload.get("rate", payload.get("negative_word_rate", DEFAULT_NEGATIVE_WORD_RATE))
+        service.set_collect_negative_word_rate(float(rate))
+        return jsonify(service.status()["collect"])
+
+    @app.post("/collect/occasional-word-mix")
+    def collect_occasional_word_mix() -> Any:
         payload = request.get_json(silent=True) or {}
         raw_weights = payload.get("weights", payload)
         if not isinstance(raw_weights, dict):
             return jsonify({"error": "weights object is required"}), 400
-        service.set_collect_negative_label_mix(raw_weights)
+        service.set_collect_occasional_word_mix(raw_weights)
         return jsonify(service.status()["collect"])
 
     @app.post("/collect/scramble")
@@ -2447,9 +2478,9 @@ def create_app(service: AcquisitionService) -> Flask:
         service.stop_collect_scramble_next_chance()
         return jsonify(service.status()["collect"])
 
-    @app.post("/collect/negative-labels/toggle")
-    def collect_negative_labels_toggle() -> Any:
-        service.toggle_collect_negative_labels()
+    @app.post("/collect/occasional-word/toggle")
+    def collect_occasional_word_toggle() -> Any:
+        service.toggle_collect_occasional_word()
         return jsonify(service.status()["collect"])
 
     @app.post("/alignment-test/start")

@@ -33,6 +33,14 @@ from train import (
 
 # --- embeddings / UMAP (always runs after metrics)
 EMBEDDING_SPLITS = ("val", "test")
+
+# val = held-out sessions (extra-session); test = intra-session holdout from train sessions
+SPLIT_SESSION_KIND = {
+    "val": "extra",
+    "test": "intra",
+}
+SPLIT_DISPLAY_WIDTH = 14
+SESSION_DISPLAY_WIDTH = 22
 EMBEDDING_MAX_PER_LABEL = 200
 EMBEDDINGS_N_NEIGHBORS = 15
 EMBEDDINGS_MIN_DIST = 0.1
@@ -185,6 +193,25 @@ def format_session_display(name: str, *, width: int = 14) -> str:
     else:
         short = f"...{name[-(width - 3) :]}"
     return short if len(short) <= width else short[:width]
+
+
+def format_split_display(split_name: str) -> str:
+    kind = SPLIT_SESSION_KIND.get(split_name)
+    if kind:
+        return f"{split_name} [{kind}]"
+    return split_name
+
+
+def format_session_display_for_split(
+    name: str,
+    split_name: str,
+    *,
+    width: int = SESSION_DISPLAY_WIDTH,
+) -> str:
+    kind = SPLIT_SESSION_KIND.get(split_name)
+    suffix = f" [{kind}]" if kind else ""
+    inner_width = max(1, width - len(suffix))
+    return f"{format_session_display(name, width=inner_width)}{suffix}"
 
 
 def compute_session_metrics(
@@ -468,7 +495,7 @@ def print_metrics(
     idx_to_label: dict[int, str],
     use_color: bool = True,
 ) -> None:
-    print(f"\n=== {metrics['split']} ===")
+    print(f"\n=== {format_split_display(metrics['split'])} ===")
     print(f"samples:           {metrics['n_samples']}")
     print(f"loss:              {metrics['loss']:.4f}")
     print(f"accuracy:          {metrics['accuracy']:.4f}")
@@ -564,13 +591,17 @@ def print_session_rankings(
         return
 
     overall_acc = metrics["accuracy"]
+    split_name = metrics["split"]
     min_samples = metrics.get("session_min_samples", 1)
-    print(f"\nper-session (>= {min_samples} samples, split accuracy={overall_acc:.4f}):")
+    print(
+        f"\nper-session (>= {min_samples} samples, "
+        f"{format_split_display(split_name)} accuracy={overall_acc:.4f}):"
+    )
 
     def print_rows(title: str, rows: list[dict]) -> None:
         print(f"\n{title}:")
         print(
-            f"{'session':<14} {'accuracy':>10} {'delta':>10} {'correct':>10} "
+            f"{'session':<{SESSION_DISPLAY_WIDTH}} {'accuracy':>10} {'delta':>10} {'correct':>10} "
             f"{'samples':>10}  {'worst recall':<24} {'worst precision':<24}"
         )
         for row in rows:
@@ -585,9 +616,9 @@ def print_session_rankings(
                 metric="precision",
                 idx_to_label=idx_to_label,
             )
-            session = format_session_display(row["session"])
+            session = format_session_display_for_split(row["session"], split_name)
             print(
-                f"{session:<14} "
+                f"{session:<{SESSION_DISPLAY_WIDTH}} "
                 f"{row['accuracy']:>10.4f} "
                 f"{delta:>+10.4f} "
                 f"{row['n_correct']:>10d} "
@@ -658,7 +689,7 @@ def _print_cross_split_session_rankings(
     def print_rows(title: str, rows: list[dict]) -> None:
         print(f"\n{title}:")
         print(
-            f"{'split':<8} {'session':<14} {'accuracy':>10} "
+            f"{'split':<{SPLIT_DISPLAY_WIDTH}} {'session':<{SESSION_DISPLAY_WIDTH}} {'accuracy':>10} "
             f"{'delta':>10} {'correct':>10} {'samples':>10}  "
             f"{'worst recall':<24} {'worst precision':<24}"
         )
@@ -673,10 +704,11 @@ def _print_cross_split_session_rankings(
                 metric="precision",
                 idx_to_label=idx_to_label,
             )
-            session = format_session_display(row["session"])
+            split_name = row["split"]
+            session = format_session_display_for_split(row["session"], split_name)
             print(
-                f"{row['split']:<8} "
-                f"{session:<14} "
+                f"{format_split_display(split_name):<{SPLIT_DISPLAY_WIDTH}} "
+                f"{session:<{SESSION_DISPLAY_WIDTH}} "
                 f"{row['accuracy']:>10.4f} "
                 f"{row['delta']:>+10.4f} "
                 f"{row['n_correct']:>10d} "
@@ -799,7 +831,11 @@ def print_model_comparison_meta(
     split_names = [name for name in COMPARE_SPLITS if name in best_by_split and name in last_by_split]
 
     print("\nsplit metrics (delta = last - best; ↑ = last improved, ↓ = last worse):")
-    header = f"{'split':<8}" + "".join(f"{label:>12}" for label, _, _ in COMPARE_METRICS) + f"{'winner':>10}"
+    header = (
+        f"{'split':<{SPLIT_DISPLAY_WIDTH}}"
+        + "".join(f"{label:>12}" for label, _, _ in COMPARE_METRICS)
+        + f"{'winner':>10}"
+    )
     print(header)
     for split_name in split_names:
         best_row = best_by_split[split_name]
@@ -819,13 +855,21 @@ def print_model_comparison_meta(
                 winner_summary = "best"
             else:
                 winner_summary = "tie"
-        print(f"{split_name:<8}{''.join(deltas)}{str(winner_summary):>10}")
+        print(
+            f"{format_split_display(split_name):<{SPLIT_DISPLAY_WIDTH}}"
+            f"{''.join(deltas)}{str(winner_summary):>10}"
+        )
 
     val_test_splits = [name for name in ("val", "test") if name in split_names]
     if val_test_splits:
         n_classes = len(next(iter(best_by_split.values()))["per_class"])
         print("\nper-class recall delta (last - best):")
-        print(f"{'label':<20}" + "".join(f"{split + ' Δ':>12}" for split in val_test_splits))
+        print(
+            f"{'label':<20}"
+            + "".join(
+                f"{format_split_display(split) + ' Δ':>16}" for split in val_test_splits
+            )
+        )
         best_recall_wins = 0
         last_recall_wins = 0
         tie_recall_wins = 0
@@ -837,10 +881,10 @@ def print_model_comparison_meta(
                 last_recall = last_by_split[split_name]["per_class"][class_idx]["recall"]
                 support = best_by_split[split_name]["per_class"][class_idx]["support"]
                 if support <= 0:
-                    cells.append("     n/a".rjust(12))
+                    cells.append("     n/a".rjust(16))
                     continue
                 delta = last_recall - best_recall
-                cells.append(_delta_text(delta, higher_is_better=True, width=12))
+                cells.append(_delta_text(delta, higher_is_better=True, width=16))
                 winner = _winner(best_recall, last_recall, higher_is_better=True)
                 if winner == "best":
                     best_recall_wins += 1
@@ -850,7 +894,7 @@ def print_model_comparison_meta(
                     tie_recall_wins += 1
             print(f"{label[:20]:<20}{''.join(cells)}")
         print(
-            f"\nper-class recall head-to-head (val+test, support>0): "
+            f"\nper-class recall head-to-head (val [extra]+test [intra], support>0): "
             f"best={best_recall_wins}, last={last_recall_wins}, tie={tie_recall_wins}"
         )
 
@@ -863,8 +907,9 @@ def print_model_comparison_meta(
             row["session_dir"]: row for row in last_by_split[split_name]["per_session"]
         }
         common = sorted(set(best_sessions) & set(last_sessions))
+        split_label = format_split_display(split_name)
         if not common:
-            print(f"  {split_name}: no shared ranked sessions")
+            print(f"  {split_label}: no shared ranked sessions")
             continue
         deltas = [
             last_sessions[session_dir]["accuracy"] - best_sessions[session_dir]["accuracy"]
@@ -875,7 +920,7 @@ def print_model_comparison_meta(
         ties = len(deltas) - last_wins - best_wins
         mean_delta = float(np.mean(deltas))
         print(
-            f"  {split_name}: n={len(common)}, mean Δacc={mean_delta:+.4f}, "
+            f"  {split_label}: n={len(common)}, mean Δacc={mean_delta:+.4f}, "
             f"last wins={last_wins}, best wins={best_wins}, tie={ties}"
         )
 
@@ -889,12 +934,12 @@ def print_summary_table(
 ) -> None:
     print("\n=== summary ===")
     print(
-        f"{'split':<8} {'samples':>8} {'loss':>10} "
+        f"{'split':<{SPLIT_DISPLAY_WIDTH}} {'samples':>8} {'loss':>10} "
         f"{'accuracy':>10} {'bal_acc':>10} {'macro_f1':>10} {'weighted_f1':>12}"
     )
     for metrics in metrics_list:
         print(
-            f"{metrics['split']:<8} "
+            f"{format_split_display(metrics['split']):<{SPLIT_DISPLAY_WIDTH}} "
             f"{metrics['n_samples']:>8} "
             f"{metrics['loss']:>10.4f} "
             f"{metrics['accuracy']:>10.4f} "
@@ -910,7 +955,7 @@ def print_summary_table(
 
     n_classes = len(next(iter(by_split.values()))["per_class"])
     confusion_width = 22
-    print("\nper-class recall and top confusion (train vs val vs test):")
+    print("\nper-class recall and top confusion (train vs val [extra] vs test [intra]):")
     if use_color:
         print(
             "  (recall: red=low, green=high, bold=worst split; "
@@ -918,8 +963,11 @@ def print_summary_table(
         )
     header = (
         f"{'label':<20}"
-        + "".join(f"{name:>10}" for name in split_names)
-        + "".join(f"{name + ' confusion':>{confusion_width}}" for name in split_names)
+        + "".join(f"{format_split_display(name):>14}" for name in split_names)
+        + "".join(
+            f"{format_split_display(name) + ' confusion':>{confusion_width}}"
+            for name in split_names
+        )
     )
     print(header)
     for class_idx in range(n_classes):
@@ -1224,7 +1272,7 @@ def plot_embedding_umap(
             color="gray",
             linestyle="None",
             markersize=7,
-            label=f"{split_name} ({'dot' if marker == 'o' else 'square'})",
+            label=f"{format_split_display(split_name)} ({'dot' if marker == 'o' else 'square'})",
         )
         for split_name, marker in SPLIT_MARKERS.items()
         if any(sample.split == split_name for sample in all_samples)
@@ -1288,7 +1336,7 @@ def run_embedding_umap(
         )
         print(
             f"embeddings ({kind}): collected {len(samples)} samples "
-            f"from {', '.join(embedding_splits)} "
+            f"from {', '.join(format_split_display(split) for split in embedding_splits)} "
             f"(max {max_per_label} per label per split)"
         )
         checkpoint_samples.append((kind, samples))
