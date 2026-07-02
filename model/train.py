@@ -257,6 +257,53 @@ def build_label_map(base_dataset, indices) -> dict:
     return label_to_idx
 
 
+def print_input_sample_preview(splits) -> None:
+    """Print one train sample with stats so inputs can be sanity-checked before training."""
+    label_to_idx = build_label_map(splits.dataset, splits.train.indices)
+    ds = FusionDataset(splits.dataset, splits.train.indices, label_to_idx)
+    base_idx = splits.train.indices[0]
+    raw = splits.dataset[base_idx]
+    eeg, emg, y_soft, y_hard = ds[0]
+
+    def _tensor_lines(t: torch.Tensor, name: str) -> list[str]:
+        if t.numel() == 0:
+            return [f"  {name}: disabled (empty tensor, shape={tuple(t.shape)})"]
+        flat = t.detach().float()
+        nonzero_pct = 100.0 * (flat != 0).float().mean().item()
+        ch0 = [round(v, 4) for v in t[0, 0, :8].tolist()]
+        return [
+            f"  {name}: shape={tuple(t.shape)}",
+            (
+                f"    min={flat.min().item():.4f}  max={flat.max().item():.4f}  "
+                f"mean={flat.mean().item():.4f}  std={flat.std().item():.4f}  "
+                f"nonzero={nonzero_pct:.1f}%"
+            ),
+            f"    ch0[:8]={ch0}",
+        ]
+
+    session = raw.get("session_dir")
+    session_name = Path(session).name if session is not None else "?"
+
+    print("\n--- training input sample (train index 0) ---")
+    print(
+        f"  label={raw['label']!r}  event={raw.get('event_type')!r}  "
+        f"session={session_name}"
+    )
+    if raw.get("label_probs"):
+        print(f"  label_probs={raw['label_probs']}")
+    print(
+        f"  modalities: eeg={'on' if not NOT_USE_EEG else 'off'}"
+        f" ({len(ACTIVE_EEG_INDICES)} ch)  "
+        f"emg={'on' if not NOT_USE_EMG else 'off'}"
+        f" ({len(ACTIVE_EMG_INDICES)} ch)"
+    )
+    for line in _tensor_lines(eeg, "eeg"):
+        print(line)
+    for line in _tensor_lines(emg, "emg"):
+        print(line)
+    print("--------------------------------------------\n")
+
+
 # --- train
 def construct_model(splits, architecture: str = MODEL_ARCHITECTURE):
     label_to_idx = build_label_map(splits.dataset, splits.train.indices)
@@ -270,20 +317,6 @@ def construct_model(splits, architecture: str = MODEL_ARCHITECTURE):
     n_eeg = len(ACTIVE_EEG_INDICES) if use_eeg else 0
     n_emg = len(ACTIVE_EMG_INDICES) if use_emg else 0
     T = eeg0.shape[2] if use_eeg else emg0.shape[2]
-
-    print("\n\n")
-    print("--- example sample ---")
-    if use_eeg:
-        print("eeg: ", eeg0)
-    else:
-        print("eeg: disabled")
-    print("\n")
-    if use_emg:
-        print("emg: ", emg0)
-    else:
-        print("emg: disabled")
-    print("------")
-    print("\n\n")
 
     model = build_fusion_model(
         architecture,
@@ -1096,6 +1129,7 @@ def run_training(
 ) -> dict:
     """Train one model on the given splits; return model, history, and run metadata."""
     seed_everything(seed, deterministic)
+    print_input_sample_preview(splits)
     continued_from: dict | None = None
     kwargs = dict(train_kwargs or {})
 

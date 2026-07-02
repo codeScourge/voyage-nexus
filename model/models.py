@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import ClassVar
 
 import torch
@@ -375,9 +376,304 @@ class CATNet(nn.Module):
         return {"emg": self._pool_proj(z_emg, self.proj_emg)}
 
 
+class CausalConv1d(nn.Module):
+    """Left-padded 1D convolution for causal temporal modeling."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        dilation: int = 1,
+    ):
+        super().__init__()
+        self.pad = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            dilation=dilation,
+            bias=True,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(F.pad(x, (self.pad, 0)))
+
+
+class ATCNetConvBlock(nn.Module):
+    """ATCNet convolutional (CV) block: temporal -> depthwise spatial -> temporal."""
+
+    def __init__(
+        self,
+        n_channels: int,
+        T: int,
+        *,
+        F1: int = 16,
+        D: int = 2,
+        kern_temporal: int = 64,
+        kern_refine: int = 16,
+        pool_size_1: int = 8,
+        pool_size_2: int = 7,
+        p_drop: float = 0.3,
+    ):
+        super().__init__()
+        self.F2 = F1 * D
+        self.Tc = max(1, max(1, T // pool_size_1) // pool_size_2)
+
+        self.conv1 = nn.Conv2d(
+            1, F1, (1, kern_temporal),
+            padding=(0, kern_temporal // 2), bias=False,
+        )
+        self.bn1 = nn.BatchNorm2d(F1)
+        self.conv2 = nn.Conv2d(
+            F1, self.F2, (n_channels, 1),
+            groups=F1, bias=False,
+        )
+        self.bn2 = nn.BatchNorm2d(self.F2)
+        self.pool1 = TimeAvgPool(max(1, T // pool_size_1))
+        self.drop1 = nn.Dropout2d(p_drop)
+
+        self.conv3 = nn.Conv2d(
+            self.F2, self.F2, (1, kern_refine),
+            padding=(0, kern_refine // 2), bias=False,
+        )
+        self.bn3 = nn.BatchNorm2d(self.F2)
+        self.pool2 = TimeAvgPool(self.Tc)
+        self.drop2 = nn.Dropout2d(p_drop)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.bn1(self.conv1(x))
+        x = F.elu(self.bn2(self.conv2(x)))
+        x = self.drop1(self.pool1(x))
+        x = F.elu(self.bn3(self.conv3(x)))
+        x = self.drop2(self.pool2(x))
+        return x.squeeze(2)
+
+
+class ATCNetMHA(nn.Module):
+    """Multi-head attention with per-head dim independent of input dim (ATCNet paper)."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        head_dim: int,
+        output_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.head_dim = head_dim
+        self.embed_dim = head_dim * num_heads
+        self.fc_q = nn.Linear(input_dim, self.embed_dim)
+        self.fc_k = nn.Linear(input_dim, self.embed_dim)
+        self.fc_v = nn.Linear(input_dim, self.embed_dim)
+        self.fc_o = nn.Linear(self.embed_dim, output_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        batch_size = q.shape[0]
+        q = self.fc_q(q)
+        k = self.fc_k(k)
+        v = self.fc_v(v)
+
+        q_ = torch.cat(q.split(self.head_dim, dim=-1), dim=0)
+        k_ = torch.cat(k.split(self.head_dim, dim=-1), dim=0)
+        v_ = torch.cat(v.split(self.head_dim, dim=-1), dim=0)
+
+        weights = torch.softmax(
+            q_.bmm(k_.transpose(-2, -1)) / math.sqrt(self.head_dim),
+            dim=-1,
+        )
+        heads = torch.cat(
+            weights.bmm(v_).split(batch_size, dim=0),
+            dim=-1,
+        )
+        return self.dropout(self.fc_o(heads))
+
+
+class ATCNetAttentionBlock(nn.Module):
+    """Multi-head self-attention over the temporal sequence (AT block)."""
+
+    def __init__(
+        self,
+        in_dim: int,
+        *,
+        head_dim: int = 8,
+        num_heads: int = 2,
+        p_drop: float = 0.5,
+    ):
+        super().__init__()
+        self.norm = nn.LayerNorm(in_dim, eps=1e-6)
+        self.mha = ATCNetMHA(
+            input_dim=in_dim,
+            head_dim=head_dim,
+            output_dim=in_dim,
+            num_heads=num_heads,
+            dropout=p_drop,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # (B, C, T) -> (B, T, C) -> residual add -> (B, C, T)
+        seq = x.transpose(1, 2)
+        out = self.mha(self.norm(seq), self.norm(seq), self.norm(seq))
+        return (seq + out).transpose(1, 2)
+
+
+class ATCNetTCNResidualBlock(nn.Module):
+    """Dilated causal residual block from the ATCNet TC block."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        n_filters: int,
+        kernel_size: int,
+        dilation: int,
+        p_drop: float,
+    ):
+        super().__init__()
+        self.conv1 = CausalConv1d(in_channels, n_filters, kernel_size, dilation=dilation)
+        self.bn1 = nn.BatchNorm1d(n_filters)
+        self.conv2 = CausalConv1d(n_filters, n_filters, kernel_size, dilation=dilation)
+        self.bn2 = nn.BatchNorm1d(n_filters)
+        self.drop = nn.Dropout(p_drop)
+        self.skip = (
+            nn.Conv1d(in_channels, n_filters, kernel_size=1)
+            if in_channels != n_filters
+            else nn.Identity()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.drop(F.elu(self.bn1(self.conv1(x))))
+        out = self.drop(F.elu(self.bn2(self.conv2(out))))
+        return F.elu(out + self.skip(x))
+
+
+class ATCNet(nn.Module):
+    """ATCNet (Altaheri et al., 2022) without sliding windows — raw trial in, logits out.
+
+    CV block encodes spatio-temporal features, multi-head self-attention highlights
+    salient time steps, and a dilated causal TCN reads out the last temporal position.
+    """
+
+    EMBEDDING_TAPS: ClassVar[dict[str, str]] = EMBEDDING_TAP_LABELS
+
+    def __init__(
+        self,
+        n_eeg: int,
+        n_emg: int,
+        n_classes: int,
+        T: int,
+        *,
+        F1: int = 16,
+        D: int = 2,
+        kern_temporal: int | None = None,
+        kern_refine: int = 16,
+        pool_size_1: int = 8,
+        pool_size_2: int = 7,
+        p_drop_cv: float = 0.3,
+        head_dim: int = 8,
+        num_heads: int = 2,
+        p_drop_att: float = 0.5,
+        tcn_depth: int = 2,
+        tcn_kernel: int = 4,
+        p_drop_tcn: float = 0.3,
+        use_eeg: bool | None = None,
+        use_emg: bool | None = None,
+    ):
+        super().__init__()
+        self.use_eeg, self.use_emg = _resolve_modality_flags(
+            use_eeg=use_eeg,
+            use_emg=use_emg,
+            n_eeg=n_eeg,
+            n_emg=n_emg,
+        )
+        if kern_temporal is None:
+            kern_temporal = max(1, min(64, T // 4))
+
+        cv_kwargs = dict(
+            T=T,
+            F1=F1,
+            D=D,
+            kern_temporal=kern_temporal,
+            kern_refine=kern_refine,
+            pool_size_1=pool_size_1,
+            pool_size_2=pool_size_2,
+            p_drop=p_drop_cv,
+        )
+        if self.use_eeg:
+            self.eeg_cv = ATCNetConvBlock(n_eeg, **cv_kwargs)
+        if self.use_emg:
+            self.emg_cv = ATCNetConvBlock(n_emg, **cv_kwargs)
+
+        self.F2 = F1 * D
+        self.tcn_filters = self.F2
+        self.seq_dim = self.F2 * (int(self.use_eeg) + int(self.use_emg))
+
+        self.attention = ATCNetAttentionBlock(
+            self.seq_dim,
+            head_dim=head_dim,
+            num_heads=num_heads,
+            p_drop=p_drop_att,
+        )
+        self.tcn = nn.Sequential(
+            *[
+                ATCNetTCNResidualBlock(
+                    in_channels=self.seq_dim if i == 0 else self.tcn_filters,
+                    n_filters=self.tcn_filters,
+                    kernel_size=tcn_kernel,
+                    dilation=2**i,
+                    p_drop=p_drop_tcn,
+                )
+                for i in range(tcn_depth)
+            ]
+        )
+        self.classifier = nn.Linear(self.tcn_filters, n_classes)
+
+    def _encode_cv(self, eeg: torch.Tensor, emg: torch.Tensor) -> list[torch.Tensor]:
+        maps: list[torch.Tensor] = []
+        if self.use_eeg:
+            maps.append(self.eeg_cv(eeg))
+        if self.use_emg:
+            maps.append(self.emg_cv(emg))
+        if len(maps) == 2:
+            t = min(maps[0].shape[-1], maps[1].shape[-1])
+            return [m[..., :t] for m in maps]
+        return maps
+
+    def _concat_maps(self, maps: list[torch.Tensor]) -> torch.Tensor:
+        return maps[0] if len(maps) == 1 else torch.cat(maps, dim=1)
+
+    def _sequence_embed(self, seq: torch.Tensor) -> torch.Tensor:
+        x = self.attention(seq)
+        x = self.tcn(x)
+        return x[..., -1]
+
+    def forward(self, eeg: torch.Tensor, emg: torch.Tensor) -> torch.Tensor:
+        seq = self._concat_maps(self._encode_cv(eeg, emg))
+        return self.classifier(self._sequence_embed(seq))
+
+    def forward_embeddings(self, eeg: torch.Tensor, emg: torch.Tensor) -> dict[str, torch.Tensor]:
+        if self.use_eeg and self.use_emg:
+            e_map, m_map = self._encode_cv(eeg, emg)
+            zero_e = torch.zeros_like(e_map)
+            zero_m = torch.zeros_like(m_map)
+            return {
+                "eeg": self._sequence_embed(self._concat_maps([e_map, zero_m])),
+                "emg": self._sequence_embed(self._concat_maps([zero_e, m_map])),
+                "fused": self._sequence_embed(self._concat_maps([e_map, m_map])),
+            }
+
+        seq = self._concat_maps(self._encode_cv(eeg, emg))
+        embed = self._sequence_embed(seq)
+        if self.use_eeg:
+            return {"eeg": embed}
+        return {"emg": embed}
+
+
 ARCHITECTURES: dict[str, type[nn.Module]] = {
     "intermediate_fusion_eegnet": IntermediateFusionEEGNet,
     "cat_net": CATNet,
+    "atc_net": ATCNet,
 }
 
 
@@ -429,7 +725,11 @@ def build_fusion_model(
 
 __all__ = [
     "ARCHITECTURES",
+    "ATCNet",
+    "ATCNetAttentionBlock",
+    "ATCNetConvBlock",
     "CATNet",
+    "CausalConv1d",
     "ChannelAttention1d",
     "EMBEDDING_TAP_LABELS",
     "IntermediateFusionEEGNet",
