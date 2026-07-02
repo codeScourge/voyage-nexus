@@ -366,13 +366,34 @@ def latest_run_dir(root: Path = CHECKPOINT_DIR) -> Path | None:
 
 
 def default_checkpoint_path(kind: str = "best", root: Path = CHECKPOINT_DIR) -> Path:
-    run_dir = latest_run_dir(root)
-    if run_dir is not None:
+    runs = sorted(
+        [p for p in root.iterdir() if p.is_dir() and RUN_DIR_NAME_RE.match(p.name)],
+        key=lambda p: p.name,
+        reverse=True,
+    )
+    latest_run = runs[0] if runs else None
+    for run_dir in runs:
         path = run_dir / f"{kind}.pt"
         if path.exists():
+            if latest_run is not None and run_dir != latest_run:
+                latest_path = latest_run / f"{kind}.pt"
+                if not any(latest_run.iterdir()):
+                    reason = f"latest run {latest_run.name} is empty"
+                else:
+                    reason = f"latest run {latest_run.name} has no {kind}.pt (expected at {latest_path})"
+                print(f"warning: {reason}; falling back to {path}")
             return path
     legacy = root / "fusion_eegnet.pt"
-    return legacy if legacy.exists() else (run_dir / f"{kind}.pt" if run_dir else legacy)
+    if legacy.exists():
+        if latest_run is not None:
+            latest_path = latest_run / f"{kind}.pt"
+            if not any(latest_run.iterdir()):
+                reason = f"latest run {latest_run.name} is empty"
+            else:
+                reason = f"latest run {latest_run.name} has no {kind}.pt (expected at {latest_path})"
+            print(f"warning: {reason}; falling back to {legacy}")
+        return legacy
+    return runs[0] / f"{kind}.pt" if runs else legacy
 
 
 # Legacy alias for scripts that import CHECKPOINT_PATH.

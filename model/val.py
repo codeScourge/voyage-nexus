@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -1357,6 +1357,108 @@ def run_embedding_umap(
     )
 
 
+def validate_run_dir(
+    run_dir: Path,
+    *,
+    splits,
+    device: torch.device | None = None,
+    batch_size: int = 32,
+    session_min_samples: int = 3,
+    session_top_k: int = 7,
+    use_color: bool = True,
+    seed: int = 0,
+    checkpoint_hint: Path | None = None,
+    run_embeddings: bool = True,
+    save_report: bool = True,
+) -> dict[str, Any]:
+    """Evaluate best.pt and last.pt in a run directory; optional report and UMAP."""
+    run_dir = Path(run_dir)
+    if device is None:
+        device = get_device()
+
+    ckpt_paths = checkpoint_paths_for_run(run_dir)
+    evaluated: dict[str, tuple[list[dict], dict[str, int], dict]] = {}
+    report_path: Path | None = None
+
+    with capture_report_output() as report_buffer:
+        print(f"device: {device}")
+        print(f"run_dir: {run_dir.resolve()}")
+
+        for kind in ("best", "last"):
+            if kind not in ckpt_paths:
+                print(f"\nwarning: {kind}.pt not found in {run_dir}, skipping")
+                continue
+
+            checkpoint_path = ckpt_paths[kind]
+            if (
+                kind == "last"
+                and "best" in evaluated
+                and checkpoint_path.resolve() == ckpt_paths["best"].resolve()
+            ):
+                _, label_to_idx, ckpt_meta = load_checkpoint(checkpoint_path, device)
+                print_checkpoint_banner(kind, checkpoint_path, ckpt_meta)
+                print("(identical to best.pt — reusing evaluation results)\n")
+                evaluated[kind] = (evaluated["best"][0], label_to_idx, ckpt_meta)
+                continue
+
+            evaluated[kind] = evaluate_checkpoint_report(
+                kind,
+                checkpoint_path,
+                splits=splits,
+                device=device,
+                batch_size=batch_size,
+                session_min_samples=session_min_samples,
+                session_top_k=session_top_k,
+                use_color=use_color,
+                seed=seed,
+            )
+
+        if "best" in evaluated and "last" in evaluated:
+            best_metrics, _best_label_to_idx, best_meta = evaluated["best"]
+            last_metrics, _last_label_to_idx, last_meta = evaluated["last"]
+            idx_to_label = {idx: label for label, idx in _best_label_to_idx.items()}
+            print_model_comparison_meta(
+                best_metrics,
+                last_metrics,
+                best_meta=best_meta,
+                last_meta=last_meta,
+                idx_to_label=idx_to_label,
+            )
+        elif len(evaluated) == 1:
+            only_kind = next(iter(evaluated))
+            print(
+                f"\n(note: only {only_kind}.pt was evaluated; "
+                "need both best and last for comparison)"
+            )
+
+        if run_embeddings:
+            run_embedding_umap(
+                ckpt_paths,
+                splits,
+                device=device,
+                batch_size=batch_size,
+                embedding_splits=EMBEDDING_SPLITS,
+                max_per_label=EMBEDDING_MAX_PER_LABEL,
+                output_path=run_dir / EMBEDDINGS_OUTPUT_NAME,
+                seed=seed,
+                n_neighbors=EMBEDDINGS_N_NEIGHBORS,
+                min_dist=EMBEDDINGS_MIN_DIST,
+            )
+
+    if save_report:
+        report_path = save_validation_report(
+            run_dir,
+            buffer=report_buffer,
+            checkpoint_hint=checkpoint_hint,
+        )
+
+    return {
+        "run_dir": run_dir,
+        "evaluated": evaluated,
+        "report_path": report_path,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Evaluate best.pt and last.pt from a training run.",
@@ -1397,83 +1499,22 @@ def main() -> None:
     use_color = _use_color(force=not args.no_color)
 
     seed_everything(args.seed)
-    device = get_device()
 
     run_dir = resolve_run_dir(args.checkpoint)
-    ckpt_paths = checkpoint_paths_for_run(run_dir)
     splits = load_dataset_splits(args.splits_dir)
 
-    with capture_report_output() as report_buffer:
-        print(f"device: {device}")
-        print(f"run_dir: {run_dir.resolve()}")
-
-        evaluated: dict[str, tuple[list[dict], dict[str, int], dict]] = {}
-        for kind in ("best", "last"):
-            if kind not in ckpt_paths:
-                print(f"\nwarning: {kind}.pt not found in {run_dir}, skipping")
-                continue
-
-            checkpoint_path = ckpt_paths[kind]
-            if (
-                kind == "last"
-                and "best" in evaluated
-                and checkpoint_path.resolve() == ckpt_paths["best"].resolve()
-            ):
-                _, label_to_idx, ckpt_meta = load_checkpoint(checkpoint_path, device)
-                print_checkpoint_banner(kind, checkpoint_path, ckpt_meta)
-                print("(identical to best.pt — reusing evaluation results)\n")
-                evaluated[kind] = (evaluated["best"][0], label_to_idx, ckpt_meta)
-                continue
-
-            evaluated[kind] = evaluate_checkpoint_report(
-                kind,
-                checkpoint_path,
-                splits=splits,
-                device=device,
-                batch_size=args.batch_size,
-                session_min_samples=args.session_min_samples,
-                session_top_k=args.session_top_k,
-                use_color=use_color,
-                seed=args.seed,
-            )
-
-        if "best" in evaluated and "last" in evaluated:
-            best_metrics, _best_label_to_idx, best_meta = evaluated["best"]
-            last_metrics, _last_label_to_idx, last_meta = evaluated["last"]
-            idx_to_label = {idx: label for label, idx in _best_label_to_idx.items()}
-            print_model_comparison_meta(
-                best_metrics,
-                last_metrics,
-                best_meta=best_meta,
-                last_meta=last_meta,
-                idx_to_label=idx_to_label,
-            )
-        elif len(evaluated) == 1:
-            only_kind = next(iter(evaluated))
-            print(
-                f"\n(note: only {only_kind}.pt was evaluated; "
-                "need both best and last for comparison)"
-            )
-
-        run_embedding_umap(
-            ckpt_paths,
-            splits,
-            device=device,
-            batch_size=args.batch_size,
-            embedding_splits=EMBEDDING_SPLITS,
-            max_per_label=EMBEDDING_MAX_PER_LABEL,
-            output_path=run_dir / EMBEDDINGS_OUTPUT_NAME,
-            seed=args.seed,
-            n_neighbors=EMBEDDINGS_N_NEIGHBORS,
-            min_dist=EMBEDDINGS_MIN_DIST,
-        )
-
-    report_path = save_validation_report(
+    result = validate_run_dir(
         run_dir,
-        buffer=report_buffer,
+        splits=splits,
+        batch_size=args.batch_size,
+        session_min_samples=args.session_min_samples,
+        session_top_k=args.session_top_k,
+        use_color=use_color,
+        seed=args.seed,
         checkpoint_hint=args.checkpoint,
     )
-    print(f"report: saved validation report to {report_path.resolve()}")
+    if result["report_path"] is not None:
+        print(f"report: saved validation report to {result['report_path'].resolve()}")
 
 
 if __name__ == "__main__":
