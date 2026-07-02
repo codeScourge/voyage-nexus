@@ -1,14 +1,14 @@
-client/recordings/*
-!client/recordings/.gitkeep
+recordings/*
+!recordings/.gitkeep
 
-client/recordings_unused/*
-!client/recording_unused/.gitkeep
+recordings_unused/*
+!recordings_unused/.gitkeep
 
-model/splits/*
-!model/splits/.gitkeep
+splits/*
+!splits/.gitkeep
 
-model/checkpoints/*
-!model/splits/.checkpoints
+checkpoints/*
+!checkpoints/.gitkeep
 
 # macOS
 .DS_Store

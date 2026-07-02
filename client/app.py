@@ -23,7 +23,8 @@ import serial
 from flask import Flask, jsonify, render_template, request
 from serial.tools import list_ports
 
-_MODEL_ROOT = Path(__file__).resolve().parent.parent / "model"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_MODEL_ROOT = _REPO_ROOT / "model"
 if _MODEL_ROOT.is_dir() and str(_MODEL_ROOT) not in sys.path:
     sys.path.insert(0, str(_MODEL_ROOT))
 
@@ -63,7 +64,7 @@ UPDATE_HZ = 30
 CHANNELS_PER_PAGE = 8
 PLOT_POINTS = 400
 DEFAULT_BAUD = 2_000_000
-DEFAULT_RECORDINGS_DIR = "recordings"
+DEFAULT_RECORDINGS_DIR = _REPO_ROOT / "recordings"
 ALIGNMENT_WINDOW_FRAMES = 512
 THINKING_COUNTDOWN_SECONDS = 3
 COLLECTION_WORDS = ("highlight", "bullshit", "gogogo", "shitbull", "naan", "halloween", "glue")
@@ -2412,7 +2413,7 @@ def create_app(service: AcquisitionService) -> Flask:
     @app.post("/recording/start")
     def start_recording() -> Any:
         payload = request.get_json(silent=True) or {}
-        base_dir = Path(payload.get("base_dir", Path.cwd() / DEFAULT_RECORDINGS_DIR))
+        base_dir = Path(payload.get("base_dir", DEFAULT_RECORDINGS_DIR))
         session_dir = service.start_recording(base_dir)
         return jsonify({"session_dir": str(session_dir)})
 
