@@ -20,6 +20,7 @@ from torch.utils.flop_counter import FlopCounterMode
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
+from _perf import PerfReport, sync_device
 from data import default_label_to_idx, label_probs_to_vector, load_dataset_splits
 
 # ---
@@ -227,7 +228,6 @@ class FusionDataset(torch.utils.data.Dataset):
     def __getitem__(self, i: int):
         sample = self.base[self.indices[i]]
         x = sample["x"]
-        x = (x - x.mean(dim=0, keepdim=True)) / (x.std(dim=0, keepdim=True) + 1e-6)
 
         if self.not_use_eeg:
             eeg = torch.empty(1, 0, x.shape[0], dtype=x.dtype)
@@ -575,16 +575,25 @@ def evaluate_fusion_split(
     n_classes: int,
     idx_to_label: dict[int, str],
     desc: str,
+    device: torch.device,
+    perf: PerfReport | None = None,
 ) -> tuple[float, float, dict[str, float], dict[str, float]]:
     model.eval()
     running = 0.0
     correct = total = 0
     loss_sum, correct_per_class, count_per_class = init_per_class_counters(n_classes, device)
+    batch_wait_started = time.perf_counter()
     for eeg, emg, y_soft, y_hard in tqdm(dataloader, desc=desc, leave=False):
+        if perf is not None:
+            perf.add(f"{desc}/dataloader", time.perf_counter() - batch_wait_started, where="CPU")
+        gpu_started = time.perf_counter()
         eeg, emg = eeg.to(device), emg.to(device)
         y_soft = y_soft.to(device)
         y_hard = y_hard.to(device)
         logits = model(eeg, emg)
+        sync_device(device)
+        if perf is not None:
+            perf.add(f"{desc}/gpu", time.perf_counter() - gpu_started, where="GPU")
         running += soft_cross_entropy(logits, y_soft).item() * y_hard.size(0)
         pred = logits.argmax(1)
         correct += (pred == y_hard).sum().item()
@@ -593,6 +602,7 @@ def evaluate_fusion_split(
             logits, y_hard, pred,
             loss_sum, correct_per_class, count_per_class,
         )
+        batch_wait_started = time.perf_counter()
     split_loss = running / dataset_size if dataset_size else 0.0
     split_acc = correct / total if total else 0.0
     loss_per_label, acc_per_label = per_class_metrics_from_counters(
@@ -854,13 +864,17 @@ def train(
         flop_counter = stack.enter_context(FlopCounterMode(display=False))
         for epoch in epoch_bar:
             epoch_start = time.perf_counter()
+            epoch_perf = PerfReport(f"epoch {epoch + 1}", live=False)
             model.train()
             running = 0.0
             train_correct = train_total = 0
             train_loss_sum, train_correct_per_class, train_count_per_class = init_per_class_counters(
                 n_classes, device,
             )
+            batch_wait_started = time.perf_counter()
             for eeg, emg, y_soft, y_hard in tqdm(train_dl, desc="train", leave=False):
+                epoch_perf.add("train/dataloader", time.perf_counter() - batch_wait_started, where="CPU")
+                gpu_started = time.perf_counter()
                 eeg, emg = eeg.to(device), emg.to(device)
                 y_soft = y_soft.to(device)
                 y_hard = y_hard.to(device)
@@ -869,6 +883,8 @@ def train(
                 loss = soft_cross_entropy(logits, y_soft)
                 loss.backward()
                 opt.step()
+                sync_device(device)
+                epoch_perf.add("train/gpu", time.perf_counter() - gpu_started, where="GPU")
                 running += loss.item() * y_hard.size(0)
                 pred = logits.argmax(1)
                 train_correct += (pred == y_hard).sum().item()
@@ -877,6 +893,7 @@ def train(
                     logits, y_hard, pred,
                     train_loss_sum, train_correct_per_class, train_count_per_class,
                 )
+                batch_wait_started = time.perf_counter()
 
             train_loss = running / len(train_ds)
             train_acc = train_correct / train_total if train_total else 0.0
@@ -884,7 +901,6 @@ def train(
                 train_loss_sum, train_correct_per_class, train_count_per_class, idx_to_label,
             )
 
-        
             val_loss, val_acc, val_loss_per_label, val_acc_per_label = evaluate_fusion_split(
                 model,
                 val_dl,
@@ -892,6 +908,8 @@ def train(
                 n_classes=n_classes,
                 idx_to_label=idx_to_label,
                 desc="val",
+                device=device,
+                perf=epoch_perf,
             )
             test_loss, test_acc, test_loss_per_label, test_acc_per_label = evaluate_fusion_split(
                 model,
@@ -900,6 +918,8 @@ def train(
                 n_classes=n_classes,
                 idx_to_label=idx_to_label,
                 desc="test",
+                device=device,
+                perf=epoch_perf,
             )
 
             epoch_num = epoch + 1
@@ -929,6 +949,7 @@ def train(
                     "val_loss": val_loss,
                     "val_acc": val_acc,
                 }
+                ckpt_started = time.perf_counter()
                 write_checkpoint(
                     run_dir / "best.pt",
                     kind="best",
@@ -940,6 +961,7 @@ def train(
                     state_dict=best_state,
                     log=False,
                 )
+                epoch_perf.add("checkpoint/best", time.perf_counter() - ckpt_started, where="I/O")
                 epoch_notes.append(f"saved best.pt (epoch {epoch_num})")
 
             smoothed_stop = smoothed_tail(history[stop_metric_key], early_stopping_smooth_window)
@@ -957,6 +979,7 @@ def train(
 
             if save_interval > 0 and epoch_num % save_interval == 0:
                 ckpt_name = f"epoch_{epoch_num:04d}.pt"
+                ckpt_started = time.perf_counter()
                 write_checkpoint(
                     run_dir / ckpt_name,
                     kind="epoch",
@@ -967,9 +990,12 @@ def train(
                     val_acc=val_acc,
                     log=False,
                 )
+                epoch_perf.add(f"checkpoint/{ckpt_name}", time.perf_counter() - ckpt_started, where="I/O")
                 epoch_notes.append(f"saved {ckpt_name}")
 
             epoch_time = time.perf_counter() - epoch_start
+            epoch_perf.add("epoch/overhead", max(0.0, epoch_time - epoch_perf.total_seconds()), where="CPU")
+            epoch_bar.write(epoch_perf.format_block(min_pct=1.0, max_rows=10))
             epoch_bar.write(
                 format_epoch_summary(
                     epoch_num,
@@ -1034,12 +1060,16 @@ def train(
         )
         model.load_state_dict(best_state)
 
+    plot_started = time.perf_counter()
     plot_training_history(
         history,
         run_dir / "training_history.png",
         idx_to_label=idx_to_label,
         best_epoch=best_metrics["epoch"] if best_state is not None else None,
     )
+    plot_perf = PerfReport("training wrap-up")
+    plot_perf.add("plot_history", time.perf_counter() - plot_started, where="CPU")
+    plot_perf.print_summary()
 
     run_elapsed = time.perf_counter() - run_start
     tqdm.write("")
@@ -1142,7 +1172,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     SPLITS_DIR = Path(__file__).resolve().parent.parent / "splits"
+    load_perf = PerfReport("load splits")
+    load_started = time.perf_counter()
     splits = load_dataset_splits(SPLITS_DIR)
+    load_perf.add("load_dataset_splits", time.perf_counter() - load_started, where="I/O")
+    load_perf.print_summary()
 
     continue_from: Path | None = None
     if args.continue_training:

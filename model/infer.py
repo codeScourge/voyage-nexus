@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from _preprocessors import EEG_CHANNELS, EMG_CHANNELS
+from data import normalize_window_per_sample
 
 
 def fix_window_length(
@@ -34,8 +35,8 @@ def fix_window_length(
 
 def prepare_fusion_sample(window_tc: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
     """Return eeg, emg each (1, C, T) — identical to FusionDataset.__getitem__."""
-    x = torch.from_numpy(np.asarray(window_tc, dtype=np.float32))
-    x = (x - x.mean(dim=0, keepdim=True)) / (x.std(dim=0, keepdim=True) + 1e-6)
+    window = normalize_window_per_sample(np.asarray(window_tc, dtype=np.float32))
+    x = torch.from_numpy(window)
     eeg = x[:, EEG_CHANNELS].T.unsqueeze(0)
     emg = x[:, EMG_CHANNELS].T.unsqueeze(0)
     return eeg, emg

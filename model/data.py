@@ -16,6 +16,7 @@ import torch
 from torch.utils.data import Dataset, Subset
 from tqdm import tqdm
 
+from _perf import PerfReport
 from _preprocessors import (
     BandpassConfig,
     DEFAULT_EEG_BANDPASS_CONFIG,
@@ -1225,6 +1226,31 @@ class EventWindowBatch:
         return int(self.x.shape[2]) if self.x.ndim == 3 else 32
 
 
+WINDOW_NORM_EPS = 1e-6
+
+
+def normalize_window_per_sample(window: np.ndarray, *, eps: float = WINDOW_NORM_EPS) -> np.ndarray:
+    """Z-score one (time, channels) window along time, per channel."""
+    if window.size == 0:
+        return window.astype(np.float32, copy=False)
+    mean = window.mean(axis=0, keepdims=True)
+    std = window.std(axis=0, keepdims=True)
+    return ((window - mean) / (std + eps)).astype(np.float32, copy=False)
+
+
+def normalize_windows_per_sample(
+    windows: np.ndarray,
+    *,
+    eps: float = WINDOW_NORM_EPS,
+) -> np.ndarray:
+    """Z-score each (time, channels) window along time, per channel. Input: (N, T, C)."""
+    if windows.size == 0:
+        return windows.astype(np.float32, copy=False)
+    mean = windows.mean(axis=1, keepdims=True)
+    std = windows.std(axis=1, keepdims=True)
+    return ((windows - mean) / (std + eps)).astype(np.float32, copy=False)
+
+
 def _fix_windows_to_length(
     windows: Union[np.ndarray, Sequence[np.ndarray]],
     target_len: int,
@@ -1275,6 +1301,7 @@ def build_event_windows(
     eeg_bandpass: Optional[BandpassConfig] = DEFAULT_EEG_BANDPASS_CONFIG,
     emg_bandpass: Optional[BandpassConfig] = DEFAULT_EMG_BANDPASS_CONFIG,
     filter_order: int = 4,
+    perf: PerfReport | None = None,
 ) -> EventWindowBatch:
     """Build fixed-length windows from labelled events.
 
@@ -1283,9 +1310,13 @@ def build_event_windows(
     All windows are center-cropped/padded to a common target_len.
     """
     session_dir = Path(session_dir)
+    meta_started = time.perf_counter()
     meta = load_session_meta(session_dir)
     events = load_events(session_dir)
+    if perf is not None:
+        perf.add("load_meta_events", time.perf_counter() - meta_started, where="I/O")
 
+    load_started = time.perf_counter()
     session_channels = load_session_channels(
         session_dir,
         line_noise=line_noise,
@@ -1293,6 +1324,8 @@ def build_event_windows(
         emg_bandpass=emg_bandpass,
         filter_order=filter_order,
     )
+    if perf is not None:
+        perf.add("load_filter_channels", time.perf_counter() - load_started, where="CPU")
     fs = session_channels.sample_rate_hz
     channels = session_channels.channels
     sample_indices = session_channels.sample_indices
@@ -1310,6 +1343,7 @@ def build_event_windows(
     center_samples: list[int] = []
     skipped = 0
 
+    extract_started = time.perf_counter()
     for event in events:
         event_type = event.get("event_type", "")
         if event_types is not None and event_type not in event_types:
@@ -1436,6 +1470,9 @@ def build_event_windows(
             skipped=skipped,
         )
 
+    if perf is not None:
+        perf.add("extract_windows", time.perf_counter() - extract_started, where="CPU")
+
     if raw_windows and len(label_probs) != len(raw_windows):
         raise RuntimeError(
             f"label_probs length ({len(label_probs)}) != windows ({len(raw_windows)})"
@@ -1447,12 +1484,15 @@ def build_event_windows(
             target_len = int(np.median([w.shape[0] for w in raw_windows]))
             target_len = max(target_len, 1)
         n_ch = channels.shape[1]
+        fix_started = time.perf_counter()
         x = _fix_windows_to_length(
             raw_windows,
             target_len,
             n_ch=n_ch,
             pad_value=pad_value,
         )
+        if perf is not None:
+            perf.add("fix_window_length", time.perf_counter() - fix_started, where="CPU")
     else:
         target_len = target_len or 1
         x = np.zeros((0, target_len, channels.shape[1]), dtype=np.float32)
@@ -1472,7 +1512,11 @@ def build_event_windows(
         label_probs=tuple(label_probs),
     )
 
-def _merge_batches(batches: Sequence[EventWindowBatch]) -> EventWindowBatch:
+def _merge_batches(
+    batches: Sequence[EventWindowBatch],
+    *,
+    perf: PerfReport | None = None,
+) -> EventWindowBatch:
     if not batches:
         raise ValueError("At least one session batch is required")
 
@@ -1486,45 +1530,71 @@ def _merge_batches(batches: Sequence[EventWindowBatch]) -> EventWindowBatch:
             raise ValueError("All sessions must use the same pre_ms/post_ms window")
 
     if len(batches) == 1:
-        return batches[0]
+        x = batches[0].x
+        labels = batches[0].labels
+        event_types = batches[0].event_types
+        event_ids = batches[0].event_ids
+        collection_block_ids = batches[0].collection_block_ids
+        center_sample_index = batches[0].center_sample_index
+        session_dirs = batches[0].session_dirs
+        skipped = batches[0].skipped
+        label_probs = batches[0].label_probs
+    else:
+        target_len = max(batch.window_len for batch in batches)
+        align_started = time.perf_counter()
+        aligned_x = [
+            _fix_windows_to_length(batch.x, target_len)
+            if batch.window_len != target_len
+            else batch.x
+            for batch in batches
+        ]
+        if perf is not None:
+            perf.add("align_window_length", time.perf_counter() - align_started, where="CPU")
 
-    target_len = max(batch.window_len for batch in batches)
-    aligned_x = [
-        _fix_windows_to_length(batch.x, target_len)
-        if batch.window_len != target_len
-        else batch.x
-        for batch in batches
-    ]
+        def _batch_label_probs(batch: EventWindowBatch) -> tuple[Optional[dict[str, float]], ...]:
+            if batch.label_probs:
+                return batch.label_probs
+            return tuple(None for _ in batch.labels)
 
-    def _batch_label_probs(batch: EventWindowBatch) -> tuple[Optional[dict[str, float]], ...]:
-        if batch.label_probs:
-            return batch.label_probs
-        return tuple(None for _ in batch.labels)
-
-    return EventWindowBatch(
-        x=np.concatenate(aligned_x, axis=0),
-        labels=tuple(label for batch in batches for label in batch.labels),
-        event_types=tuple(event_type for batch in batches for event_type in batch.event_types),
-        event_ids=tuple(event_id for batch in batches for event_id in batch.event_ids),
-        collection_block_ids=tuple(
+        x = np.concatenate(aligned_x, axis=0)
+        labels = tuple(label for batch in batches for label in batch.labels)
+        event_types = tuple(event_type for batch in batches for event_type in batch.event_types)
+        event_ids = tuple(event_id for batch in batches for event_id in batch.event_ids)
+        collection_block_ids = tuple(
             block_id for batch in batches for block_id in batch.collection_block_ids
-        ),
-        center_sample_index=np.concatenate(
+        )
+        center_sample_index = np.concatenate(
             [batch.center_sample_index for batch in batches],
             axis=0,
-        ),
-        session_dirs=tuple(
+        )
+        session_dirs = tuple(
             session_dir for batch in batches for session_dir in batch.session_dirs
-        ),
-        sample_rate_hz=sample_rate_hz,
-        pre_samples=pre_samples,
-        post_samples=post_samples,
-        skipped=sum(batch.skipped for batch in batches),
-        label_probs=tuple(
+        )
+        skipped = sum(batch.skipped for batch in batches)
+        label_probs = tuple(
             probs
             for batch in batches
             for probs in _batch_label_probs(batch)
-        ),
+        )
+
+    norm_started = time.perf_counter()
+    x = normalize_windows_per_sample(x)
+    if perf is not None:
+        perf.add("normalize_windows", time.perf_counter() - norm_started, where="CPU")
+
+    return EventWindowBatch(
+        x=x,
+        labels=labels,
+        event_types=event_types,
+        event_ids=event_ids,
+        collection_block_ids=collection_block_ids,
+        center_sample_index=center_sample_index,
+        session_dirs=session_dirs,
+        sample_rate_hz=sample_rate_hz,
+        pre_samples=pre_samples,
+        post_samples=post_samples,
+        skipped=skipped,
+        label_probs=label_probs,
     )
 
 
@@ -1546,6 +1616,7 @@ class SessionEventDataset(Dataset):
         dtype: torch.dtype = torch.float32,
         channel_first: bool = False,
         show_progress: bool = False,
+        perf: PerfReport | None = None,
     ) -> None:
         if isinstance(session_dirs, (str, Path)):
             dirs = [Path(session_dirs)]
@@ -1564,6 +1635,7 @@ class SessionEventDataset(Dataset):
         build_started = time.perf_counter()
         for session_dir in progress:
             session_started = time.perf_counter()
+            session_perf = PerfReport(live=False) if perf is not None else None
             batch = build_event_windows(
                 session_dir,
                 pre_ms=pre_ms,
@@ -1573,6 +1645,7 @@ class SessionEventDataset(Dataset):
                 eeg_bandpass=eeg_bandpass,
                 emg_bandpass=emg_bandpass,
                 filter_order=filter_order,
+                perf=session_perf,
             )
             batches.append(batch)
             session_elapsed = time.perf_counter() - session_started
@@ -1581,8 +1654,28 @@ class SessionEventDataset(Dataset):
                 skipped=batch.skipped,
                 last_s=f"{session_elapsed:.1f}",
             )
+            if perf is not None and session_perf is not None:
+                for entry in session_perf.entries:
+                    perf.add(f"session/{entry.name}", entry.seconds, where=entry.where)
+                session_total = session_perf.total_seconds()
+                if session_total >= 1.0:
+                    tqdm.write(
+                        session_perf.format_block(
+                            prefix=f"{session_dir.name} ",
+                            min_pct=1.0,
+                            max_rows=6,
+                        )
+                    )
         self.build_elapsed_s = time.perf_counter() - build_started
-        batch = _merge_batches(batches)
+        merge_perf = PerfReport("merge", live=False) if perf is not None else None
+        batch = _merge_batches(batches, perf=merge_perf)
+        if perf is not None and merge_perf is not None:
+            for entry in merge_perf.entries:
+                perf.add(entry.name, entry.seconds, where=entry.where)
+            if show_progress:
+                tqdm.write(merge_perf.format_block(min_pct=0.0))
+            else:
+                merge_perf.print_block(min_pct=0.0)
 
         self._batch = batch
         self._label_to_idx = label_to_idx
@@ -2032,17 +2125,23 @@ def build_dataset_splits(
     stratified_label_split: bool = False,
     label_max_fractions: Optional[dict[str, float]] = None,
     show_progress: bool = True,
+    perf: PerfReport | None = None,
 ) -> DatasetSplits:
     from _viewer_core import discover_sessions
 
     recordings_path = Path(recordings_path)
+    discover_started = time.perf_counter()
     sessions = discover_sessions(recordings_path)
+    if perf is not None:
+        perf.add("discover_sessions", time.perf_counter() - discover_started, where="I/O")
     dataset = SessionEventDataset(
         sessions,
         pre_ms=pre_ms,
         post_ms=post_ms,
         show_progress=show_progress,
+        perf=perf,
     )
+    split_started = time.perf_counter()
     (
         train_indices,
         val_indices,
@@ -2057,9 +2156,12 @@ def build_dataset_splits(
         intra_session_test_split=intra_session_test_split,
         stratified_label_split=stratified_label_split,
     )
+    if perf is not None:
+        perf.add("split_indices", time.perf_counter() - split_started, where="CPU")
     block_ids = dataset.batch.collection_block_ids or tuple(
         _block_id_from_event_id(event_id) for event_id in dataset.batch.event_ids
     )
+    cap_started = time.perf_counter()
     (
         train_indices,
         val_indices,
@@ -2075,6 +2177,8 @@ def build_dataset_splits(
         per_sample_event_ids=dataset.batch.event_ids,
         label_max_fractions=label_max_fractions,
     )
+    if perf is not None:
+        perf.add("label_fraction_caps", time.perf_counter() - cap_started, where="CPU")
     return DatasetSplits(
         dataset=dataset,
         train=Subset(dataset, train_indices.tolist()),
@@ -2124,8 +2228,9 @@ def save_dataset_splits(output_dir: Path, splits: DatasetSplits) -> None:
             label_probs_manifest.append(None)
 
     manifest = {
-        "version": 4,
+        "version": 5,
         "seed": SPLIT_SEED,
+        "per_sample_normalized": True,
         "recordings_path": str(splits.recordings_path.resolve()),
         "pre_ms": splits.pre_ms,
         "post_ms": splits.post_ms,
@@ -2167,6 +2272,15 @@ def load_dataset_splits(splits_dir: Path) -> DatasetSplits:
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     windows = np.load(windows_path)
+    if manifest.get("per_sample_normalized", False):
+        x = windows["x"]
+    else:
+        x = normalize_windows_per_sample(windows["x"])
+        print(
+            "load_dataset_splits: legacy splits without per_sample_normalized; "
+            "normalized on load — rebuild splits to persist.",
+            flush=True,
+        )
 
     if "collection_block_ids" in manifest:
         collection_block_ids = tuple(manifest["collection_block_ids"])
@@ -2196,7 +2310,7 @@ def load_dataset_splits(splits_dir: Path) -> DatasetSplits:
         )
 
     batch = EventWindowBatch(
-        x=windows["x"],
+        x=x,
         labels=tuple(manifest["labels"]),
         event_types=tuple(manifest["event_types"]),
         event_ids=tuple(manifest["event_ids"]),
@@ -2453,7 +2567,7 @@ if __name__ == "__main__":
     seed_everything(SEED)
 
     total_started = time.perf_counter()
-    build_started = time.perf_counter()
+    build_perf = PerfReport("dataset build", live=False)
 
     splits = build_dataset_splits(
         RECORDINGS_PATH,
@@ -2464,17 +2578,23 @@ if __name__ == "__main__":
         stratified_label_split=STRATIFIED_LABEL_SPLIT,
         label_max_fractions=LABEL_MAX_FRACTIONS,
         show_progress=True,
+        perf=build_perf,
     )
 
+    build_wall = time.perf_counter() - total_started
+    build_perf.print_summary(wall_seconds=build_wall)
 
-    build_elapsed = time.perf_counter() - build_started
     save_started = time.perf_counter()
-
     save_dataset_splits(SPLITS_OUTPUT_DIR, splits)
-
     save_elapsed = time.perf_counter() - save_started
     total_elapsed = time.perf_counter() - total_started
 
+    save_perf = PerfReport("dataset save")
+    save_perf.add("write_splits", save_elapsed, where="I/O")
+    save_perf.print_summary()
+
     print(f"Saved splits to {SPLITS_OUTPUT_DIR.resolve()}")
-    print(f"Timing: build={build_elapsed:.1f}s, save={save_elapsed:.1f}s, total={total_elapsed:.1f}s")
+    print(
+        f"Timing: build={build_wall:.1f}s, save={save_elapsed:.1f}s, total={total_elapsed:.1f}s"
+    )
     print_split_summary(splits)
