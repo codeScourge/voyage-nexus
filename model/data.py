@@ -60,8 +60,9 @@ STRATIFIED_LABEL_SPLIT = True
 
 # --- tech shit
 SEED = 42
-RECORDINGS_PATH = Path(__file__).resolve().parent.parent / "client" / "recordings"
-SPLITS_OUTPUT_DIR = Path(__file__).resolve().parent / "splits"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+RECORDINGS_PATH = _REPO_ROOT / "recordings"
+SPLITS_OUTPUT_DIR = _REPO_ROOT / "splits"
 PRE_MS = 0.0
 POST_MS = 0.0
 

@@ -14,7 +14,7 @@ from data import (
     transition_label_probs_from_event_id,
 )
 
-DEFAULT_SPLITS_DIR = Path(__file__).resolve().parent / "splits"
+DEFAULT_SPLITS_DIR = Path(__file__).resolve().parent.parent / "splits"
 
 
 def _format_probs(probs: dict[str, float]) -> str:

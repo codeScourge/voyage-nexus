@@ -1370,7 +1370,7 @@ def main() -> None:
     parser.add_argument(
         "--splits-dir",
         type=Path,
-        default=Path(__file__).resolve().parent / "splits",
+        default=Path(__file__).resolve().parent.parent / "splits",
         help="Directory with splits_manifest.json and splits_windows.npz",
     )
     parser.add_argument("--batch-size", type=int, default=32)

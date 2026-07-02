@@ -314,7 +314,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--splits-dir",
         type=Path,
-        default=Path(__file__).resolve().parent / "splits",
+        default=Path(__file__).resolve().parent.parent / "splits",
         help="directory with saved dataset splits",
     )
     parser.add_argument(

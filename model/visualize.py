@@ -88,7 +88,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--path",
         type=Path,
-        default=Path("../client/recordings"),
+        default=Path(__file__).resolve().parent.parent / "recordings",
         help="Session directory or parent folder containing session_* dirs",
     )
     parser.add_argument("--host", default="127.0.0.1")

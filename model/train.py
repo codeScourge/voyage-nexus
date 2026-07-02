@@ -150,7 +150,7 @@ def get_device() -> torch.device:
 
 # --- setup
 device = get_device()
-CHECKPOINT_DIR = Path(__file__).resolve().parent / "checkpoints"
+CHECKPOINT_DIR = Path(__file__).resolve().parent.parent / "checkpoints"
 CHECKPOINT_SAVE_INTERVAL = 5
 EARLY_STOPPING_METRIC = "loss"  # "loss" or "acc" — stop signal only, not best.pt selection
 EARLY_STOPPING_SMOOTH_WINDOW = 4
@@ -1119,14 +1119,14 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    SPLITS_DIR = Path(__file__).resolve().parent / "splits"
+    SPLITS_DIR = Path(__file__).resolve().parent.parent / "splits"
     splits = load_dataset_splits(SPLITS_DIR)
 
     continue_from: Path | None = None
     if args.continue_training:
         source_run = latest_run_dir()
         if source_run is None:
-            raise SystemExit("No checkpoint runs found under model/checkpoints; train from scratch first.")
+            raise SystemExit("No checkpoint runs found under checkpoints/; train from scratch first.")
         continue_from = latest_checkpoint_in_run(source_run)
 
     result = run_training(
