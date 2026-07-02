@@ -1,7 +1,7 @@
 [project]
 name = "voyage-nexus"
 version = "0.1.0"
-description = "Add your description here"
+description = "wassup, nerds"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

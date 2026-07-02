@@ -151,6 +151,7 @@ def get_device() -> torch.device:
 # --- setup
 device = get_device()
 CHECKPOINT_DIR = Path(__file__).resolve().parent.parent / "checkpoints"
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 CHECKPOINT_SAVE_INTERVAL = 5
 EARLY_STOPPING_METRIC = "loss"  # "loss" or "acc" — stop signal only, not best.pt selection
 EARLY_STOPPING_SMOOTH_WINDOW = 4
