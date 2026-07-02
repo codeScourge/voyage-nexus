@@ -1,6 +1,16 @@
 """Run a grid of training experiments and compare results.
 
-Example: both architectures at 33%, 66%, and 100% of training data:
+Output layout (all under repo ``checkpoints/``)::
+
+    checkpoints/meta_<timestamp>_<id>/
+      intermediate_fusion_eegnet_p033/   # one training run per experiment
+      intermediate_fusion_eegnet_p066/
+      cat_net_p100/
+      manifest.json
+      comparison.md
+      comparison.png
+
+Examples::
 
     uv run meta_train.py
     uv run meta_train.py --models intermediate_fusion_eegnet cat_net --fractions 0.33 0.66 1.0
@@ -22,7 +32,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from torch.utils.data import Subset
 
-from data import DatasetSplits, load_dataset_splits
+from data import SPLITS_OUTPUT_DIR, DatasetSplits, load_dataset_splits
 from models import ARCHITECTURES
 from train import CHECKPOINT_DIR, SEED, format_duration, run_training
 
@@ -311,18 +321,6 @@ def parse_args() -> argparse.Namespace:
         default=list(DEFAULT_DATA_FRACTIONS),
         help=f"training data fractions (default: {' '.join(str(f) for f in DEFAULT_DATA_FRACTIONS)})",
     )
-    parser.add_argument(
-        "--splits-dir",
-        type=Path,
-        default=Path(__file__).resolve().parent.parent / "splits",
-        help="directory with saved dataset splits",
-    )
-    parser.add_argument(
-        "--meta-dir",
-        type=Path,
-        default=None,
-        help="output directory for the meta run (default: auto under checkpoints/)",
-    )
     parser.add_argument("--seed", type=int, default=SEED, help=f"random seed (default: {SEED})")
     return parser.parse_args()
 
@@ -334,15 +332,14 @@ def main() -> None:
         if not (0.0 < fraction <= 1.0):
             raise SystemExit(f"invalid fraction {fraction!r}; expected 0 < f <= 1")
 
-    splits = load_dataset_splits(args.splits_dir)
+    splits = load_dataset_splits(SPLITS_OUTPUT_DIR)
     experiments = default_experiment_grid(args.models, args.fractions)
-    meta_dir = Path(args.meta_dir) if args.meta_dir is not None else create_meta_dir()
-
-    if args.meta_dir is not None:
-        meta_dir.mkdir(parents=True, exist_ok=True)
+    meta_dir = create_meta_dir()
 
     grid_summary = ", ".join(f"{s.architecture}@{s.train_fraction:.0%}" for s in experiments)
-    print(f"meta run: {meta_dir}")
+    print(f"checkpoints: {CHECKPOINT_DIR.resolve()}")
+    print(f"splits: {SPLITS_OUTPUT_DIR.resolve()}")
+    print(f"meta run: {meta_dir.resolve()}")
     print(f"grid ({len(experiments)}): {grid_summary}")
 
     results = run_meta_experiments(
