@@ -20,11 +20,13 @@ from tqdm import tqdm
 from collections import defaultdict
 
 from data import load_dataset_splits
-from models import build_fusion_model, get_embedding_taps
+from models import get_embedding_taps
 from train import (
     CHECKPOINT_DIR,
     FusionDataset,
     _per_label_colors,
+    build_model_from_config,
+    fusion_dataset_kwargs,
     get_device,
     latest_run_dir,
     seed_everything,
@@ -34,7 +36,7 @@ from train import (
 # --- embeddings / UMAP (always runs after metrics)
 EMBEDDING_SPLITS = ("val", "test")
 
-# val = held-out sessions (extra-session); test = intra-session holdout from train sessions
+# val = intra-session holdout from train sessions; test = held-out extra sessions
 SPLIT_SESSION_KIND = {
     "val": "extra",
     "test": "intra",
@@ -360,16 +362,8 @@ def load_checkpoint(path: Path, device: torch.device) -> tuple[nn.Module, dict, 
     model_config = ckpt["model_config"]
     label_to_idx: dict[str, int] = ckpt["label_to_idx"]
     state_dict = ckpt["model_state_dict"]
-    architecture = model_config.get("architecture", "intermediate_fusion_eegnet")
 
-    model = build_fusion_model(
-        architecture,
-        n_eeg=model_config["n_eeg"],
-        n_emg=model_config["n_emg"],
-        n_classes=model_config["n_classes"],
-        T=model_config["T"],
-        state_dict=state_dict,
-    )
+    model = build_model_from_config(model_config, state_dict=state_dict)
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
@@ -381,6 +375,7 @@ def load_checkpoint(path: Path, device: torch.device) -> tuple[nn.Module, dict, 
         "val_acc": float(ckpt.get("val_acc", float("nan"))),
         "kind": ckpt.get("kind", "unknown"),
         "checkpoint_device": ckpt.get("device", "unknown"),
+        "model_config": model_config,
     }
     return model, label_to_idx, meta
 
@@ -1035,7 +1030,12 @@ def evaluate_checkpoint_report(
 
     all_metrics: list[dict] = []
     for split_name, indices in split_specs:
-        dataset = FusionDataset(splits.dataset, indices, label_to_idx)
+        dataset = FusionDataset(
+            splits.dataset,
+            indices,
+            label_to_idx,
+            **fusion_dataset_kwargs(ckpt_meta["model_config"]),
+        )
         metrics = evaluate_split(
             model,
             dataset,
@@ -1139,6 +1139,7 @@ def collect_embedding_samples(
     splits,
     label_to_idx: dict[str, int],
     *,
+    model_config: dict,
     device: torch.device,
     batch_size: int,
     embedding_splits: tuple[str, ...],
@@ -1155,7 +1156,12 @@ def collect_embedding_samples(
     for split_name in embedding_splits:
         if split_name not in split_indices:
             raise ValueError(f"unknown embedding split '{split_name}' (choose val, test)")
-        dataset = FusionDataset(splits.dataset, split_indices[split_name], label_to_idx)
+        dataset = FusionDataset(
+            splits.dataset,
+            split_indices[split_name],
+            label_to_idx,
+            **fusion_dataset_kwargs(model_config),
+        )
         samples.extend(
             collect_embeddings(
                 model,
@@ -1317,13 +1323,14 @@ def run_embedding_umap(
             continue
         seen_paths.add(resolved)
 
-        model, label_to_idx, _ = load_checkpoint(checkpoint_path, device)
+        model, label_to_idx, ckpt_meta = load_checkpoint(checkpoint_path, device)
         if embedding_taps is None:
             embedding_taps = get_embedding_taps(model)
         samples = collect_embedding_samples(
             model,
             splits,
             label_to_idx,
+            model_config=ckpt_meta["model_config"],
             device=device,
             batch_size=batch_size,
             embedding_splits=embedding_splits,

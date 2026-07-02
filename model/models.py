@@ -15,6 +15,24 @@ EMBEDDING_TAP_LABELS: dict[str, str] = {
 }
 
 
+def _resolve_modality_flags(
+    *,
+    use_eeg: bool | None,
+    use_emg: bool | None,
+    n_eeg: int,
+    n_emg: int,
+) -> tuple[bool, bool]:
+    resolved_use_eeg = (n_eeg > 0) if use_eeg is None else use_eeg
+    resolved_use_emg = (n_emg > 0) if use_emg is None else use_emg
+    if not resolved_use_eeg and not resolved_use_emg:
+        raise ValueError("At least one modality must be enabled")
+    if resolved_use_eeg and n_eeg <= 0:
+        raise ValueError("n_eeg must be > 0 when EEG is enabled")
+    if resolved_use_emg and n_emg <= 0:
+        raise ValueError("n_emg must be > 0 when EMG is enabled")
+    return resolved_use_eeg, resolved_use_emg
+
+
 class ModalityBranch(nn.Module):
     """EEGNet Block 1: temporal conv -> depthwise spatial conv.
 
@@ -24,17 +42,11 @@ class ModalityBranch(nn.Module):
 
     def __init__(self, n_channels: int, F1: int, D: int, kernel_length: int):
         super().__init__()
-        # temporal conv: 'same' padding so T is preserved. one shared kernel
-        # across all channels, F1 of them.
         self.temporal = nn.Conv2d(
             1, F1, (1, kernel_length),
             padding=(0, kernel_length // 2), bias=False,
         )
         self.bn1 = nn.BatchNorm2d(F1)
-
-        # depthwise spatial conv: kernel (C, 1), valid padding -> collapses
-        # channel axis to 1. groups=F1 ties each spatial filter to one temporal
-        # map. depth multiplier D via out_channels = D*F1.
         self.spatial = nn.Conv2d(
             F1, D * F1, (n_channels, 1),
             groups=F1, bias=False,
@@ -49,19 +61,13 @@ class ModalityBranch(nn.Module):
 
 
 class TimeAvgPool(nn.Module):
-    """Pool along the time axis to a fixed length without AdaptiveAvgPool2d.
-
-    MPS does not implement adaptive pooling when input length is not divisible
-    by the target length (pytorch#96056). Trim trailing samples if needed, then
-    use fixed-kernel average pooling.
-    """
+    """Pool along the time axis to a fixed length without AdaptiveAvgPool2d."""
 
     def __init__(self, out_len: int):
         super().__init__()
         self.out_len = out_len
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, 1, T)
         t = x.shape[-1]
         out = self.out_len
         if t == out:
@@ -76,12 +82,7 @@ class TimeAvgPool(nn.Module):
 
 
 class IntermediateFusionEEGNet(nn.Module):
-    """Two EEGNet Block-1 branches (EEG, EMG) fused before the separable conv.
-
-    Fusion = concat along feature-map axis once both branches are
-    (B, D*F1, 1, T). The shared separable conv then learns cross-modal
-    temporal summaries and mixes EEG+EMG feature maps together.
-    """
+    """EEGNet Block-1 branch(es) fused before the separable conv."""
 
     EMBEDDING_TAPS: ClassVar[dict[str, str]] = EMBEDDING_TAP_LABELS
 
@@ -94,34 +95,42 @@ class IntermediateFusionEEGNet(nn.Module):
         F1: int = 8,
         D: int = 2,
         F2: int = 32,
-        kern_eeg: int = 128,   # half the sampling rate per the paper
-        kern_emg: int = 128,   # tune: EMG carries higher-freq content
+        kern_eeg: int = 128,
+        kern_emg: int = 128,
         sep_kernel: int = 16,
         p_drop: float = 0.25,
+        *,
+        use_eeg: bool | None = None,
+        use_emg: bool | None = None,
     ):
         super().__init__()
-        self.eeg_branch = ModalityBranch(n_eeg, F1, D, kern_eeg)
-        self.emg_branch = ModalityBranch(n_emg, F1, D, kern_emg)
+        self.use_eeg, self.use_emg = _resolve_modality_flags(
+            use_eeg=use_eeg,
+            use_emg=use_emg,
+            n_eeg=n_eeg,
+            n_emg=n_emg,
+        )
+        self.branch_maps = D * F1
 
-        fused_maps = 2 * (D * F1)  # concat of both branches
+        if self.use_eeg:
+            self.eeg_branch = ModalityBranch(n_eeg, F1, D, kern_eeg)
+        if self.use_emg:
+            self.emg_branch = ModalityBranch(n_emg, F1, D, kern_emg)
+
+        fused_maps = self.branch_maps * (int(self.use_eeg) + int(self.use_emg))
 
         pool1_out = max(1, T // 4)
         pool2_out = max(1, pool1_out // 8)
         self.pool1_out = pool1_out
         self.pool2_out = pool2_out
 
-        # fixed pools handle short windows and avoid MPS adaptive-pool limits
         self.pool1 = TimeAvgPool(pool1_out)
         self.drop1 = nn.Dropout(p_drop)
 
-        # --- Block 2: separable conv on the FUSED maps ---
-        # depthwise temporal part: per-map (1, sep_kernel) summary, 'same' pad
         self.sep_depth = nn.Conv2d(
             fused_maps, fused_maps, (1, sep_kernel),
             padding=(0, sep_kernel // 2), groups=fused_maps, bias=False,
         )
-        # pointwise: mix all fused maps -> F2 (this is where EEG and EMG
-        # feature maps actually combine)
         self.sep_point = nn.Conv2d(fused_maps, F2, (1, 1), bias=False)
         self.bn3 = nn.BatchNorm2d(F2)
         self.pool2 = TimeAvgPool(pool2_out)
@@ -131,16 +140,19 @@ class IntermediateFusionEEGNet(nn.Module):
 
     def _encode_branches(
         self, eeg: torch.Tensor, emg: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        e = self.eeg_branch(eeg)
-        m = self.emg_branch(emg)
-        t = min(e.shape[-1], m.shape[-1])
-        return e[..., :t], m[..., :t]
+    ) -> tuple[torch.Tensor, ...]:
+        branches: list[torch.Tensor] = []
+        if self.use_eeg:
+            branches.append(self.eeg_branch(eeg))
+        if self.use_emg:
+            branches.append(self.emg_branch(emg))
+        if len(branches) == 2:
+            t = min(branches[0].shape[-1], branches[1].shape[-1])
+            return branches[0][..., :t], branches[1][..., :t]
+        return (branches[0],)
 
-    def _fusion_embed(
-        self, e: torch.Tensor, m: torch.Tensor, *, apply_dropout: bool,
-    ) -> torch.Tensor:
-        x = torch.cat([e, m], dim=1)
+    def _fusion_embed(self, *branch_maps: torch.Tensor, apply_dropout: bool) -> torch.Tensor:
+        x = branch_maps[0] if len(branch_maps) == 1 else torch.cat(branch_maps, dim=1)
         x = self.pool1(x)
         if apply_dropout:
             x = self.drop1(x)
@@ -153,20 +165,27 @@ class IntermediateFusionEEGNet(nn.Module):
         return torch.flatten(x, start_dim=1)
 
     def forward(self, eeg: torch.Tensor, emg: torch.Tensor) -> torch.Tensor:
-        e, m = self._encode_branches(eeg, emg)
-        fused = self._fusion_embed(e, m, apply_dropout=True)
+        maps = self._encode_branches(eeg, emg)
+        fused = self._fusion_embed(*maps, apply_dropout=True)
         return self.classifier(fused)
 
     def forward_embeddings(self, eeg: torch.Tensor, emg: torch.Tensor) -> dict[str, torch.Tensor]:
         """Per-modality and fused embeddings without dropout (use under model.eval())."""
-        e, m = self._encode_branches(eeg, emg)
-        zero_e = torch.zeros_like(e)
-        zero_m = torch.zeros_like(m)
-        return {
-            "eeg": self._fusion_embed(e, zero_m, apply_dropout=False),
-            "emg": self._fusion_embed(zero_e, m, apply_dropout=False),
-            "fused": self._fusion_embed(e, m, apply_dropout=False),
-        }
+        if self.use_eeg and self.use_emg:
+            e, m = self._encode_branches(eeg, emg)
+            zero_e = torch.zeros_like(e)
+            zero_m = torch.zeros_like(m)
+            return {
+                "eeg": self._fusion_embed(e, zero_m, apply_dropout=False),
+                "emg": self._fusion_embed(zero_e, m, apply_dropout=False),
+                "fused": self._fusion_embed(e, m, apply_dropout=False),
+            }
+
+        maps = self._encode_branches(eeg, emg)
+        fused = self._fusion_embed(*maps, apply_dropout=False)
+        if self.use_eeg:
+            return {"eeg": fused}
+        return {"emg": fused}
 
 
 def _tensor_bc_t(x: torch.Tensor) -> torch.Tensor:
@@ -231,25 +250,19 @@ class ModalityEncoder(nn.Module):
         self.out_dim = 2 * lstm_hidden
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, 1, C, T)
-        seq = _with_temporal_diff(_tensor_bc_t(x))          # (B, T', 2C)
-        h = seq.transpose(1, 2)                           # (B, 2C, T')
+        seq = _with_temporal_diff(_tensor_bc_t(x))
+        h = seq.transpose(1, 2)
         h = F.relu(self.conv1(h))
         h = F.relu(self.conv2(h))
         h = self.pool(h)
         h = self.channel_attn(h)
-        h = h.transpose(1, 2)                             # (B, T'', C2)
+        h = h.transpose(1, 2)
         out, _ = self.temporal(h)
-        return out                                          # (B, T'', 2*lstm_hidden)
+        return out
 
 
 class CATNet(nn.Module):
-    """Cross-attention EEG-EMG fusion network (CAT-Net, without domain adversary).
-
-    Zhuang et al., CAT-Net: A Cross-Attention Tone Network for Cross-Subject
-    EEG-EMG Fusion Tone Decoding. Implements spatial-temporal encoders,
-    bidirectional cross-attention fusion, and a tone classifier only.
-    """
+    """Cross-attention EEG-EMG fusion network (CAT-Net, without domain adversary)."""
 
     EMBEDDING_TAPS: ClassVar[dict[str, str]] = EMBEDDING_TAP_LABELS
 
@@ -266,38 +279,63 @@ class CATNet(nn.Module):
         attn_dim: int = 128,
         fusion_dim: int = 128,
         p_drop: float = 0.4,
+        use_eeg: bool | None = None,
+        use_emg: bool | None = None,
     ):
         super().__init__()
-        del T  # sequence length is inferred at runtime
-        self.eeg_encoder = ModalityEncoder(n_eeg, conv_dims=conv_dims, lstm_hidden=lstm_hidden)
-        self.emg_encoder = ModalityEncoder(n_emg, conv_dims=conv_dims, lstm_hidden=lstm_hidden)
-        embed_dim = self.eeg_encoder.out_dim
-        if embed_dim != attn_dim:
-            raise ValueError(
-                f"encoder output dim {embed_dim} must match attn_dim {attn_dim}; "
-                "adjust lstm_hidden or attn_dim"
-            )
-
-        self.eeg_cross = nn.MultiheadAttention(
-            embed_dim, attn_heads, batch_first=True,
+        del T
+        self.use_eeg, self.use_emg = _resolve_modality_flags(
+            use_eeg=use_eeg,
+            use_emg=use_emg,
+            n_eeg=n_eeg,
+            n_emg=n_emg,
         )
-        self.emg_cross = nn.MultiheadAttention(
-            embed_dim, attn_heads, batch_first=True,
-        )
-        self.norm_eeg = nn.LayerNorm(embed_dim)
-        self.norm_emg = nn.LayerNorm(embed_dim)
-        self.proj_eeg = nn.Linear(embed_dim * 2, fusion_dim)
-        self.proj_emg = nn.Linear(embed_dim * 2, fusion_dim)
+        self.fusion_dim = fusion_dim
         self.drop = nn.Dropout(p_drop)
-        self.classifier = nn.Linear(fusion_dim * 2, n_classes)
+
+        if self.use_eeg:
+            self.eeg_encoder = ModalityEncoder(n_eeg, conv_dims=conv_dims, lstm_hidden=lstm_hidden)
+        if self.use_emg:
+            self.emg_encoder = ModalityEncoder(n_emg, conv_dims=conv_dims, lstm_hidden=lstm_hidden)
+
+        if self.use_eeg and self.use_emg:
+            embed_dim = self.eeg_encoder.out_dim
+            if embed_dim != attn_dim:
+                raise ValueError(
+                    f"encoder output dim {embed_dim} must match attn_dim {attn_dim}; "
+                    "adjust lstm_hidden or attn_dim"
+                )
+            self.eeg_cross = nn.MultiheadAttention(
+                embed_dim, attn_heads, batch_first=True,
+            )
+            self.emg_cross = nn.MultiheadAttention(
+                embed_dim, attn_heads, batch_first=True,
+            )
+            self.norm_eeg = nn.LayerNorm(embed_dim)
+            self.norm_emg = nn.LayerNorm(embed_dim)
+            self.proj_eeg = nn.Linear(embed_dim * 2, fusion_dim)
+            self.proj_emg = nn.Linear(embed_dim * 2, fusion_dim)
+            self.classifier = nn.Linear(fusion_dim * 2, n_classes)
+        elif self.use_eeg:
+            self.proj_eeg = nn.Linear(self.eeg_encoder.out_dim * 2, fusion_dim)
+            self.classifier = nn.Linear(fusion_dim, n_classes)
+        else:
+            self.proj_emg = nn.Linear(self.emg_encoder.out_dim * 2, fusion_dim)
+            self.classifier = nn.Linear(fusion_dim, n_classes)
+
+    def _pool_proj(self, z: torch.Tensor, proj: nn.Linear) -> torch.Tensor:
+        pooled = torch.cat([z.mean(dim=1), z.amax(dim=1)], dim=-1)
+        return proj(pooled)
 
     def _encode_pair(
         self, eeg: torch.Tensor, emg: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        z_eeg = self.eeg_encoder(eeg)
-        z_emg = self.emg_encoder(emg)
-        t = min(z_eeg.shape[1], z_emg.shape[1])
-        return z_eeg[:, :t, :], z_emg[:, :t, :]
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        z_eeg = self.eeg_encoder(eeg) if self.use_eeg else None
+        z_emg = self.emg_encoder(emg) if self.use_emg else None
+        if z_eeg is not None and z_emg is not None:
+            t = min(z_eeg.shape[1], z_emg.shape[1])
+            return z_eeg[:, :t, :], z_emg[:, :t, :]
+        return z_eeg, z_emg
 
     def _cross_fuse(
         self, z_eeg: torch.Tensor, z_emg: torch.Tensor, *, apply_dropout: bool,
@@ -307,10 +345,8 @@ class CATNet(nn.Module):
         c_eeg = self.norm_eeg(c_eeg)
         c_emg = self.norm_emg(c_emg)
 
-        p_eeg = torch.cat([c_eeg.mean(dim=1), c_eeg.amax(dim=1)], dim=-1)
-        p_emg = torch.cat([c_emg.mean(dim=1), c_emg.amax(dim=1)], dim=-1)
-        f_eeg = self.proj_eeg(p_eeg)
-        f_emg = self.proj_emg(p_emg)
+        f_eeg = self._pool_proj(c_eeg, self.proj_eeg)
+        f_emg = self._pool_proj(c_emg, self.proj_emg)
         fused = torch.cat([f_eeg, f_emg], dim=-1)
         if apply_dropout:
             fused = self.drop(fused)
@@ -318,14 +354,25 @@ class CATNet(nn.Module):
 
     def forward(self, eeg: torch.Tensor, emg: torch.Tensor) -> torch.Tensor:
         z_eeg, z_emg = self._encode_pair(eeg, emg)
-        _, _, fused = self._cross_fuse(z_eeg, z_emg, apply_dropout=True)
+        if self.use_eeg and self.use_emg:
+            _, _, fused = self._cross_fuse(z_eeg, z_emg, apply_dropout=True)
+            return self.classifier(fused)
+        if self.use_eeg:
+            fused = self._pool_proj(z_eeg, self.proj_eeg)
+        else:
+            fused = self._pool_proj(z_emg, self.proj_emg)
+        if self.drop.p > 0.0:
+            fused = self.drop(fused)
         return self.classifier(fused)
 
     def forward_embeddings(self, eeg: torch.Tensor, emg: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Per-modality and fused embeddings without dropout (use under model.eval())."""
         z_eeg, z_emg = self._encode_pair(eeg, emg)
-        f_eeg, f_emg, fused = self._cross_fuse(z_eeg, z_emg, apply_dropout=False)
-        return {"eeg": f_eeg, "emg": f_emg, "fused": fused}
+        if self.use_eeg and self.use_emg:
+            f_eeg, f_emg, fused = self._cross_fuse(z_eeg, z_emg, apply_dropout=False)
+            return {"eeg": f_eeg, "emg": f_emg, "fused": fused}
+        if self.use_eeg:
+            return {"eeg": self._pool_proj(z_eeg, self.proj_eeg)}
+        return {"emg": self._pool_proj(z_emg, self.proj_emg)}
 
 
 ARCHITECTURES: dict[str, type[nn.Module]] = {
@@ -335,11 +382,16 @@ ARCHITECTURES: dict[str, type[nn.Module]] = {
 
 
 def get_embedding_taps(model: nn.Module) -> dict[str, str]:
-    """Return ordered tap key -> plot title for a fusion model."""
-    taps = getattr(type(model), "EMBEDDING_TAPS", None)
-    if not taps:
-        raise TypeError(f"{type(model).__name__} does not define EMBEDDING_TAPS")
-    return dict(taps)
+    """Return tap key -> plot title for the modalities present in the model."""
+    use_eeg = getattr(model, "use_eeg", True)
+    use_emg = getattr(model, "use_emg", True)
+    if use_eeg and use_emg:
+        return dict(EMBEDDING_TAP_LABELS)
+    if use_eeg:
+        return {"eeg": EMBEDDING_TAP_LABELS["eeg"]}
+    if use_emg:
+        return {"emg": EMBEDDING_TAP_LABELS["emg"]}
+    raise TypeError(f"{type(model).__name__} has no enabled modalities")
 
 
 def build_fusion_model(
@@ -350,6 +402,8 @@ def build_fusion_model(
     n_classes: int,
     T: int,
     state_dict: dict[str, torch.Tensor] | None = None,
+    use_eeg: bool | None = None,
+    use_emg: bool | None = None,
     **kwargs,
 ) -> nn.Module:
     if architecture not in ARCHITECTURES:
@@ -367,6 +421,8 @@ def build_fusion_model(
         n_emg=n_emg,
         n_classes=n_classes,
         T=T,
+        use_eeg=use_eeg,
+        use_emg=use_emg,
         **model_kwargs,
     )
 

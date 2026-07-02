@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 from data import default_label_to_idx, label_probs_to_vector, load_dataset_splits
 
 # ---
-SEED = 42
+SEED = 56 # 42 always
 TORCH_DETERMINISTIC = False
 RUN_DIR_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}")
 
@@ -157,25 +157,68 @@ EARLY_STOPPING_SMOOTH_WINDOW = 4
 MODEL_ARCHITECTURE = "intermediate_fusion_eegnet"  # or "cat_net"
 
 
-# Dummy width for a disabled modality branch (models require n_channels >= 1).
-DISABLED_MODALITY_CHANNELS = 1
+def use_eeg_from_config(model_config: dict) -> bool:
+    return not model_config.get("not_use_eeg", False)
 
 
-def _modality_input(x: torch.Tensor, indices: list[int], *, disabled: bool) -> torch.Tensor:
-    """Return (1, C, T) for one modality; zeros when the modality is disabled."""
-    if disabled:
-        return torch.zeros(1, DISABLED_MODALITY_CHANNELS, x.shape[0], dtype=x.dtype)
-    return x[:, indices].T.unsqueeze(0)
+def use_emg_from_config(model_config: dict) -> bool:
+    return not model_config.get("not_use_emg", False)
+
+
+def fusion_dataset_kwargs(model_config: dict | None = None) -> dict:
+    if model_config is None:
+        return {}
+    return {
+        "not_use_eeg": model_config.get("not_use_eeg", False),
+        "not_use_emg": model_config.get("not_use_emg", False),
+    }
+
+
+def build_model_from_config(
+    model_config: dict,
+    *,
+    state_dict: dict | None = None,
+) -> nn.Module:
+    use_eeg = use_eeg_from_config(model_config)
+    use_emg = use_emg_from_config(model_config)
+    active_eeg = model_config.get("active_eeg_indices", [])
+    active_emg = model_config.get("active_emg_indices", [])
+    n_eeg = len(active_eeg) if use_eeg else 0
+    n_emg = len(active_emg) if use_emg else 0
+    if use_eeg and n_eeg == 0:
+        n_eeg = int(model_config["n_eeg"])
+    if use_emg and n_emg == 0:
+        n_emg = int(model_config["n_emg"])
+    return build_fusion_model(
+        model_config.get("architecture", MODEL_ARCHITECTURE),
+        n_eeg=n_eeg,
+        n_emg=n_emg,
+        n_classes=model_config["n_classes"],
+        T=model_config["T"],
+        use_eeg=use_eeg,
+        use_emg=use_emg,
+        state_dict=state_dict,
+    )
 
 
 # --- dataset adapter
 class FusionDataset(torch.utils.data.Dataset):
     """Wraps the split so __getitem__ returns (eeg, emg, label) batched-ready."""
 
-    def __init__(self, base_dataset, indices, label_to_idx):
+    def __init__(
+        self,
+        base_dataset,
+        indices,
+        label_to_idx,
+        *,
+        not_use_eeg: bool | None = None,
+        not_use_emg: bool | None = None,
+    ):
         self.base = base_dataset
         self.indices = list(indices)
         self.label_to_idx = label_to_idx
+        self.not_use_eeg = NOT_USE_EEG if not_use_eeg is None else not_use_eeg
+        self.not_use_emg = NOT_USE_EMG if not_use_emg is None else not_use_emg
 
     def __len__(self) -> int:
         return len(self.indices)
@@ -185,8 +228,14 @@ class FusionDataset(torch.utils.data.Dataset):
         x = sample["x"]
         x = (x - x.mean(dim=0, keepdim=True)) / (x.std(dim=0, keepdim=True) + 1e-6)
 
-        eeg = _modality_input(x, ACTIVE_EEG_INDICES, disabled=NOT_USE_EEG)
-        emg = _modality_input(x, ACTIVE_EMG_INDICES, disabled=NOT_USE_EMG)
+        if self.not_use_eeg:
+            eeg = torch.empty(1, 0, x.shape[0], dtype=x.dtype)
+        else:
+            eeg = x[:, ACTIVE_EEG_INDICES].T.unsqueeze(0)
+        if self.not_use_emg:
+            emg = torch.empty(1, 0, x.shape[0], dtype=x.dtype)
+        else:
+            emg = x[:, ACTIVE_EMG_INDICES].T.unsqueeze(0)
         y_soft = torch.from_numpy(
             label_probs_to_vector(
                 sample.get("label_probs"),
@@ -215,15 +264,23 @@ def construct_model(splits, architecture: str = MODEL_ARCHITECTURE):
 
     # infer shapes from one sample
     eeg0, emg0, _, _ = FusionDataset(splits.dataset, splits.train.indices, label_to_idx)[0]
-    n_eeg = DISABLED_MODALITY_CHANNELS if NOT_USE_EEG else eeg0.shape[1]
-    n_emg = DISABLED_MODALITY_CHANNELS if NOT_USE_EMG else emg0.shape[1]
-    T = eeg0.shape[2]
+    use_eeg = not NOT_USE_EEG
+    use_emg = not NOT_USE_EMG
+    n_eeg = len(ACTIVE_EEG_INDICES) if use_eeg else 0
+    n_emg = len(ACTIVE_EMG_INDICES) if use_emg else 0
+    T = eeg0.shape[2] if use_eeg else emg0.shape[2]
 
     print("\n\n")
     print("--- example sample ---")
-    print("eeg: ", eeg0)
+    if use_eeg:
+        print("eeg: ", eeg0)
+    else:
+        print("eeg: disabled")
     print("\n")
-    print("emg: ", emg0)
+    if use_emg:
+        print("emg: ", emg0)
+    else:
+        print("emg: disabled")
     print("------")
     print("\n\n")
 
@@ -233,6 +290,8 @@ def construct_model(splits, architecture: str = MODEL_ARCHITECTURE):
         n_emg=n_emg,
         n_classes=n_classes,
         T=T,
+        use_eeg=use_eeg,
+        use_emg=use_emg,
     ).to(device)
 
     return model, label_to_idx, {
@@ -285,14 +344,7 @@ def load_training_checkpoint(path: Path) -> tuple[nn.Module, dict, dict, dict]:
     label_to_idx: dict[str, int] = ckpt["label_to_idx"]
 
     architecture = model_config.get("architecture", "intermediate_fusion_eegnet")
-    model = build_fusion_model(
-        architecture,
-        n_eeg=model_config["n_eeg"],
-        n_emg=model_config["n_emg"],
-        n_classes=model_config["n_classes"],
-        T=model_config["T"],
-        state_dict=ckpt["model_state_dict"],
-    )
+    model = build_model_from_config(model_config, state_dict=ckpt["model_state_dict"])
     model.load_state_dict(ckpt["model_state_dict"])
 
     resume_meta = {
@@ -375,6 +427,8 @@ def format_epoch_summary(
     train_acc: float,
     val_loss: float,
     val_acc: float,
+    test_loss: float,
+    test_acc: float,
     best_acc: float,
     best_epoch: int,
     epoch_time: float,
@@ -389,6 +443,8 @@ def format_epoch_summary(
         f"train_acc={train_acc:.4f}",
         f"val_loss={val_loss:.4f}",
         f"val_acc={val_acc:.4f}",
+        f"test_loss={test_loss:.4f}",
+        f"test_acc={test_acc:.4f}",
         f"best={best_acc:.4f} (epoch={best_epoch})",
         f"{epoch_time:.1f}s",
     ]
@@ -488,6 +544,78 @@ def per_class_metrics_from_counters(
     return losses, accs
 
 
+@torch.no_grad()
+def evaluate_fusion_split(
+    model,
+    dataloader: DataLoader,
+    dataset_size: int,
+    *,
+    n_classes: int,
+    idx_to_label: dict[int, str],
+    desc: str,
+) -> tuple[float, float, dict[str, float], dict[str, float]]:
+    model.eval()
+    running = 0.0
+    correct = total = 0
+    loss_sum, correct_per_class, count_per_class = init_per_class_counters(n_classes, device)
+    for eeg, emg, y_soft, y_hard in tqdm(dataloader, desc=desc, leave=False):
+        eeg, emg = eeg.to(device), emg.to(device)
+        y_soft = y_soft.to(device)
+        y_hard = y_hard.to(device)
+        logits = model(eeg, emg)
+        running += soft_cross_entropy(logits, y_soft).item() * y_hard.size(0)
+        pred = logits.argmax(1)
+        correct += (pred == y_hard).sum().item()
+        total += y_hard.size(0)
+        update_per_class_counters(
+            logits, y_hard, pred,
+            loss_sum, correct_per_class, count_per_class,
+        )
+    split_loss = running / dataset_size if dataset_size else 0.0
+    split_acc = correct / total if total else 0.0
+    loss_per_label, acc_per_label = per_class_metrics_from_counters(
+        loss_sum, correct_per_class, count_per_class, idx_to_label,
+    )
+    return split_loss, split_acc, loss_per_label, acc_per_label
+
+
+def _plot_per_label_split(
+    ax,
+    epochs: range,
+    loss_per_label: dict[str, list[float]],
+    *,
+    title: str,
+) -> None:
+    labels = list(loss_per_label)
+    label_colors = _per_label_colors(len(labels))
+    for color, label in zip(label_colors, labels):
+        ax.plot(epochs, loss_per_label[label], color=color, label=label)
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("loss")
+    ax.set_title(title)
+    ax.legend(fontsize=7, ncol=2)
+    ax.grid(True, alpha=0.3)
+
+
+def _plot_per_label_acc_split(
+    ax,
+    epochs: range,
+    acc_per_label: dict[str, list[float]],
+    *,
+    title: str,
+) -> None:
+    labels = list(acc_per_label)
+    label_colors = _per_label_colors(len(labels))
+    for color, label in zip(label_colors, labels):
+        ax.plot(epochs, acc_per_label[label], color=color, label=label)
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("accuracy")
+    ax.set_title(title)
+    ax.set_ylim(0.0, 1.0)
+    ax.legend(fontsize=7, ncol=2)
+    ax.grid(True, alpha=0.3)
+
+
 def _per_label_colors(n: int) -> list:
     """Distinct colors for per-label plots; scales beyond the default 10-color cycle."""
     if n <= 0:
@@ -512,9 +640,12 @@ def plot_training_history(
     n_epochs = len(history["train_loss"])
     epochs = range(1, n_epochs + 1)
     path.parent.mkdir(parents=True, exist_ok=True)
-    labels = [idx_to_label[i] for i in sorted(idx_to_label)]
 
-    fig, ((ax_loss, ax_acc), (ax_loss_label, ax_acc_label)) = plt.subplots(2, 2, figsize=(12, 10))
+    fig, axes = plt.subplots(4, 2, figsize=(12, 16))
+    ax_loss, ax_acc = axes[0]
+    ax_train_loss_label, ax_train_acc_label = axes[1]
+    ax_val_loss_label, ax_val_acc_label = axes[2]
+    ax_test_loss_label, ax_test_acc_label = axes[3]
 
     def mark_best_epoch(ax, *, with_label: bool = False) -> None:
         if best_epoch is None or not (1 <= best_epoch <= n_epochs):
@@ -530,59 +661,66 @@ def plot_training_history(
 
     ax_loss.plot(epochs, history["train_loss"], label="train loss")
     ax_loss.plot(epochs, history["val_loss"], label="val loss")
+    ax_loss.plot(epochs, history["test_loss"], label="test loss")
     ax_loss.set_xlabel("epoch")
     ax_loss.set_ylabel("loss")
-    ax_loss.set_title("Training and validation loss")
+    ax_loss.set_title("Training, validation, and test loss")
     ax_loss.legend()
     ax_loss.grid(True, alpha=0.3)
 
     ax_acc.plot(epochs, history["train_acc"], label="train acc")
     ax_acc.plot(epochs, history["val_acc"], label="val acc")
+    ax_acc.plot(epochs, history["test_acc"], label="test acc")
     ax_acc.set_xlabel("epoch")
     ax_acc.set_ylabel("accuracy")
-    ax_acc.set_title("Training and validation accuracy")
+    ax_acc.set_title("Training, validation, and test accuracy")
     ax_acc.set_ylim(0.0, 1.0)
     ax_acc.grid(True, alpha=0.3)
 
-    train_loss_per_label = history["train_loss_per_label"]
-    val_loss_per_label = history["val_loss_per_label"]
-    train_acc_per_label = history["train_acc_per_label"]
-    val_acc_per_label = history["val_acc_per_label"]
+    _plot_per_label_split(
+        ax_train_loss_label,
+        epochs,
+        history["train_loss_per_label"],
+        title="Per-label train loss",
+    )
+    _plot_per_label_acc_split(
+        ax_train_acc_label,
+        epochs,
+        history["train_acc_per_label"],
+        title="Per-label train accuracy",
+    )
+    _plot_per_label_split(
+        ax_val_loss_label,
+        epochs,
+        history["val_loss_per_label"],
+        title="Per-label val loss",
+    )
+    _plot_per_label_acc_split(
+        ax_val_acc_label,
+        epochs,
+        history["val_acc_per_label"],
+        title="Per-label val accuracy",
+    )
+    _plot_per_label_split(
+        ax_test_loss_label,
+        epochs,
+        history["test_loss_per_label"],
+        title="Per-label test loss",
+    )
+    _plot_per_label_acc_split(
+        ax_test_acc_label,
+        epochs,
+        history["test_acc_per_label"],
+        title="Per-label test accuracy",
+    )
 
-    label_colors = _per_label_colors(len(labels))
-    for color, label in zip(label_colors, labels):
-        ax_loss_label.plot(
-            epochs, train_loss_per_label[label], color=color, linestyle="-", label=f"train {label}",
-        )
-        ax_loss_label.plot(
-            epochs, val_loss_per_label[label], color=color, linestyle=":", label=f"val {label}",
-        )
-        ax_acc_label.plot(
-            epochs, train_acc_per_label[label], color=color, linestyle="-", label=f"train {label}",
-        )
-        ax_acc_label.plot(
-            epochs, val_acc_per_label[label], color=color, linestyle=":", label=f"val {label}",
-        )
-
-    ax_loss_label.set_xlabel("epoch")
-    ax_loss_label.set_ylabel("loss")
-    ax_loss_label.set_title("Per-label training and validation loss")
-    ax_loss_label.legend(fontsize=7, ncol=2)
-    ax_loss_label.grid(True, alpha=0.3)
-
-    ax_acc_label.set_xlabel("epoch")
-    ax_acc_label.set_ylabel("accuracy")
-    ax_acc_label.set_title("Per-label training and validation accuracy")
-    ax_acc_label.set_ylim(0.0, 1.0)
-    ax_acc_label.legend(fontsize=7, ncol=2)
-    ax_acc_label.grid(True, alpha=0.3)
-
-    mark_best_epoch(ax_loss)
+    for row in axes:
+        for ax in row:
+            mark_best_epoch(ax)
     mark_best_epoch(ax_acc, with_label=True)
-    mark_best_epoch(ax_loss_label)
-    mark_best_epoch(ax_acc_label)
-    for ax in (ax_loss, ax_acc, ax_loss_label, ax_acc_label):
-        ax.set_xlim(1, n_epochs)
+    for row in axes:
+        for ax in row:
+            ax.set_xlim(1, n_epochs)
     ax_acc.legend()
 
     fig.tight_layout()
@@ -616,9 +754,11 @@ def train(
 
     train_ds = FusionDataset(splits.dataset, splits.train.indices, label_to_idx)
     val_ds = FusionDataset(splits.dataset, splits.val.indices, label_to_idx)
+    test_ds = FusionDataset(splits.dataset, splits.test.indices, label_to_idx)
 
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=num_workers, pin_memory=pin_memory)
     val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+    test_dl = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
 
     opt = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -634,12 +774,16 @@ def train(
     history: dict[str, list[float] | dict[str, list[float]]] = {
         "train_loss": [],
         "val_loss": [],
+        "test_loss": [],
         "train_acc": [],
         "val_acc": [],
+        "test_acc": [],
         "train_loss_per_label": {label: [] for label in label_to_idx},
         "val_loss_per_label": {label: [] for label in label_to_idx},
+        "test_loss_per_label": {label: [] for label in label_to_idx},
         "train_acc_per_label": {label: [] for label in label_to_idx},
         "val_acc_per_label": {label: [] for label in label_to_idx},
+        "test_acc_per_label": {label: [] for label in label_to_idx},
     }
     epochs_without_improve = 0
     stop_metric_key = "val_loss" if early_stopping_metric == "loss" else "val_acc"
@@ -719,54 +863,49 @@ def train(
             )
 
         
-            model.eval()
-            with torch.no_grad():
-                val_running = 0.0
-                correct = total = 0
-                val_loss_sum, val_correct_per_class, val_count_per_class = init_per_class_counters(
-                    n_classes, device,
-                )
-                for eeg, emg, y_soft, y_hard in tqdm(val_dl, desc="val", leave=False):
-                    eeg, emg = eeg.to(device), emg.to(device)
-                    y_soft = y_soft.to(device)
-                    y_hard = y_hard.to(device)
-                    logits = model(eeg, emg)
-                    val_running += soft_cross_entropy(logits, y_soft).item() * y_hard.size(0)
-                    pred = logits.argmax(1)
-                    correct += (pred == y_hard).sum().item()
-                    total += y_hard.size(0)
-                    update_per_class_counters(
-                        logits, y_hard, pred,
-                        val_loss_sum, val_correct_per_class, val_count_per_class,
-                    )
-                val_loss = val_running / len(val_ds) if len(val_ds) else 0.0
-                acc = correct / total if total else 0.0
-                val_loss_per_label, val_acc_per_label = per_class_metrics_from_counters(
-                    val_loss_sum, val_correct_per_class, val_count_per_class, idx_to_label,
-                )
+            val_loss, val_acc, val_loss_per_label, val_acc_per_label = evaluate_fusion_split(
+                model,
+                val_dl,
+                len(val_ds),
+                n_classes=n_classes,
+                idx_to_label=idx_to_label,
+                desc="val",
+            )
+            test_loss, test_acc, test_loss_per_label, test_acc_per_label = evaluate_fusion_split(
+                model,
+                test_dl,
+                len(test_ds),
+                n_classes=n_classes,
+                idx_to_label=idx_to_label,
+                desc="test",
+            )
 
             epoch_num = epoch + 1
             epoch_notes: list[str] = []
 
             history["train_loss"].append(train_loss)
             history["val_loss"].append(val_loss)
+            history["test_loss"].append(test_loss)
             history["train_acc"].append(train_acc)
-            history["val_acc"].append(acc)
+            history["val_acc"].append(val_acc)
+            history["test_acc"].append(test_acc)
             for label in label_to_idx:
                 history["train_loss_per_label"][label].append(train_loss_per_label[label])
                 history["val_loss_per_label"][label].append(val_loss_per_label[label])
+                history["test_loss_per_label"][label].append(test_loss_per_label[label])
                 history["train_acc_per_label"][label].append(train_acc_per_label[label])
                 history["val_acc_per_label"][label].append(val_acc_per_label[label])
+                history["test_acc_per_label"][label].append(test_acc_per_label[label])
 
-            if acc > best_acc:
-                best_acc = acc
+            if val_acc > best_acc:
+                best_acc = val_acc
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
                 best_metrics = {
                     "epoch": epoch_num,
                     "train_loss": train_loss,
                     "train_acc": train_acc,
                     "val_loss": val_loss,
-                    "val_acc": acc,
+                    "val_acc": val_acc,
                 }
                 write_checkpoint(
                     run_dir / "best.pt",
@@ -775,7 +914,7 @@ def train(
                     train_loss=train_loss,
                     train_acc=train_acc,
                     val_loss=val_loss,
-                    val_acc=acc,
+                    val_acc=val_acc,
                     state_dict=best_state,
                     log=False,
                 )
@@ -803,7 +942,7 @@ def train(
                     train_loss=train_loss,
                     train_acc=train_acc,
                     val_loss=val_loss,
-                    val_acc=acc,
+                    val_acc=val_acc,
                     log=False,
                 )
                 epoch_notes.append(f"saved {ckpt_name}")
@@ -816,7 +955,9 @@ def train(
                     train_loss=train_loss,
                     train_acc=train_acc,
                     val_loss=val_loss,
-                    val_acc=acc,
+                    val_acc=val_acc,
+                    test_loss=test_loss,
+                    test_acc=test_acc,
                     best_acc=best_acc,
                     best_epoch=best_metrics["epoch"],
                     epoch_time=epoch_time,

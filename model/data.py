@@ -136,7 +136,7 @@ def all_labels() -> tuple[str, ...]:
 
 def default_label_max_fractions(fraction: float = 0.20) -> dict[str, float]:
     return {label: fraction for label in all_labels()}
-LABEL_MAX_FRACTIONS = default_label_max_fractions(0.25)
+LABEL_MAX_FRACTIONS = default_label_max_fractions(0.40)
 
 def _block_id_from_event_id(event_id: str) -> str:
     if event_id.startswith("silence:"):
@@ -1702,7 +1702,7 @@ class DatasetSplits:
     val_indices: np.ndarray
     test_indices: np.ndarray
     train_sessions: tuple[Path, ...]
-    val_sessions: tuple[Path, ...]
+    test_sessions: tuple[Path, ...]
     recordings_path: Path
     pre_ms: float
     post_ms: float
@@ -1865,54 +1865,54 @@ def _label_distribution_l1_distance(
     )
 
 
-def _pick_val_sessions(
+def _pick_test_sessions(
     sessions: list[Path],
     session_to_indices: dict[Path, list[int]],
     per_sample_labels: Sequence[str],
-    n_val_sessions: int,
+    n_test_sessions: int,
     *,
     stratified: bool,
     n_trials: int = 1000,
 ) -> set[Path]:
-    if n_val_sessions <= 0:
+    if n_test_sessions <= 0:
         return set()
 
     if not stratified:
         session_order = _rng.permutation(len(sessions))
-        return {sessions[int(i)] for i in session_order[:n_val_sessions]}
+        return {sessions[int(i)] for i in session_order[:n_test_sessions]}
 
     all_indices = [index for session in sessions for index in session_to_indices[session]]
     global_counts = _label_counts_for_indices(all_indices, per_sample_labels)
     global_total = sum(global_counts.values())
     if global_total == 0:
         session_order = _rng.permutation(len(sessions))
-        return {sessions[int(i)] for i in session_order[:n_val_sessions]}
+        return {sessions[int(i)] for i in session_order[:n_test_sessions]}
 
     target_fractions = {
         label: count / global_total for label, count in global_counts.items()
     }
 
     best_score = float("inf")
-    best_val_sessions: set[Path] = set()
+    best_test_sessions: set[Path] = set()
     for _ in range(n_trials):
         session_order = _rng.permutation(len(sessions))
-        val_sessions = {sessions[int(i)] for i in session_order[:n_val_sessions]}
-        val_indices = [
-            index for session in val_sessions for index in session_to_indices[session]
+        test_sessions = {sessions[int(i)] for i in session_order[:n_test_sessions]}
+        test_indices = [
+            index for session in test_sessions for index in session_to_indices[session]
         ]
         score = _label_distribution_l1_distance(
-            _label_counts_for_indices(val_indices, per_sample_labels),
+            _label_counts_for_indices(test_indices, per_sample_labels),
             target_fractions,
         )
         if score < best_score:
             best_score = score
-            best_val_sessions = val_sessions
+            best_test_sessions = test_sessions
 
-    if best_val_sessions:
-        return best_val_sessions
+    if best_test_sessions:
+        return best_test_sessions
 
     session_order = _rng.permutation(len(sessions))
-    return {sessions[int(i)] for i in session_order[:n_val_sessions]}
+    return {sessions[int(i)] for i in session_order[:n_test_sessions]}
 
 
 def _split_session_train_test(
@@ -1959,15 +1959,15 @@ def split_sample_indices(
     per_sample_sessions: Sequence[Path],
     per_sample_labels: Sequence[str],
     *,
-    extra_session_test_split: float = 0.2,
+    extra_session_test_split: float = 0.15,
     intra_session_test_split: float = 0.15,
     stratified_label_split: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[Path, ...], tuple[Path, ...]]:
     """Return disjoint train, val, and test sample indices.
 
-    train = events from train sessions not assigned to test
-    val   = all events from held-out extra sessions
-    test  = held-out intra-session events from train sessions
+    train = events from train sessions not assigned to val
+    val   = held-out intra-session events from train sessions
+    test  = all events from held-out extra sessions
     """
     if not sessions:
         raise ValueError("At least one session is required")
@@ -1980,44 +1980,44 @@ def split_sample_indices(
     for index, session_dir in enumerate(per_sample_sessions):
         session_to_indices[Path(session_dir)].append(index)
 
-    n_val_sessions = int(round(len(sessions) * extra_session_test_split))
+    n_test_sessions = int(round(len(sessions) * extra_session_test_split))
     if len(sessions) > 1:
-        n_val_sessions = min(n_val_sessions, len(sessions) - 1)
+        n_test_sessions = min(n_test_sessions, len(sessions) - 1)
     else:
-        n_val_sessions = 0
+        n_test_sessions = 0
 
-    val_sessions = _pick_val_sessions(
+    test_sessions = _pick_test_sessions(
         sessions,
         session_to_indices,
         per_sample_labels,
-        n_val_sessions,
+        n_test_sessions,
         stratified=stratified_label_split,
     )
-    remaining_sessions = [session for session in sessions if session not in val_sessions]
+    remaining_sessions = [session for session in sessions if session not in test_sessions]
 
     train_indices: list[int] = []
     val_indices: list[int] = []
     test_indices: list[int] = []
 
-    for session_dir in sorted(val_sessions):
-        val_indices.extend(session_to_indices[session_dir])
+    for session_dir in sorted(test_sessions):
+        test_indices.extend(session_to_indices[session_dir])
 
     for session_dir in remaining_sessions:
-        session_train, session_test = _split_session_train_test(
+        session_train, session_val = _split_session_train_test(
             session_to_indices.get(session_dir, []),
             per_sample_labels,
             intra_session_test_split=intra_session_test_split,
             stratified=stratified_label_split,
         )
         train_indices.extend(session_train)
-        test_indices.extend(session_test)
+        val_indices.extend(session_val)
 
     return (
         np.asarray(train_indices, dtype=np.int64),
         np.asarray(val_indices, dtype=np.int64),
         np.asarray(test_indices, dtype=np.int64),
         tuple(sorted(set(remaining_sessions))),
-        tuple(sorted(val_sessions)),
+        tuple(sorted(test_sessions)),
     )
 
 
@@ -2047,7 +2047,7 @@ def build_dataset_splits(
         val_indices,
         test_indices,
         train_sessions,
-        val_sessions,
+        test_sessions,
     ) = split_sample_indices(
         sessions,
         dataset._session_dirs,
@@ -2083,7 +2083,7 @@ def build_dataset_splits(
         val_indices=val_indices,
         test_indices=test_indices,
         train_sessions=train_sessions,
-        val_sessions=val_sessions,
+        test_sessions=test_sessions,
         recordings_path=recordings_path,
         pre_ms=pre_ms,
         post_ms=post_ms,
@@ -2123,7 +2123,7 @@ def save_dataset_splits(output_dir: Path, splits: DatasetSplits) -> None:
             label_probs_manifest.append(None)
 
     manifest = {
-        "version": 3,
+        "version": 4,
         "seed": SPLIT_SEED,
         "recordings_path": str(splits.recordings_path.resolve()),
         "pre_ms": splits.pre_ms,
@@ -2147,7 +2147,7 @@ def save_dataset_splits(output_dir: Path, splits: DatasetSplits) -> None:
         "val_indices": splits.val_indices.tolist(),
         "test_indices": splits.test_indices.tolist(),
         "train_sessions": [str(path) for path in splits.train_sessions],
-        "val_sessions": [str(path) for path in splits.val_sessions],
+        "test_sessions": [str(path) for path in splits.test_sessions],
     }
     (output_dir / SPLITS_MANIFEST_NAME).write_text(
         json.dumps(manifest, indent=2),
@@ -2214,22 +2214,30 @@ def load_dataset_splits(splits_dir: Path) -> DatasetSplits:
     )
 
     train_indices = np.asarray(manifest["train_indices"], dtype=np.int64)
+    version = int(manifest.get("version", 1))
     if "val_indices" in manifest:
         val_indices = np.asarray(manifest["val_indices"], dtype=np.int64)
         test_indices = np.asarray(manifest["test_indices"], dtype=np.int64)
-        val_sessions = tuple(Path(path) for path in manifest["val_sessions"])
+        if version >= 4:
+            test_sessions = tuple(
+                Path(path) for path in manifest.get("test_sessions", ())
+            )
+        else:
+            val_indices, test_indices = test_indices, val_indices
+            session_paths = manifest.get("val_sessions") or manifest.get("test_sessions") or ()
+            test_sessions = tuple(Path(path) for path in session_paths)
     else:
-        # v1 manifests combined val (extra-session) + test (intra-session) in test_indices
+        # v1 manifests combined extra-session + intra-session holdouts in test_indices
         combined_test = np.asarray(manifest["test_indices"], dtype=np.int64)
-        val_session_set = {Path(path) for path in manifest["extra_test_sessions"]}
+        extra_session_set = {Path(path) for path in manifest["extra_test_sessions"]}
         per_sample_sessions = tuple(Path(path) for path in manifest["session_dirs"])
-        val_mask = np.array(
-            [per_sample_sessions[i] in val_session_set for i in combined_test],
+        extra_mask = np.array(
+            [per_sample_sessions[i] in extra_session_set for i in combined_test],
             dtype=bool,
         )
-        val_indices = combined_test[val_mask]
-        test_indices = combined_test[~val_mask]
-        val_sessions = tuple(Path(path) for path in manifest["extra_test_sessions"])
+        val_indices = combined_test[~extra_mask]
+        test_indices = combined_test[extra_mask]
+        test_sessions = tuple(Path(path) for path in manifest["extra_test_sessions"])
 
     return DatasetSplits(
         dataset=dataset,
@@ -2240,7 +2248,7 @@ def load_dataset_splits(splits_dir: Path) -> DatasetSplits:
         val_indices=val_indices,
         test_indices=test_indices,
         train_sessions=tuple(Path(path) for path in manifest["train_sessions"]),
-        val_sessions=val_sessions,
+        test_sessions=test_sessions,
         recordings_path=Path(manifest["recordings_path"]),
         pre_ms=float(manifest["pre_ms"]),
         post_ms=float(manifest["post_ms"]),
@@ -2409,10 +2417,10 @@ def print_split_summary(splits: DatasetSplits) -> None:
         f"train: {len(splits.train)} samples from {len(splits.train_sessions)} sessions"
     )
     print(
-        f"val:   {len(splits.val)} samples from {len(splits.val_sessions)} held-out sessions"
+        f"val:   {len(splits.val)} held-out intra-session events from train sessions"
     )
     print(
-        f"test:  {len(splits.test)} held-out intra-session events from train sessions"
+        f"test:  {len(splits.test)} samples from {len(splits.test_sessions)} held-out sessions"
     )
     print(
         f"split balancing: {'stratified by label' if splits.stratified_label_split else 'random'}"
