@@ -17,6 +17,7 @@ Examples::
 
     uv run meta_val.py
     uv run meta_val.py --meta-dir checkpoints/meta_2026-07-02_12-00-00_abc12345
+    uv run meta_val.py --no-compare-best-vs-last --splits val test --no-split-sessions
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -36,9 +37,12 @@ from meta_train import META_DIR_NAME_RE
 from train import CHECKPOINT_DIR, SEED, seed_everything
 from val import (
     _metrics_by_split,
+    add_validation_option_args,
     checkpoint_paths_for_run,
     get_device,
     validate_run_dir,
+    validation_options_from_args,
+    ValidationOptions,
 )
 
 SLUG_RE = re.compile(r"^(.+)_p(\d{3})$")
@@ -146,12 +150,9 @@ def run_meta_validation(
     meta_dir: Path,
     splits,
     device,
-    batch_size: int,
-    session_min_samples: int,
-    session_top_k: int,
+    options: ValidationOptions,
     use_color: bool,
     seed: int,
-    run_embeddings: bool,
 ) -> list[ExperimentValidationResult]:
     experiment_dirs = discover_experiment_dirs(meta_dir)
     if not experiment_dirs:
@@ -160,6 +161,13 @@ def run_meta_validation(
     training_lookup = load_training_manifest(meta_dir)
     results: list[ExperimentValidationResult] = []
     total = len(experiment_dirs)
+
+    # Meta aggregation always needs best.pt metrics.
+    options = replace(
+        options,
+        checkpoints=tuple(dict.fromkeys(("best",) + tuple(options.resolved_checkpoints()))),
+        save_report=True,
+    )
 
     for idx, run_dir in enumerate(experiment_dirs, start=1):
         slug, architecture, train_fraction, train_samples = experiment_metadata(
@@ -174,14 +182,10 @@ def run_meta_validation(
         outcome = validate_run_dir(
             run_dir,
             splits=splits,
+            options=options,
             device=device,
-            batch_size=batch_size,
-            session_min_samples=session_min_samples,
-            session_top_k=session_top_k,
             use_color=use_color,
             seed=seed,
-            run_embeddings=run_embeddings,
-            save_report=True,
         )
         if outcome["report_path"] is not None:
             print(f"report: saved validation report to {outcome['report_path'].resolve()}")
@@ -402,16 +406,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="meta run directory (default: latest meta_* under checkpoints/)",
     )
-    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--session-top-k", type=int, default=7)
-    parser.add_argument("--session-min-samples", type=int, default=3)
     parser.add_argument("--no-color", action="store_true")
-    parser.add_argument(
-        "--no-embeddings",
-        action="store_true",
-        help="skip per-experiment UMAP plots",
-    )
+    add_validation_option_args(parser)
     return parser.parse_args()
 
 
@@ -419,6 +416,7 @@ def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
     device = get_device()
+    options = validation_options_from_args(args)
 
     meta_dir = resolve_meta_dir(args.meta_dir)
     splits = load_dataset_splits(SPLITS_OUTPUT_DIR)
@@ -428,17 +426,18 @@ def main() -> None:
     print(f"splits: {SPLITS_OUTPUT_DIR.resolve()}")
     print(f"meta dir: {meta_dir.resolve()}")
     print(f"experiments: {len(experiment_dirs)}")
+    print(
+        f"options: compare_best_vs_last={options.compare_best_vs_last} "
+        f"splits={list(options.resolved_splits())} embeddings={options.run_embeddings}"
+    )
 
     results = run_meta_validation(
         meta_dir=meta_dir,
         splits=splits,
         device=device,
-        batch_size=args.batch_size,
-        session_min_samples=args.session_min_samples,
-        session_top_k=args.session_top_k,
+        options=options,
         use_color=not args.no_color,
         seed=args.seed,
-        run_embeddings=not args.no_embeddings,
     )
 
     save_validation_manifest(meta_dir, results, seed=args.seed)

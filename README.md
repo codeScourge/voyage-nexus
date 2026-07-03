@@ -69,7 +69,7 @@ we have a dict that limits each label to x% (after put into sets) - algorithm tr
 
 ### models (tune params regarding: models)
 
-### val
+### val (tune params regarding: what metrics exportet)
 
 ### firmware and processing
 we need to convert from ADS units to volts. this does depend on the gain setting: `lsb = lambda gain: (2.0 * vref / gain) / ((2**24) - 1) * 1e6` ==> !!! you have to match it between `client/protocol.py` and `firmware/include/config.h` 

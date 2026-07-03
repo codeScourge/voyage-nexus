@@ -3,11 +3,26 @@
 from __future__ import annotations
 
 import math
+from dataclasses import asdict, dataclass
 from typing import ClassVar
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+@dataclass(frozen=True)
+class TrainDefaults:
+    """Per-architecture optimizer / schedule defaults."""
+
+    lr: float = 1e-3
+    weight_decay: float = 0.0
+    batch_size: int = 32
+    grad_clip_norm: float | None = None
+    warmup_epochs: int = 0
+
+    def as_dict(self) -> dict:
+        return asdict(self)
 
 EMBEDDING_TAP_LABELS: dict[str, str] = {
     "eeg": "EEG only",
@@ -676,6 +691,39 @@ ARCHITECTURES: dict[str, type[nn.Module]] = {
     "atc_net": ATCNet,
 }
 
+# Per-architecture training defaults. Pure convnets tolerate higher LR;
+# RNN/attention stacks need lower LR, weight decay, and grad clipping;
+# deep attention+TCN stacks also need warmup.
+ARCHITECTURE_TRAIN_DEFAULTS: dict[str, TrainDefaults] = {
+    "intermediate_fusion_eegnet": TrainDefaults(
+        lr=1e-3,
+        weight_decay=0.0,
+        batch_size=32,
+    ),
+    "cat_net": TrainDefaults(
+        lr=3e-4,
+        weight_decay=1e-4,
+        batch_size=32,
+        grad_clip_norm=1.0,
+    ),
+    "atc_net": TrainDefaults(
+        lr=3e-4,
+        weight_decay=1e-4,
+        batch_size=32,
+        grad_clip_norm=1.0,
+        warmup_epochs=5,
+    ),
+}
+
+
+def get_train_defaults(architecture: str) -> TrainDefaults:
+    if architecture not in ARCHITECTURE_TRAIN_DEFAULTS:
+        known = ", ".join(sorted(ARCHITECTURE_TRAIN_DEFAULTS))
+        raise ValueError(
+            f"unknown architecture {architecture!r}; expected one of: {known}"
+        )
+    return ARCHITECTURE_TRAIN_DEFAULTS[architecture]
+
 
 def get_embedding_taps(model: nn.Module) -> dict[str, str]:
     """Return tap key -> plot title for the modalities present in the model."""
@@ -725,6 +773,7 @@ def build_fusion_model(
 
 __all__ = [
     "ARCHITECTURES",
+    "ARCHITECTURE_TRAIN_DEFAULTS",
     "ATCNet",
     "ATCNetAttentionBlock",
     "ATCNetConvBlock",
@@ -736,6 +785,8 @@ __all__ = [
     "ModalityBranch",
     "ModalityEncoder",
     "TimeAvgPool",
+    "TrainDefaults",
     "build_fusion_model",
     "get_embedding_taps",
+    "get_train_defaults",
 ]

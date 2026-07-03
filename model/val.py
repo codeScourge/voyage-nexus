@@ -33,8 +33,38 @@ from train import (
     soft_cross_entropy,
 )
 
-# --- embeddings / UMAP (always runs after metrics)
+# --- report options (edit here; CLI / meta_val can override)
+COMPARE_BEST_VS_LAST = True
+# Base checkpoints to evaluate. When COMPARE_BEST_VS_LAST is True, last is added automatically.
+EVAL_CHECKPOINTS = ("best",)
+REVIEW_SPLITS = ("train", "val", "test")
+
+# Per-split sections
+SHOW_SPLIT_PER_CLASS = True
+SHOW_SPLIT_CONFUSION = True
+SHOW_SPLIT_SESSIONS = True
+
+# Summary section
+SHOW_SUMMARY = True
+SHOW_SUMMARY_PER_CLASS = True
+SHOW_SUMMARY_SESSIONS = True
+
+# Best-vs-last comparison detail (only when COMPARE_BEST_VS_LAST and both exist)
+SHOW_COMPARE_PER_CLASS = True
+SHOW_COMPARE_SESSIONS = True
+
+# Embeddings / UMAP
+RUN_EMBEDDINGS = True
 EMBEDDING_SPLITS = ("val", "test")
+EMBEDDING_MAX_PER_LABEL = 200
+EMBEDDINGS_N_NEIGHBORS = 15
+EMBEDDINGS_MIN_DIST = 0.1
+EMBEDDINGS_OUTPUT_NAME = "embeddings_umap.png"
+
+# Session ranking thresholds
+SESSION_TOP_K = 7
+SESSION_MIN_SAMPLES = 3
+BATCH_SIZE = 32
 
 # val = intra-session holdout from train sessions; test = held-out extra sessions
 SPLIT_SESSION_KIND = {
@@ -43,11 +73,176 @@ SPLIT_SESSION_KIND = {
 }
 SPLIT_DISPLAY_WIDTH = 14
 SESSION_DISPLAY_WIDTH = 22
-EMBEDDING_MAX_PER_LABEL = 200
-EMBEDDINGS_N_NEIGHBORS = 15
-EMBEDDINGS_MIN_DIST = 0.1
-EMBEDDINGS_OUTPUT_NAME = "embeddings_umap.png"
 VAL_REPORT_NAME = "validation_report.md"
+
+ALL_SPLITS = ("train", "val", "test")
+ALL_CHECKPOINTS = ("best", "last")
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationOptions:
+    """Controls what validate_run_dir evaluates and prints."""
+
+    compare_best_vs_last: bool = COMPARE_BEST_VS_LAST
+    checkpoints: tuple[str, ...] = EVAL_CHECKPOINTS
+    splits: tuple[str, ...] = REVIEW_SPLITS
+    show_split_per_class: bool = SHOW_SPLIT_PER_CLASS
+    show_split_confusion: bool = SHOW_SPLIT_CONFUSION
+    show_split_sessions: bool = SHOW_SPLIT_SESSIONS
+    show_summary: bool = SHOW_SUMMARY
+    show_summary_per_class: bool = SHOW_SUMMARY_PER_CLASS
+    show_summary_sessions: bool = SHOW_SUMMARY_SESSIONS
+    show_compare_per_class: bool = SHOW_COMPARE_PER_CLASS
+    show_compare_sessions: bool = SHOW_COMPARE_SESSIONS
+    run_embeddings: bool = RUN_EMBEDDINGS
+    embedding_splits: tuple[str, ...] = EMBEDDING_SPLITS
+    embedding_max_per_label: int = EMBEDDING_MAX_PER_LABEL
+    embeddings_n_neighbors: int = EMBEDDINGS_N_NEIGHBORS
+    embeddings_min_dist: float = EMBEDDINGS_MIN_DIST
+    session_top_k: int = SESSION_TOP_K
+    session_min_samples: int = SESSION_MIN_SAMPLES
+    batch_size: int = BATCH_SIZE
+    save_report: bool = True
+
+    def resolved_checkpoints(self) -> tuple[str, ...]:
+        kinds = [kind for kind in ALL_CHECKPOINTS if kind in self.checkpoints]
+        if self.compare_best_vs_last:
+            for kind in ALL_CHECKPOINTS:
+                if kind not in kinds:
+                    kinds.append(kind)
+        if not kinds:
+            raise ValueError(
+                f"checkpoints must include at least one of {ALL_CHECKPOINTS}; got {self.checkpoints!r}"
+            )
+        return tuple(kinds)
+
+    def resolved_splits(self) -> tuple[str, ...]:
+        splits = tuple(name for name in ALL_SPLITS if name in self.splits)
+        if not splits:
+            raise ValueError(
+                f"splits must include at least one of {ALL_SPLITS}; got {self.splits!r}"
+            )
+        return splits
+
+
+def validation_options_from_args(args: argparse.Namespace) -> ValidationOptions:
+    """Build options from an argparse namespace (val.py / meta_val.py CLIs)."""
+    return ValidationOptions(
+        compare_best_vs_last=args.compare_best_vs_last,
+        checkpoints=tuple(args.checkpoints),
+        splits=tuple(args.splits),
+        show_split_per_class=args.split_per_class,
+        show_split_confusion=args.split_confusion,
+        show_split_sessions=args.split_sessions,
+        show_summary=args.summary,
+        show_summary_per_class=args.summary_per_class,
+        show_summary_sessions=args.summary_sessions,
+        show_compare_per_class=args.compare_per_class,
+        show_compare_sessions=args.compare_sessions,
+        run_embeddings=args.embeddings,
+        embedding_splits=tuple(args.embedding_splits),
+        session_top_k=args.session_top_k,
+        session_min_samples=args.session_min_samples,
+        batch_size=args.batch_size,
+    )
+
+
+def add_validation_option_args(parser: argparse.ArgumentParser) -> None:
+    """Shared CLI flags for val.py and meta_val.py."""
+    parser.add_argument(
+        "--compare-best-vs-last",
+        action=argparse.BooleanOptionalAction,
+        default=COMPARE_BEST_VS_LAST,
+        help="evaluate last.pt and print best-vs-last comparison",
+    )
+    parser.add_argument(
+        "--checkpoints",
+        nargs="+",
+        choices=list(ALL_CHECKPOINTS),
+        default=list(EVAL_CHECKPOINTS),
+        help="which checkpoints to evaluate (default from val.py)",
+    )
+    parser.add_argument(
+        "--splits",
+        nargs="+",
+        choices=list(ALL_SPLITS),
+        default=list(REVIEW_SPLITS),
+        help="which splits to evaluate and print",
+    )
+    parser.add_argument(
+        "--split-per-class",
+        action=argparse.BooleanOptionalAction,
+        default=SHOW_SPLIT_PER_CLASS,
+        help="per-class table inside each split section",
+    )
+    parser.add_argument(
+        "--split-confusion",
+        action=argparse.BooleanOptionalAction,
+        default=SHOW_SPLIT_CONFUSION,
+        help="confusion matrix inside each split section",
+    )
+    parser.add_argument(
+        "--split-sessions",
+        action=argparse.BooleanOptionalAction,
+        default=SHOW_SPLIT_SESSIONS,
+        help="per-session rankings inside each split section",
+    )
+    parser.add_argument(
+        "--summary",
+        action=argparse.BooleanOptionalAction,
+        default=SHOW_SUMMARY,
+        help="print the cross-split summary block",
+    )
+    parser.add_argument(
+        "--summary-per-class",
+        action=argparse.BooleanOptionalAction,
+        default=SHOW_SUMMARY_PER_CLASS,
+        help="per-class recall table in the summary",
+    )
+    parser.add_argument(
+        "--summary-sessions",
+        action=argparse.BooleanOptionalAction,
+        default=SHOW_SUMMARY_SESSIONS,
+        help="cross-split session rankings in the summary",
+    )
+    parser.add_argument(
+        "--compare-per-class",
+        action=argparse.BooleanOptionalAction,
+        default=SHOW_COMPARE_PER_CLASS,
+        help="per-class recall deltas in best-vs-last comparison",
+    )
+    parser.add_argument(
+        "--compare-sessions",
+        action=argparse.BooleanOptionalAction,
+        default=SHOW_COMPARE_SESSIONS,
+        help="session accuracy deltas in best-vs-last comparison",
+    )
+    parser.add_argument(
+        "--embeddings",
+        action=argparse.BooleanOptionalAction,
+        default=RUN_EMBEDDINGS,
+        help="run UMAP embedding plots after metrics",
+    )
+    parser.add_argument(
+        "--embedding-splits",
+        nargs="+",
+        choices=["val", "test"],
+        default=list(EMBEDDING_SPLITS),
+        help="splits used for embedding UMAP",
+    )
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    parser.add_argument(
+        "--session-top-k",
+        type=int,
+        default=SESSION_TOP_K,
+        help="number of best/worst sessions to print",
+    )
+    parser.add_argument(
+        "--session-min-samples",
+        type=int,
+        default=SESSION_MIN_SAMPLES,
+        help="minimum samples required to include a session in rankings",
+    )
 
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
@@ -489,6 +684,8 @@ def print_metrics(
     *,
     idx_to_label: dict[int, str],
     use_color: bool = True,
+    show_per_class: bool = True,
+    show_confusion: bool = True,
 ) -> None:
     print(f"\n=== {format_split_display(metrics['split'])} ===")
     print(f"samples:           {metrics['n_samples']}")
@@ -498,79 +695,84 @@ def print_metrics(
     print(f"macro_f1:          {metrics['macro_f1']:.4f}")
     print(f"weighted_f1:       {metrics['weighted_f1']:.4f}")
 
-    print("\nper-class:")
-    if use_color:
-        print("  (cell color: metric value — red=low, green=high)")
-    print(f"{'label':<20} {'precision':>10} {'recall':>10} {'f1':>10} {'support':>10} {'top confusion':>28}")
-    for class_idx, row in enumerate(metrics["per_class"]):
-        label = idx_to_label.get(class_idx, str(class_idx))
-        precision = _format_colored_value(
-            f"{row['precision']:.4f}",
-            bg=_score_bg(row["precision"]),
-            use_color=use_color,
-            width=10,
-        )
-        recall = _format_colored_value(
-            f"{row['recall']:.4f}",
-            bg=_score_bg(row["recall"]),
-            use_color=use_color,
-            width=10,
-        )
-        f1 = _format_colored_value(
-            f"{row['f1']:.4f}",
-            bg=_score_bg(row["f1"]),
-            use_color=use_color,
-            width=10,
-        )
-        confused_idx = row.get("most_confused_with_idx")
-        if confused_idx is None:
-            top_confusion = "-"
-        else:
-            top_confusion = _top_confusion_text(
-                row,
-                idx_to_label=idx_to_label,
-                label_max=14,
-            )
+    if show_per_class:
+        print("\nper-class:")
+        if use_color:
+            print("  (cell color: metric value — red=low, green=high)")
         print(
-            f"{label:<20} "
-            f"{precision} "
-            f"{recall} "
-            f"{f1} "
-            f"{row['support']:>10d} "
-            f"{top_confusion:>28}"
+            f"{'label':<20} {'precision':>10} {'recall':>10} {'f1':>10} "
+            f"{'support':>10} {'top confusion':>28}"
         )
-
-    print("\nconfusion matrix (rows=true, cols=pred):")
-    if use_color:
-        print("  (cell color: count intensity — green=correct, red=misclassified)")
-    labels = [idx_to_label.get(i, str(i)) for i in range(len(metrics["per_class"]))]
-    header = "true\\pred".ljust(20) + "".join(label[:12].rjust(12) for label in labels)
-    print(header)
-
-    cm = metrics["confusion_matrix"]
-    cm_max = int(cm.max()) if cm.size else 0
-    for class_idx, row in enumerate(cm):
-        label = idx_to_label.get(class_idx, str(class_idx))
-        row_max = int(row.max()) if row.size else 0
-        cells: list[str] = []
-        for pred_idx, value in enumerate(row):
-            count = int(value)
-            if cm_max > 0:
-                intensity = count / cm_max
-            elif row_max > 0:
-                intensity = count / row_max
-            else:
-                intensity = 0.0
-            bg = _cm_bg(count, intensity, diagonal=class_idx == pred_idx)
-            cells.append(
-                _format_colored_value(
-                    str(count),
-                    bg=bg,
-                    use_color=use_color,
-                    width=12,
-                )
+        for class_idx, row in enumerate(metrics["per_class"]):
+            label = idx_to_label.get(class_idx, str(class_idx))
+            precision = _format_colored_value(
+                f"{row['precision']:.4f}",
+                bg=_score_bg(row["precision"]),
+                use_color=use_color,
+                width=10,
             )
-        print(f"{label[:20]:<20}{''.join(cells)}")
+            recall = _format_colored_value(
+                f"{row['recall']:.4f}",
+                bg=_score_bg(row["recall"]),
+                use_color=use_color,
+                width=10,
+            )
+            f1 = _format_colored_value(
+                f"{row['f1']:.4f}",
+                bg=_score_bg(row["f1"]),
+                use_color=use_color,
+                width=10,
+            )
+            confused_idx = row.get("most_confused_with_idx")
+            if confused_idx is None:
+                top_confusion = "-"
+            else:
+                top_confusion = _top_confusion_text(
+                    row,
+                    idx_to_label=idx_to_label,
+                    label_max=14,
+                )
+            print(
+                f"{label:<20} "
+                f"{precision} "
+                f"{recall} "
+                f"{f1} "
+                f"{row['support']:>10d} "
+                f"{top_confusion:>28}"
+            )
+
+    if show_confusion:
+        print("\nconfusion matrix (rows=true, cols=pred):")
+        if use_color:
+            print("  (cell color: count intensity — green=correct, red=misclassified)")
+        labels = [idx_to_label.get(i, str(i)) for i in range(len(metrics["per_class"]))]
+        header = "true\\pred".ljust(20) + "".join(label[:12].rjust(12) for label in labels)
+        print(header)
+
+        cm = metrics["confusion_matrix"]
+        cm_max = int(cm.max()) if cm.size else 0
+        for class_idx, row in enumerate(cm):
+            label = idx_to_label.get(class_idx, str(class_idx))
+            row_max = int(row.max()) if row.size else 0
+            cells: list[str] = []
+            for pred_idx, value in enumerate(row):
+                count = int(value)
+                if cm_max > 0:
+                    intensity = count / cm_max
+                elif row_max > 0:
+                    intensity = count / row_max
+                else:
+                    intensity = 0.0
+                bg = _cm_bg(count, intensity, diagonal=class_idx == pred_idx)
+                cells.append(
+                    _format_colored_value(
+                        str(count),
+                        bg=bg,
+                        use_color=use_color,
+                        width=12,
+                    )
+                )
+            print(f"{label[:20]:<20}{''.join(cells)}")
 
 
 def print_session_rankings(
@@ -805,6 +1007,8 @@ def print_model_comparison_meta(
     best_meta: dict,
     last_meta: dict,
     idx_to_label: dict[int, str],
+    show_per_class: bool = True,
+    show_sessions: bool = True,
 ) -> None:
     bar = "=" * 72
     print(f"\n{bar}")
@@ -856,7 +1060,7 @@ def print_model_comparison_meta(
         )
 
     val_test_splits = [name for name in ("val", "test") if name in split_names]
-    if val_test_splits:
+    if show_per_class and val_test_splits:
         n_classes = len(next(iter(best_by_split.values()))["per_class"])
         print("\nper-class recall delta (last - best):")
         print(
@@ -893,31 +1097,32 @@ def print_model_comparison_meta(
             f"best={best_recall_wins}, last={last_recall_wins}, tie={tie_recall_wins}"
         )
 
-    print("\nsession accuracy (last - best, shared sessions only):")
-    for split_name in val_test_splits:
-        best_sessions = {
-            row["session_dir"]: row for row in best_by_split[split_name]["per_session"]
-        }
-        last_sessions = {
-            row["session_dir"]: row for row in last_by_split[split_name]["per_session"]
-        }
-        common = sorted(set(best_sessions) & set(last_sessions))
-        split_label = format_split_display(split_name)
-        if not common:
-            print(f"  {split_label}: no shared ranked sessions")
-            continue
-        deltas = [
-            last_sessions[session_dir]["accuracy"] - best_sessions[session_dir]["accuracy"]
-            for session_dir in common
-        ]
-        last_wins = sum(1 for delta in deltas if delta > 1e-9)
-        best_wins = sum(1 for delta in deltas if delta < -1e-9)
-        ties = len(deltas) - last_wins - best_wins
-        mean_delta = float(np.mean(deltas))
-        print(
-            f"  {split_label}: n={len(common)}, mean Δacc={mean_delta:+.4f}, "
-            f"last wins={last_wins}, best wins={best_wins}, tie={ties}"
-        )
+    if show_sessions and val_test_splits:
+        print("\nsession accuracy (last - best, shared sessions only):")
+        for split_name in val_test_splits:
+            best_sessions = {
+                row["session_dir"]: row for row in best_by_split[split_name]["per_session"]
+            }
+            last_sessions = {
+                row["session_dir"]: row for row in last_by_split[split_name]["per_session"]
+            }
+            common = sorted(set(best_sessions) & set(last_sessions))
+            split_label = format_split_display(split_name)
+            if not common:
+                print(f"  {split_label}: no shared ranked sessions")
+                continue
+            deltas = [
+                last_sessions[session_dir]["accuracy"] - best_sessions[session_dir]["accuracy"]
+                for session_dir in common
+            ]
+            last_wins = sum(1 for delta in deltas if delta > 1e-9)
+            best_wins = sum(1 for delta in deltas if delta < -1e-9)
+            ties = len(deltas) - last_wins - best_wins
+            mean_delta = float(np.mean(deltas))
+            print(
+                f"  {split_label}: n={len(common)}, mean Δacc={mean_delta:+.4f}, "
+                f"last wins={last_wins}, best wins={best_wins}, tie={ties}"
+            )
 
 
 def print_summary_table(
@@ -926,6 +1131,8 @@ def print_summary_table(
     idx_to_label: dict[int, str],
     use_color: bool = True,
     session_top_k: int = 7,
+    show_per_class: bool = True,
+    show_sessions: bool = True,
 ) -> None:
     print("\n=== summary ===")
     print(
@@ -944,66 +1151,68 @@ def print_summary_table(
         )
 
     by_split = {metrics["split"]: metrics for metrics in metrics_list}
-    split_names = [name for name in ("train", "val", "test") if name in by_split]
+    split_names = [name for name in ALL_SPLITS if name in by_split]
     if not split_names:
         return
 
-    n_classes = len(next(iter(by_split.values()))["per_class"])
-    confusion_width = 22
-    print("\nper-class recall and top confusion (train vs val [extra] vs test [intra]):")
-    if use_color:
-        print(
-            "  (recall: red=low, green=high, bold=worst split; "
-            "top confusion: pred label, count, fraction of class support)"
-        )
-    header = (
-        f"{'label':<20}"
-        + "".join(f"{format_split_display(name):>14}" for name in split_names)
-        + "".join(
-            f"{format_split_display(name) + ' confusion':>{confusion_width}}"
-            for name in split_names
-        )
-    )
-    print(header)
-    for class_idx in range(n_classes):
-        label = idx_to_label.get(class_idx, str(class_idx))
-        split_rows: list[tuple[str, float, int]] = []
-        for split_name in split_names:
-            row = by_split[split_name]["per_class"][class_idx]
-            split_rows.append((split_name, row["recall"], row["support"]))
-
-        supported = [(name, recall) for name, recall, support in split_rows if support > 0]
-        worst_split: str | None = None
-        if len(supported) >= 2:
-            worst_split = min(supported, key=lambda item: item[1])[0]
-
-        recalls = []
-        for split_name, recall, support in split_rows:
-            recalls.append(
-                _format_recall(
-                    recall,
-                    support,
-                    use_color=use_color,
-                    worst=split_name == worst_split,
-                )
+    if show_per_class:
+        n_classes = len(next(iter(by_split.values()))["per_class"])
+        confusion_width = 22
+        print("\nper-class recall and top confusion (train vs val [extra] vs test [intra]):")
+        if use_color:
+            print(
+                "  (recall: red=low, green=high, bold=worst split; "
+                "top confusion: pred label, count, fraction of class support)"
             )
-        confusions = []
-        for split_name in split_names:
-            row = by_split[split_name]["per_class"][class_idx]
-            confusions.append(
-                _format_top_confusion(
-                    row,
-                    idx_to_label=idx_to_label,
-                    width=confusion_width,
-                )
+        header = (
+            f"{'label':<20}"
+            + "".join(f"{format_split_display(name):>14}" for name in split_names)
+            + "".join(
+                f"{format_split_display(name) + ' confusion':>{confusion_width}}"
+                for name in split_names
             )
-        print(f"{label[:20]:<20}{''.join(recalls)}{''.join(confusions)}")
+        )
+        print(header)
+        for class_idx in range(n_classes):
+            label = idx_to_label.get(class_idx, str(class_idx))
+            split_rows: list[tuple[str, float, int]] = []
+            for split_name in split_names:
+                row = by_split[split_name]["per_class"][class_idx]
+                split_rows.append((split_name, row["recall"], row["support"]))
 
-    _print_cross_split_session_rankings(
-        metrics_list,
-        idx_to_label=idx_to_label,
-        top_k=session_top_k,
-    )
+            supported = [(name, recall) for name, recall, support in split_rows if support > 0]
+            worst_split: str | None = None
+            if len(supported) >= 2:
+                worst_split = min(supported, key=lambda item: item[1])[0]
+
+            recalls = []
+            for split_name, recall, support in split_rows:
+                recalls.append(
+                    _format_recall(
+                        recall,
+                        support,
+                        use_color=use_color,
+                        worst=split_name == worst_split,
+                    )
+                )
+            confusions = []
+            for split_name in split_names:
+                row = by_split[split_name]["per_class"][class_idx]
+                confusions.append(
+                    _format_top_confusion(
+                        row,
+                        idx_to_label=idx_to_label,
+                        width=confusion_width,
+                    )
+                )
+            print(f"{label[:20]:<20}{''.join(recalls)}{''.join(confusions)}")
+
+    if show_sessions:
+        _print_cross_split_session_rankings(
+            metrics_list,
+            idx_to_label=idx_to_label,
+            top_k=session_top_k,
+        )
 
 
 def evaluate_checkpoint_report(
@@ -1012,27 +1221,25 @@ def evaluate_checkpoint_report(
     *,
     splits,
     device: torch.device,
-    batch_size: int,
-    session_min_samples: int,
-    session_top_k: int,
+    options: ValidationOptions,
     use_color: bool,
-    seed: int,
 ) -> tuple[list[dict], dict[str, int], dict]:
     model, label_to_idx, ckpt_meta = load_checkpoint(checkpoint_path, device)
     idx_to_label = {idx: label for label, idx in label_to_idx.items()}
     print_checkpoint_banner(kind, checkpoint_path, ckpt_meta)
 
-    split_specs = (
-        ("train", splits.train.indices),
-        ("val", splits.val.indices),
-        ("test", splits.test.indices),
-    )
+    split_indices = {
+        "train": splits.train.indices,
+        "val": splits.val.indices,
+        "test": splits.test.indices,
+    }
+    review_splits = options.resolved_splits()
 
     all_metrics: list[dict] = []
-    for split_name, indices in split_specs:
+    for split_name in review_splits:
         dataset = FusionDataset(
             splits.dataset,
-            indices,
+            split_indices[split_name],
             label_to_idx,
             **fusion_dataset_kwargs(ckpt_meta["model_config"]),
         )
@@ -1040,24 +1247,34 @@ def evaluate_checkpoint_report(
             model,
             dataset,
             device=device,
-            batch_size=batch_size,
+            batch_size=options.batch_size,
             split_name=split_name,
-            session_min_samples=session_min_samples,
+            session_min_samples=options.session_min_samples,
         )
         all_metrics.append(metrics)
-        print_metrics(metrics, idx_to_label=idx_to_label, use_color=use_color)
-        print_session_rankings(
+        print_metrics(
             metrics,
             idx_to_label=idx_to_label,
-            top_k=session_top_k,
+            use_color=use_color,
+            show_per_class=options.show_split_per_class,
+            show_confusion=options.show_split_confusion,
         )
+        if options.show_split_sessions:
+            print_session_rankings(
+                metrics,
+                idx_to_label=idx_to_label,
+                top_k=options.session_top_k,
+            )
 
-    print_summary_table(
-        all_metrics,
-        idx_to_label=idx_to_label,
-        use_color=use_color,
-        session_top_k=session_top_k,
-    )
+    if options.show_summary:
+        print_summary_table(
+            all_metrics,
+            idx_to_label=idx_to_label,
+            use_color=use_color,
+            session_top_k=options.session_top_k,
+            show_per_class=options.show_summary_per_class,
+            show_sessions=options.show_summary_sessions,
+        )
 
     return all_metrics, label_to_idx, ckpt_meta
 
@@ -1361,39 +1578,50 @@ def validate_run_dir(
     run_dir: Path,
     *,
     splits,
+    options: ValidationOptions | None = None,
     device: torch.device | None = None,
-    batch_size: int = 32,
-    session_min_samples: int = 3,
-    session_top_k: int = 7,
     use_color: bool = True,
     seed: int = 0,
     checkpoint_hint: Path | None = None,
-    run_embeddings: bool = True,
-    save_report: bool = True,
 ) -> dict[str, Any]:
-    """Evaluate best.pt and last.pt in a run directory; optional report and UMAP."""
+    """Evaluate selected checkpoints in a run directory; optional report and UMAP."""
+    options = options or ValidationOptions()
     run_dir = Path(run_dir)
     if device is None:
         device = get_device()
 
-    ckpt_paths = checkpoint_paths_for_run(run_dir)
+    available = checkpoint_paths_for_run(run_dir)
+    eval_kinds = options.resolved_checkpoints()
+    ckpt_paths = {kind: available[kind] for kind in eval_kinds if kind in available}
+    if not ckpt_paths:
+        raise FileNotFoundError(
+            f"None of requested checkpoints {eval_kinds} found in {run_dir} "
+            f"(available: {sorted(available)})"
+        )
+
     evaluated: dict[str, tuple[list[dict], dict[str, int], dict]] = {}
     report_path: Path | None = None
 
     with capture_report_output() as report_buffer:
         print(f"device: {device}")
         print(f"run_dir: {run_dir.resolve()}")
+        print(
+            f"options: checkpoints={list(ckpt_paths)} splits={list(options.resolved_splits())} "
+            f"compare_best_vs_last={options.compare_best_vs_last} "
+            f"embeddings={options.run_embeddings}"
+        )
 
-        for kind in ("best", "last"):
-            if kind not in ckpt_paths:
+        for kind in eval_kinds:
+            if kind not in available:
                 print(f"\nwarning: {kind}.pt not found in {run_dir}, skipping")
                 continue
 
-            checkpoint_path = ckpt_paths[kind]
+            checkpoint_path = available[kind]
             if (
                 kind == "last"
                 and "best" in evaluated
-                and checkpoint_path.resolve() == ckpt_paths["best"].resolve()
+                and "best" in available
+                and checkpoint_path.resolve() == available["best"].resolve()
             ):
                 _, label_to_idx, ckpt_meta = load_checkpoint(checkpoint_path, device)
                 print_checkpoint_banner(kind, checkpoint_path, ckpt_meta)
@@ -1406,46 +1634,46 @@ def validate_run_dir(
                 checkpoint_path,
                 splits=splits,
                 device=device,
-                batch_size=batch_size,
-                session_min_samples=session_min_samples,
-                session_top_k=session_top_k,
+                options=options,
                 use_color=use_color,
-                seed=seed,
             )
 
-        if "best" in evaluated and "last" in evaluated:
-            best_metrics, _best_label_to_idx, best_meta = evaluated["best"]
-            last_metrics, _last_label_to_idx, last_meta = evaluated["last"]
-            idx_to_label = {idx: label for label, idx in _best_label_to_idx.items()}
-            print_model_comparison_meta(
-                best_metrics,
-                last_metrics,
-                best_meta=best_meta,
-                last_meta=last_meta,
-                idx_to_label=idx_to_label,
-            )
-        elif len(evaluated) == 1:
-            only_kind = next(iter(evaluated))
-            print(
-                f"\n(note: only {only_kind}.pt was evaluated; "
-                "need both best and last for comparison)"
-            )
+        if options.compare_best_vs_last:
+            if "best" in evaluated and "last" in evaluated:
+                best_metrics, _best_label_to_idx, best_meta = evaluated["best"]
+                last_metrics, _last_label_to_idx, last_meta = evaluated["last"]
+                idx_to_label = {idx: label for label, idx in _best_label_to_idx.items()}
+                print_model_comparison_meta(
+                    best_metrics,
+                    last_metrics,
+                    best_meta=best_meta,
+                    last_meta=last_meta,
+                    idx_to_label=idx_to_label,
+                    show_per_class=options.show_compare_per_class,
+                    show_sessions=options.show_compare_sessions,
+                )
+            elif len(evaluated) == 1:
+                only_kind = next(iter(evaluated))
+                print(
+                    f"\n(note: only {only_kind}.pt was evaluated; "
+                    "need both best and last for comparison)"
+                )
 
-        if run_embeddings:
+        if options.run_embeddings:
             run_embedding_umap(
                 ckpt_paths,
                 splits,
                 device=device,
-                batch_size=batch_size,
-                embedding_splits=EMBEDDING_SPLITS,
-                max_per_label=EMBEDDING_MAX_PER_LABEL,
+                batch_size=options.batch_size,
+                embedding_splits=options.embedding_splits,
+                max_per_label=options.embedding_max_per_label,
                 output_path=run_dir / EMBEDDINGS_OUTPUT_NAME,
                 seed=seed,
-                n_neighbors=EMBEDDINGS_N_NEIGHBORS,
-                min_dist=EMBEDDINGS_MIN_DIST,
+                n_neighbors=options.embeddings_n_neighbors,
+                min_dist=options.embeddings_min_dist,
             )
 
-    if save_report:
+    if options.save_report:
         report_path = save_validation_report(
             run_dir,
             buffer=report_buffer,
@@ -1456,18 +1684,19 @@ def validate_run_dir(
         "run_dir": run_dir,
         "evaluated": evaluated,
         "report_path": report_path,
+        "options": options,
     }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Evaluate best.pt and last.pt from a training run.",
+        description="Evaluate checkpoints from a training run.",
     )
     parser.add_argument(
         "--checkpoint",
         type=Path,
         default=None,
-        help="Path to any checkpoint in a run dir (default: latest run, evaluates best.pt and last.pt)",
+        help="Path to any checkpoint in a run dir (default: latest run)",
     )
     parser.add_argument(
         "--splits-dir",
@@ -1475,28 +1704,17 @@ def main() -> None:
         default=Path(__file__).resolve().parent.parent / "splits",
         help="Directory with splits_manifest.json and splits_windows.npz",
     )
-    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
-        "--session-top-k",
-        type=int,
-        default=7,
-        help="Number of best/worst sessions to print per split and in summary",
-    )
-    parser.add_argument(
-        "--session-min-samples",
-        type=int,
-        default=3,
-        help="Minimum samples required to include a session in rankings",
-    )
     parser.add_argument(
         "--no-color",
         action="store_true",
         help="Disable ANSI colors in printed tables",
     )
+    add_validation_option_args(parser)
     args = parser.parse_args()
 
     use_color = _use_color(force=not args.no_color)
+    options = validation_options_from_args(args)
 
     seed_everything(args.seed)
 
@@ -1506,9 +1724,7 @@ def main() -> None:
     result = validate_run_dir(
         run_dir,
         splits=splits,
-        batch_size=args.batch_size,
-        session_min_samples=args.session_min_samples,
-        session_top_k=args.session_top_k,
+        options=options,
         use_color=use_color,
         seed=args.seed,
         checkpoint_hint=args.checkpoint,

@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models import ARCHITECTURES, build_fusion_model
+from models import ARCHITECTURES, build_fusion_model, get_train_defaults
 from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
 from tqdm import tqdm
@@ -490,25 +490,36 @@ def format_epoch_summary(
     best_epoch: int,
     epoch_time: float,
     epochs_without_improve: int | None = None,
+    early_stopping_patience: int | None = None,
     smoothed_stop: float | None = None,
     notes: list[str] | None = None,
 ) -> str:
     width = len(str(total_epochs))
+
+    def split_metrics(name: str, loss: float, acc: float) -> str:
+        return f"{name} {loss:.4f}/{acc:.4f}"
+
     parts = [
         f"epoch {epoch_num:>{width}}/{total_epochs}",
-        f"train_loss={train_loss:.4f}",
-        f"train_acc={train_acc:.4f}",
-        f"val_loss={val_loss:.4f}",
-        f"val_acc={val_acc:.4f}",
-        f"test_loss={test_loss:.4f}",
-        f"test_acc={test_acc:.4f}",
-        f"best={best_acc:.4f} (epoch={best_epoch})",
+        "loss/acc "
+        + "  ".join([
+            split_metrics("train", train_loss, train_acc),
+            split_metrics("val", val_loss, val_acc),
+            split_metrics("test", test_loss, test_acc),
+        ]),
+        f"best {best_acc:.4f}@{best_epoch}",
         f"{epoch_time:.1f}s",
     ]
-    if epochs_without_improve is not None:
-        parts.append(f"no_improve={epochs_without_improve}")
-    if smoothed_stop is not None:
-        parts.append(f"stop_smooth={smoothed_stop:.4f}")
+    if epochs_without_improve is not None or smoothed_stop is not None:
+        stop_bits: list[str] = []
+        if epochs_without_improve is not None:
+            if early_stopping_patience is not None and early_stopping_patience > 0:
+                stop_bits.append(f"{epochs_without_improve}/{early_stopping_patience}")
+            else:
+                stop_bits.append(f"{epochs_without_improve}")
+        if smoothed_stop is not None:
+            stop_bits.append(f"smooth={smoothed_stop:.4f}")
+        parts.append("stop " + " ".join(stop_bits))
     if notes:
         parts.extend(notes)
     return " | ".join(parts)
@@ -803,8 +814,11 @@ def train(
     label_to_idx,
     model_config,
     epochs=100,
-    batch_size=32,
-    lr=1e-3,
+    batch_size: int | None = None,
+    lr: float | None = None,
+    weight_decay: float | None = None,
+    grad_clip_norm: float | None = None,
+    warmup_epochs: int | None = None,
     *,
     run_dir: Path,
     save_interval: int = CHECKPOINT_SAVE_INTERVAL,
@@ -815,6 +829,33 @@ def train(
     pin_memory=False,
     continued_from: dict | None = None,
 ):
+    architecture = model_config.get("architecture", MODEL_ARCHITECTURE)
+    defaults = get_train_defaults(architecture)
+    if batch_size is None:
+        batch_size = defaults.batch_size
+    if lr is None:
+        lr = defaults.lr
+    if weight_decay is None:
+        weight_decay = defaults.weight_decay
+    if grad_clip_norm is None:
+        grad_clip_norm = defaults.grad_clip_norm
+    if warmup_epochs is None:
+        warmup_epochs = defaults.warmup_epochs
+
+    train_hparams = {
+        "lr": lr,
+        "weight_decay": weight_decay,
+        "batch_size": batch_size,
+        "grad_clip_norm": grad_clip_norm,
+        "warmup_epochs": warmup_epochs,
+    }
+    model_config["train"] = train_hparams
+    print(
+        f"train hyperparams ({architecture}): "
+        f"lr={lr}, weight_decay={weight_decay}, batch_size={batch_size}, "
+        f"grad_clip_norm={grad_clip_norm}, warmup_epochs={warmup_epochs}"
+    )
+
     n_classes = len(label_to_idx)
     model = model.to(device)
     idx_to_label = {idx: label for label, idx in label_to_idx.items()}
@@ -827,8 +868,7 @@ def train(
     val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
     test_dl = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
 
-    
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode='min', factor=0.5, patience=5
     )
@@ -902,6 +942,11 @@ def train(
     with ExitStack() as stack:
         flop_counter = stack.enter_context(FlopCounterMode(display=False))
         for epoch in epoch_bar:
+            if warmup_epochs > 0 and epoch < warmup_epochs:
+                warmup_lr = lr * float(epoch + 1) / float(warmup_epochs)
+                for pg in opt.param_groups:
+                    pg["lr"] = warmup_lr
+
             epoch_start = time.perf_counter()
             epoch_perf = PerfReport(f"epoch {epoch + 1}", live=False)
             model.train()
@@ -921,6 +966,8 @@ def train(
                 logits = model(eeg, emg)
                 loss = soft_cross_entropy(logits, y_soft)
                 loss.backward()
+                if grad_clip_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 opt.step()
                 sync_device(device)
                 epoch_perf.add("train/gpu", time.perf_counter() - gpu_started, where="GPU")
@@ -951,7 +998,8 @@ def train(
                 perf=epoch_perf,
             )
 
-            scheduler.step(val_loss)
+            if epoch >= warmup_epochs:
+                scheduler.step(val_loss)
 
             test_loss, test_acc, test_loss_per_label, test_acc_per_label = evaluate_fusion_split(
                 model,
@@ -1052,6 +1100,7 @@ def train(
                     best_epoch=best_metrics["epoch"],
                     epoch_time=epoch_time,
                     epochs_without_improve=epochs_without_improve if early_stopping_patience > 0 else None,
+                    early_stopping_patience=early_stopping_patience if early_stopping_patience > 0 else None,
                     smoothed_stop=smoothed_stop if early_stopping_patience > 0 else None,
                     notes=epoch_notes or None,
                 )
