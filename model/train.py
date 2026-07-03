@@ -28,11 +28,11 @@ SEED = 56 # 42 always
 TORCH_DETERMINISTIC = False
 RUN_DIR_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}")
 
-# --- modality selection (set True to drop an entire modality from training)
-NOT_USE_EEG = True
-NOT_USE_EMG = False
+# --- modality selection
+USE_EEG = False
+USE_EMG = True
 
-if NOT_USE_EEG and NOT_USE_EMG:
+if not USE_EEG and not USE_EMG:
     raise ValueError("At least one of EEG or EMG must be enabled")
 
 # --- channel selection (set False to exclude from training)
@@ -112,12 +112,12 @@ _EMG_CHANNEL_USE = (
     EMG1, EMG2, EMG3, EMG4, EMG5, EMG6, EMG7, EMG8,
     EMG9, EMG10, EMG11, EMG12, EMG13, EMG14, EMG15, EMG16,
 )
-ACTIVE_EEG_INDICES = [] if NOT_USE_EEG else [i for i, use in enumerate(_EEG_CHANNEL_USE) if use]
-ACTIVE_EMG_INDICES = [] if NOT_USE_EMG else [16 + i for i, use in enumerate(_EMG_CHANNEL_USE) if use]
+ACTIVE_EEG_INDICES = [i for i, use in enumerate(_EEG_CHANNEL_USE) if use] if USE_EEG else []
+ACTIVE_EMG_INDICES = [16 + i for i, use in enumerate(_EMG_CHANNEL_USE) if use] if USE_EMG else []
 
-if not NOT_USE_EEG and not ACTIVE_EEG_INDICES:
+if USE_EEG and not ACTIVE_EEG_INDICES:
     raise ValueError("At least one EEG channel must be enabled when EEG is used")
-if not NOT_USE_EMG and not ACTIVE_EMG_INDICES:
+if USE_EMG and not ACTIVE_EMG_INDICES:
     raise ValueError("At least one EMG channel must be enabled when EMG is used")
 
 
@@ -160,10 +160,14 @@ MODEL_ARCHITECTURE = "intermediate_fusion_eegnet"  # or "cat_net"
 
 
 def use_eeg_from_config(model_config: dict) -> bool:
+    if "use_eeg" in model_config:
+        return bool(model_config["use_eeg"])
     return not model_config.get("not_use_eeg", False)
 
 
 def use_emg_from_config(model_config: dict) -> bool:
+    if "use_emg" in model_config:
+        return bool(model_config["use_emg"])
     return not model_config.get("not_use_emg", False)
 
 
@@ -171,8 +175,8 @@ def fusion_dataset_kwargs(model_config: dict | None = None) -> dict:
     if model_config is None:
         return {}
     return {
-        "not_use_eeg": model_config.get("not_use_eeg", False),
-        "not_use_emg": model_config.get("not_use_emg", False),
+        "use_eeg": use_eeg_from_config(model_config),
+        "use_emg": use_emg_from_config(model_config),
     }
 
 
@@ -213,14 +217,14 @@ class FusionDataset(torch.utils.data.Dataset):
         indices,
         label_to_idx,
         *,
-        not_use_eeg: bool | None = None,
-        not_use_emg: bool | None = None,
+        use_eeg: bool | None = None,
+        use_emg: bool | None = None,
     ):
         self.base = base_dataset
         self.indices = list(indices)
         self.label_to_idx = label_to_idx
-        self.not_use_eeg = NOT_USE_EEG if not_use_eeg is None else not_use_eeg
-        self.not_use_emg = NOT_USE_EMG if not_use_emg is None else not_use_emg
+        self.use_eeg = USE_EEG if use_eeg is None else use_eeg
+        self.use_emg = USE_EMG if use_emg is None else use_emg
 
     def __len__(self) -> int:
         return len(self.indices)
@@ -229,14 +233,14 @@ class FusionDataset(torch.utils.data.Dataset):
         sample = self.base[self.indices[i]]
         x = sample["x"]
 
-        if self.not_use_eeg:
-            eeg = torch.empty(1, 0, x.shape[0], dtype=x.dtype)
-        else:
+        if self.use_eeg:
             eeg = x[:, ACTIVE_EEG_INDICES].T.unsqueeze(0)
-        if self.not_use_emg:
-            emg = torch.empty(1, 0, x.shape[0], dtype=x.dtype)
         else:
+            eeg = torch.empty(1, 0, x.shape[0], dtype=x.dtype)
+        if self.use_emg:
             emg = x[:, ACTIVE_EMG_INDICES].T.unsqueeze(0)
+        else:
+            emg = torch.empty(1, 0, x.shape[0], dtype=x.dtype)
         y_soft = torch.from_numpy(
             label_probs_to_vector(
                 sample.get("label_probs"),
@@ -292,9 +296,9 @@ def print_input_sample_preview(splits) -> None:
     if raw.get("label_probs"):
         print(f"  label_probs={raw['label_probs']}")
     print(
-        f"  modalities: eeg={'on' if not NOT_USE_EEG else 'off'}"
+        f"  modalities: eeg={'on' if USE_EEG else 'off'}"
         f" ({len(ACTIVE_EEG_INDICES)} ch)  "
-        f"emg={'on' if not NOT_USE_EMG else 'off'}"
+        f"emg={'on' if USE_EMG else 'off'}"
         f" ({len(ACTIVE_EMG_INDICES)} ch)"
     )
     for line in _tensor_lines(eeg, "eeg"):
@@ -312,11 +316,9 @@ def construct_model(splits, architecture: str = MODEL_ARCHITECTURE):
 
     # infer shapes from one sample
     eeg0, emg0, _, _ = FusionDataset(splits.dataset, splits.train.indices, label_to_idx)[0]
-    use_eeg = not NOT_USE_EEG
-    use_emg = not NOT_USE_EMG
-    n_eeg = len(ACTIVE_EEG_INDICES) if use_eeg else 0
-    n_emg = len(ACTIVE_EMG_INDICES) if use_emg else 0
-    T = eeg0.shape[2] if use_eeg else emg0.shape[2]
+    n_eeg = len(ACTIVE_EEG_INDICES) if USE_EEG else 0
+    n_emg = len(ACTIVE_EMG_INDICES) if USE_EMG else 0
+    T = eeg0.shape[2] if USE_EEG else emg0.shape[2]
 
     model = build_fusion_model(
         architecture,
@@ -324,8 +326,8 @@ def construct_model(splits, architecture: str = MODEL_ARCHITECTURE):
         n_emg=n_emg,
         n_classes=n_classes,
         T=T,
-        use_eeg=use_eeg,
-        use_emg=use_emg,
+        use_eeg=USE_EEG,
+        use_emg=USE_EMG,
     ).to(device)
 
     return model, label_to_idx, {
@@ -336,8 +338,8 @@ def construct_model(splits, architecture: str = MODEL_ARCHITECTURE):
         "T": T,
         "active_eeg_indices": ACTIVE_EEG_INDICES,
         "active_emg_indices": ACTIVE_EMG_INDICES,
-        "not_use_eeg": NOT_USE_EEG,
-        "not_use_emg": NOT_USE_EMG,
+        "use_eeg": USE_EEG,
+        "use_emg": USE_EMG,
     }
 
 def new_run_dir_name(now: datetime | None = None) -> str:
@@ -825,7 +827,11 @@ def train(
     val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
     test_dl = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
 
+    
     opt = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt, mode='min', factor=0.5, patience=5
+    )
 
     best_acc = 0.0
     best_state: dict | None = None
@@ -944,6 +950,9 @@ def train(
                 device=device,
                 perf=epoch_perf,
             )
+
+            scheduler.step(val_loss)
+
             test_loss, test_acc, test_loss_per_label, test_acc_per_label = evaluate_fusion_split(
                 model,
                 test_dl,

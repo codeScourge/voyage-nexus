@@ -52,7 +52,7 @@ here also the cutting is handled: to construct word_starting, and word_ending, w
 add --continue flag, will continue training with the currently set rules, and create a folder with the same name but `-continued` attached to it
 TODO: for loss decresion
 
-### dataset
+### dataset (tune params regarding: label construction, splitting, preporcessing)
 Silence: `INCLUDE_SILENCE_FROM_BREAKS` and `INCLUDE_SILENCE_FROM_NEGATIVE`. Transitions: `INCLUDE_TRANSITIONS_FROM_BREAKS` and `INCLUDE_TRANSITIONS_FROM_NEGATIVE` (each requires its matching silence flag).
 
 theres the simple fast approach, which just first cuts away x/y sessions for val, and another one that tries different combinations so that the distribution follows in the end what we want it to have
@@ -63,3 +63,17 @@ we have a dict that limits each label to x% (after put into sets) - algorithm tr
 - 2026-06-25_00-03-53_session_5f75476f, 2026-06-25_00-10-59_session_c019258d - collected slightly sweaty after run, was doing little head nodding half the time
 - 2026-06-25_06-50-40_session_dda4a668 - was laughing at last few samples, might need to delete the latest scrable
 - 2026-06-26_00-09-06_session_9faeac69, 2026-06-26_00-10-59_session_0dbb211f, 
+
+
+### train (tune params regarding: channels & modalities)
+
+### models (tune params regarding: models)
+
+### val
+
+### firmware and processing
+we need to convert from ADS units to volts. this does depend on the gain setting: `lsb = lambda gain: (2.0 * vref / gain) / ((2**24) - 1) * 1e6` ==> !!! you have to match it between `client/protocol.py` and `firmware/include/config.h` 
+
+apperantly we do som wapping for the daisy chain stuff, and dont by accident double swap it
+
+
