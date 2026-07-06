@@ -68,8 +68,8 @@ BATCH_SIZE = 32
 
 # val = intra-session holdout from train sessions; test = held-out extra sessions
 SPLIT_SESSION_KIND = {
-    "val": "extra",
-    "test": "intra",
+    "val": "intra",
+    "test": "extra",
 }
 SPLIT_DISPLAY_WIDTH = 14
 SESSION_DISPLAY_WIDTH = 22

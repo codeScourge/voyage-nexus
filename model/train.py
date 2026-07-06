@@ -35,74 +35,79 @@ if not USE_EEG and not USE_EMG:
     raise ValueError("At least one of EEG or EMG must be enabled")
 
 # --- channel selection (set False to exclude from training)
-# EEG1 = 0
-# EEG2 = 1
-# EEG3 = 0
-# EEG4 = 1
-# EEG5 = 1
-# EEG6 = 0
-# EEG7 = 1
-# EEG8 = 1
-# EEG9 = 1
-# EEG10 = 1
-# EEG11 = 0
-# EEG12 = 1
-# EEG13 = 0
-# EEG14 = 0
-# EEG15 = 0
-# EEG16 = 0
 
-# EMG1 = 1
-# EMG2 = 0
-# EMG3 = 1
-# EMG4 = 1
-# EMG5 = 0
-# EMG6 = 1
-# EMG7 = 0
-# EMG8 = 1
-# EMG9 = 0
-# EMG10 = 1
-# EMG11 = 0
-# EMG12 = 0
-# EMG13 = 0
-# EMG14 = 1
-# EMG15 = 0
-# EMG16 = 1
-
-EEG1 = 1
+# set 1
+EEG1 = 0
 EEG2 = 1
-EEG3 = 1
+EEG3 = 0
 EEG4 = 1
 EEG5 = 1
-EEG6 = 1
+EEG6 = 0
 EEG7 = 1
 EEG8 = 1
 EEG9 = 1
 EEG10 = 1
-EEG11 = 1
+EEG11 = 0
 EEG12 = 1
-EEG13 = 1
-EEG14 = 1
-EEG15 = 1
-EEG16 = 1
+EEG13 = 0
+EEG14 = 0
+EEG15 = 0
+EEG16 = 0
 
 EMG1 = 1
-EMG2 = 1
+EMG2 = 0
 EMG3 = 1
 EMG4 = 1
-EMG5 = 1
+EMG5 = 0
 EMG6 = 1
-EMG7 = 1
+EMG7 = 0
 EMG8 = 1
-EMG9 = 1
+EMG9 = 0
 EMG10 = 1
-EMG11 = 1
-EMG12 = 1
-EMG13 = 1
+EMG11 = 0
+EMG12 = 0
+EMG13 = 0
 EMG14 = 1
-EMG15 = 1
+EMG15 = 0
 EMG16 = 1
 
+# all
+# EEG1 = 1
+# EEG2 = 1
+# EEG3 = 1
+# EEG4 = 1
+# EEG5 = 1
+# EEG6 = 1
+# EEG7 = 1
+# EEG8 = 1
+# EEG9 = 1
+# EEG10 = 1
+# EEG11 = 1
+# EEG12 = 1
+# EEG13 = 1
+# EEG14 = 1
+# EEG15 = 1
+# EEG16 = 1
+
+# EMG1 = 1
+# EMG2 = 1
+# EMG3 = 1
+# EMG4 = 1
+# EMG5 = 1
+# EMG6 = 1
+# EMG7 = 1
+# EMG8 = 1
+# EMG9 = 1
+# EMG10 = 1
+# EMG11 = 1
+# EMG12 = 1
+# EMG13 = 1
+# EMG14 = 1
+# EMG15 = 1
+# EMG16 = 1
+
+
+# ---
 _EEG_CHANNEL_USE = (
     EEG1, EEG2, EEG3, EEG4, EEG5, EEG6, EEG7, EEG8,
     EEG9, EEG10, EEG11, EEG12, EEG13, EEG14, EEG15, EEG16,
@@ -155,7 +160,7 @@ CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 CHECKPOINT_SAVE_INTERVAL = 5
 EARLY_STOPPING_METRIC = "loss"  # "loss" or "acc" — stop signal only, not best.pt selection
 EARLY_STOPPING_SMOOTH_WINDOW = 4
-MODEL_ARCHITECTURE = "intermediate_fusion_eegnet"  # or "cat_net"
+MODEL_ARCHITECTURE = "atc_net"
 
 
 def use_eeg_from_config(model_config: dict) -> bool:
@@ -519,41 +524,34 @@ def format_epoch_summary(
     test_acc: float,
     best_acc: float,
     best_epoch: int,
-    epoch_time: float,
     epochs_without_improve: int | None = None,
     early_stopping_patience: int | None = None,
     smoothed_stop: float | None = None,
     notes: list[str] | None = None,
 ) -> str:
     width = len(str(total_epochs))
+    split_width = max(len(name) for name in ("train", "val", "test"))
 
-    def split_metrics(name: str, loss: float, acc: float) -> str:
-        return f"{name} {loss:.4f}/{acc:.4f}"
+    def split_line(name: str, loss: float, acc: float) -> str:
+        return f"{name:<{split_width}}  loss: {loss:.4f} --- acc: {acc:.4f}"
 
-    parts = [
+    lines = [
         f"epoch {epoch_num:>{width}}/{total_epochs}",
-        "loss/acc "
-        + "  ".join([
-            split_metrics("train", train_loss, train_acc),
-            split_metrics("val", val_loss, val_acc),
-            split_metrics("test", test_loss, test_acc),
-        ]),
+        split_line("train", train_loss, train_acc),
+        split_line("val", val_loss, val_acc),
+        split_line("test", test_loss, test_acc),
         f"best {best_acc:.4f}@{best_epoch}",
-        f"{epoch_time:.1f}s",
     ]
-    if epochs_without_improve is not None or smoothed_stop is not None:
-        stop_bits: list[str] = []
-        if epochs_without_improve is not None:
-            if early_stopping_patience is not None and early_stopping_patience > 0:
-                stop_bits.append(f"{epochs_without_improve}/{early_stopping_patience}")
-            else:
-                stop_bits.append(f"{epochs_without_improve}")
-        if smoothed_stop is not None:
-            stop_bits.append(f"smooth={smoothed_stop:.4f}")
-        parts.append("stop " + " ".join(stop_bits))
+    if epochs_without_improve is not None:
+        if early_stopping_patience is not None and early_stopping_patience > 0:
+            lines.append(f"stop {epochs_without_improve}/{early_stopping_patience}")
+        else:
+            lines.append(f"stop {epochs_without_improve}")
+    if smoothed_stop is not None:
+        lines.append(f"smooth {smoothed_stop:.4f}")
     if notes:
-        parts.extend(notes)
-    return " | ".join(parts)
+        lines.extend(notes)
+    return "\n".join(lines)
 
 
 def format_duration(seconds: float) -> str:
@@ -1159,7 +1157,6 @@ def train(
                 test_acc=test_acc,
                 best_acc=best_acc,
                 best_epoch=best_metrics["epoch"],
-                epoch_time=epoch_time,
                 epochs_without_improve=epochs_without_improve if early_stopping_patience > 0 else None,
                 early_stopping_patience=early_stopping_patience if early_stopping_patience > 0 else None,
                 smoothed_stop=smoothed_stop if early_stopping_patience > 0 else None,
