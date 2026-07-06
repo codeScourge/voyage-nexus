@@ -6,7 +6,6 @@ import random
 import re
 import time
 import uuid
-from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 
@@ -208,8 +207,20 @@ def build_model_from_config(
 
 
 # --- dataset adapter
+def _modality_tensor(x_ntc: np.ndarray, channel_indices: list[int]) -> torch.Tensor:
+    """(N, T, C_all) -> float32 (N, 1, C, T) for the selected channels."""
+    # (N, T, C) -> (N, C, T) -> (N, 1, C, T)
+    selected = np.ascontiguousarray(x_ntc[:, :, channel_indices].transpose(0, 2, 1))
+    return torch.from_numpy(selected).unsqueeze(1)
+
+
 class FusionDataset(torch.utils.data.Dataset):
-    """Wraps the split so __getitem__ returns (eeg, emg, label) batched-ready."""
+    """Pre-materialized (eeg, emg, y_soft, y_hard) tensors for a split.
+
+    Windows live in ``base_dataset.batch.x`` as float32 ``(N, T, C)``. We slice
+    channels and labels once up front so ``__getitem__`` is a tensor index, not
+    per-sample numpy→torch conversion.
+    """
 
     def __init__(
         self,
@@ -226,46 +237,66 @@ class FusionDataset(torch.utils.data.Dataset):
         self.use_eeg = USE_EEG if use_eeg is None else use_eeg
         self.use_emg = USE_EMG if use_emg is None else use_emg
 
+        batch = base_dataset.batch
+        idx = np.asarray(self.indices, dtype=np.int64)
+        # batch.x is (N, T, C), time-major channels-last — same layout as live windows.
+        x = np.asarray(batch.x[idx], dtype=np.float32)
+        n, t, _c = x.shape
+
+        if self.use_eeg and ACTIVE_EEG_INDICES:
+            self.eeg = _modality_tensor(x, ACTIVE_EEG_INDICES)
+        else:
+            self.eeg = torch.empty(n, 1, 0, t, dtype=torch.float32)
+
+        if self.use_emg and ACTIVE_EMG_INDICES:
+            self.emg = _modality_tensor(x, ACTIVE_EMG_INDICES)
+        else:
+            self.emg = torch.empty(n, 1, 0, t, dtype=torch.float32)
+
+        n_classes = len(label_to_idx)
+        y_soft = np.zeros((n, n_classes), dtype=np.float32)
+        y_hard = np.empty(n, dtype=np.int64)
+        labels = batch.labels
+        label_probs = batch.label_probs
+        for i, base_i in enumerate(self.indices):
+            label = labels[base_i]
+            probs = label_probs[base_i] if label_probs else None
+            y_soft[i] = label_probs_to_vector(probs, label, label_to_idx)
+            y_hard[i] = label_to_idx[label]
+        self.y_soft = torch.from_numpy(y_soft)
+        self.y_hard = torch.from_numpy(y_hard)
+
     def __len__(self) -> int:
         return len(self.indices)
 
     def __getitem__(self, i: int):
-        sample = self.base[self.indices[i]]
-        x = sample["x"]
-
-        if self.use_eeg:
-            eeg = x[:, ACTIVE_EEG_INDICES].T.unsqueeze(0)
-        else:
-            eeg = torch.empty(1, 0, x.shape[0], dtype=x.dtype)
-        if self.use_emg:
-            emg = x[:, ACTIVE_EMG_INDICES].T.unsqueeze(0)
-        else:
-            emg = torch.empty(1, 0, x.shape[0], dtype=x.dtype)
-        y_soft = torch.from_numpy(
-            label_probs_to_vector(
-                sample.get("label_probs"),
-                sample["label"],
-                self.label_to_idx,
-            )
-        )
-        y_hard = torch.tensor(self.label_to_idx[sample["label"]], dtype=torch.long)
-        return eeg, emg, y_soft, y_hard
+        return self.eeg[i], self.emg[i], self.y_soft[i], self.y_hard[i]
 
 
 def build_label_map(base_dataset, indices) -> dict:
     label_to_idx = default_label_to_idx()
-    seen = {base_dataset[i]["label"] for i in indices}
+    labels = base_dataset.batch.labels
+    seen = {labels[i] for i in indices}
     unknown = seen - set(label_to_idx)
     if unknown:
         raise ValueError(f"Unknown labels in training data: {sorted(unknown)}")
     return label_to_idx
 
 
+def _batch_to_device(eeg, emg, y_soft, y_hard, device: torch.device, *, non_blocking: bool):
+    return (
+        eeg.to(device, non_blocking=non_blocking),
+        emg.to(device, non_blocking=non_blocking),
+        y_soft.to(device, non_blocking=non_blocking),
+        y_hard.to(device, non_blocking=non_blocking),
+    )
+
+
 def print_input_sample_preview(splits) -> None:
     """Print one train sample with stats so inputs can be sanity-checked before training."""
     label_to_idx = build_label_map(splits.dataset, splits.train.indices)
-    ds = FusionDataset(splits.dataset, splits.train.indices, label_to_idx)
     base_idx = splits.train.indices[0]
+    ds = FusionDataset(splits.dataset, [base_idx], label_to_idx)
     raw = splits.dataset[base_idx]
     eeg, emg, y_soft, y_hard = ds[0]
 
@@ -315,7 +346,7 @@ def construct_model(splits, architecture: str = MODEL_ARCHITECTURE):
     print(f"classes ({n_classes}): {', '.join(label_to_idx)}")
 
     # infer shapes from one sample
-    eeg0, emg0, _, _ = FusionDataset(splits.dataset, splits.train.indices, label_to_idx)[0]
+    eeg0, emg0, _, _ = FusionDataset(splits.dataset, splits.train.indices[:1], label_to_idx)[0]
     n_eeg = len(ACTIVE_EEG_INDICES) if USE_EEG else 0
     n_emg = len(ACTIVE_EMG_INDICES) if USE_EMG else 0
     T = eeg0.shape[2] if USE_EEG else emg0.shape[2]
@@ -623,6 +654,7 @@ def evaluate_fusion_split(
     desc: str,
     device: torch.device,
     perf: PerfReport | None = None,
+    non_blocking: bool = False,
 ) -> tuple[float, float, dict[str, float], dict[str, float]]:
     model.eval()
     running = 0.0
@@ -633,9 +665,9 @@ def evaluate_fusion_split(
         if perf is not None:
             perf.add(f"{desc}/dataloader", time.perf_counter() - batch_wait_started, where="CPU")
         gpu_started = time.perf_counter()
-        eeg, emg = eeg.to(device), emg.to(device)
-        y_soft = y_soft.to(device)
-        y_hard = y_hard.to(device)
+        eeg, emg, y_soft, y_hard = _batch_to_device(
+            eeg, emg, y_soft, y_hard, device, non_blocking=non_blocking,
+        )
         logits = model(eeg, emg)
         sync_device(device)
         if perf is not None:
@@ -825,8 +857,8 @@ def train(
     early_stopping_patience: int = 10,
     early_stopping_metric: str = EARLY_STOPPING_METRIC,
     early_stopping_smooth_window: int = EARLY_STOPPING_SMOOTH_WINDOW,
-    num_workers=0,
-    pin_memory=False,
+    num_workers: int = 0,
+    pin_memory: bool | None = None,
     continued_from: dict | None = None,
 ):
     architecture = model_config.get("architecture", MODEL_ARCHITECTURE)
@@ -841,6 +873,10 @@ def train(
         grad_clip_norm = defaults.grad_clip_norm
     if warmup_epochs is None:
         warmup_epochs = defaults.warmup_epochs
+    # Pre-materialized tensors: workers only add IPC cost. pin_memory helps H2D on CUDA.
+    if pin_memory is None:
+        pin_memory = device.type == "cuda"
+    non_blocking = bool(pin_memory and device.type == "cuda")
 
     train_hparams = {
         "lr": lr,
@@ -853,20 +889,34 @@ def train(
     print(
         f"train hyperparams ({architecture}): "
         f"lr={lr}, weight_decay={weight_decay}, batch_size={batch_size}, "
-        f"grad_clip_norm={grad_clip_norm}, warmup_epochs={warmup_epochs}"
+        f"grad_clip_norm={grad_clip_norm}, warmup_epochs={warmup_epochs}, "
+        f"num_workers={num_workers}, pin_memory={pin_memory}"
     )
 
     n_classes = len(label_to_idx)
     model = model.to(device)
     idx_to_label = {idx: label for label, idx in label_to_idx.items()}
 
+    materialize_started = time.perf_counter()
     train_ds = FusionDataset(splits.dataset, splits.train.indices, label_to_idx)
     val_ds = FusionDataset(splits.dataset, splits.val.indices, label_to_idx)
     test_ds = FusionDataset(splits.dataset, splits.test.indices, label_to_idx)
+    print(
+        f"materialized fusion tensors in {time.perf_counter() - materialize_started:.2f}s "
+        f"(train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)})"
+    )
 
-    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=num_workers, pin_memory=pin_memory)
-    val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
-    test_dl = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
+    train_dl = DataLoader(train_ds, shuffle=True, drop_last=True, **loader_kwargs)
+    val_dl = DataLoader(val_ds, shuffle=False, **loader_kwargs)
+    test_dl = DataLoader(test_ds, shuffle=False, **loader_kwargs)
 
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -939,192 +989,203 @@ def train(
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
     )
     run_start = time.perf_counter()
-    with ExitStack() as stack:
-        flop_counter = stack.enter_context(FlopCounterMode(display=False))
-        for epoch in epoch_bar:
-            if warmup_epochs > 0 and epoch < warmup_epochs:
-                warmup_lr = lr * float(epoch + 1) / float(warmup_epochs)
-                for pg in opt.param_groups:
-                    pg["lr"] = warmup_lr
+    flops_per_step = 0
+    train_steps = 0
+    for epoch in epoch_bar:
+        if warmup_epochs > 0 and epoch < warmup_epochs:
+            warmup_lr = lr * float(epoch + 1) / float(warmup_epochs)
+            for pg in opt.param_groups:
+                pg["lr"] = warmup_lr
 
-            epoch_start = time.perf_counter()
-            epoch_perf = PerfReport(f"epoch {epoch + 1}", live=False)
-            model.train()
-            running = 0.0
-            train_correct = train_total = 0
-            train_loss_sum, train_correct_per_class, train_count_per_class = init_per_class_counters(
-                n_classes, device,
+        epoch_start = time.perf_counter()
+        epoch_perf = PerfReport(f"epoch {epoch + 1}", live=False)
+        model.train()
+        running = 0.0
+        train_correct = train_total = 0
+        train_loss_sum, train_correct_per_class, train_count_per_class = init_per_class_counters(
+            n_classes, device,
+        )
+        batch_wait_started = time.perf_counter()
+        for eeg, emg, y_soft, y_hard in tqdm(train_dl, desc="train", leave=False):
+            epoch_perf.add("train/dataloader", time.perf_counter() - batch_wait_started, where="CPU")
+            gpu_started = time.perf_counter()
+            eeg, emg, y_soft, y_hard = _batch_to_device(
+                eeg, emg, y_soft, y_hard, device, non_blocking=non_blocking,
             )
-            batch_wait_started = time.perf_counter()
-            for eeg, emg, y_soft, y_hard in tqdm(train_dl, desc="train", leave=False):
-                epoch_perf.add("train/dataloader", time.perf_counter() - batch_wait_started, where="CPU")
-                gpu_started = time.perf_counter()
-                eeg, emg = eeg.to(device), emg.to(device)
-                y_soft = y_soft.to(device)
-                y_hard = y_hard.to(device)
-                opt.zero_grad()
+            opt.zero_grad(set_to_none=True)
+            # Count FLOPs on the first step only; extrapolate at the end.
+            if flops_per_step == 0:
+                with FlopCounterMode(display=False) as flop_counter:
+                    logits = model(eeg, emg)
+                    loss = soft_cross_entropy(logits, y_soft)
+                    loss.backward()
+                flops_per_step = int(flop_counter.get_total_flops())
+            else:
                 logits = model(eeg, emg)
                 loss = soft_cross_entropy(logits, y_soft)
                 loss.backward()
-                if grad_clip_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-                opt.step()
-                sync_device(device)
-                epoch_perf.add("train/gpu", time.perf_counter() - gpu_started, where="GPU")
-                running += loss.item() * y_hard.size(0)
-                pred = logits.argmax(1)
-                train_correct += (pred == y_hard).sum().item()
-                train_total += y_hard.size(0)
-                update_per_class_counters(
-                    logits, y_hard, pred,
-                    train_loss_sum, train_correct_per_class, train_count_per_class,
-                )
-                batch_wait_started = time.perf_counter()
-
-            train_loss = running / len(train_ds)
-            train_acc = train_correct / train_total if train_total else 0.0
-            train_loss_per_label, train_acc_per_label = per_class_metrics_from_counters(
-                train_loss_sum, train_correct_per_class, train_count_per_class, idx_to_label,
+            if grad_clip_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            opt.step()
+            sync_device(device)
+            epoch_perf.add("train/gpu", time.perf_counter() - gpu_started, where="GPU")
+            running += loss.item() * y_hard.size(0)
+            pred = logits.argmax(1)
+            train_correct += (pred == y_hard).sum().item()
+            train_total += y_hard.size(0)
+            update_per_class_counters(
+                logits, y_hard, pred,
+                train_loss_sum, train_correct_per_class, train_count_per_class,
             )
+            train_steps += 1
+            batch_wait_started = time.perf_counter()
 
-            val_loss, val_acc, val_loss_per_label, val_acc_per_label = evaluate_fusion_split(
-                model,
-                val_dl,
-                len(val_ds),
-                n_classes=n_classes,
-                idx_to_label=idx_to_label,
-                desc="val",
-                device=device,
-                perf=epoch_perf,
+        train_loss = running / len(train_ds)
+        train_acc = train_correct / train_total if train_total else 0.0
+        train_loss_per_label, train_acc_per_label = per_class_metrics_from_counters(
+            train_loss_sum, train_correct_per_class, train_count_per_class, idx_to_label,
+        )
+
+        val_loss, val_acc, val_loss_per_label, val_acc_per_label = evaluate_fusion_split(
+            model,
+            val_dl,
+            len(val_ds),
+            n_classes=n_classes,
+            idx_to_label=idx_to_label,
+            desc="val",
+            device=device,
+            perf=epoch_perf,
+            non_blocking=non_blocking,
+        )
+
+        if epoch >= warmup_epochs:
+            scheduler.step(val_loss)
+
+        test_loss, test_acc, test_loss_per_label, test_acc_per_label = evaluate_fusion_split(
+            model,
+            test_dl,
+            len(test_ds),
+            n_classes=n_classes,
+            idx_to_label=idx_to_label,
+            desc="test",
+            device=device,
+            perf=epoch_perf,
+            non_blocking=non_blocking,
+        )
+
+        epoch_num = epoch + 1
+        epoch_notes: list[str] = []
+
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["test_loss"].append(test_loss)
+        history["train_acc"].append(train_acc)
+        history["val_acc"].append(val_acc)
+        history["test_acc"].append(test_acc)
+        for label in label_to_idx:
+            history["train_loss_per_label"][label].append(train_loss_per_label[label])
+            history["val_loss_per_label"][label].append(val_loss_per_label[label])
+            history["test_loss_per_label"][label].append(test_loss_per_label[label])
+            history["train_acc_per_label"][label].append(train_acc_per_label[label])
+            history["val_acc_per_label"][label].append(val_acc_per_label[label])
+            history["test_acc_per_label"][label].append(test_acc_per_label[label])
+
+        if val_acc > best_acc:
+            best_acc = val_acc
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_metrics = {
+                "epoch": epoch_num,
+                "train_loss": train_loss,
+                "train_acc": train_acc,
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+            }
+            ckpt_started = time.perf_counter()
+            write_checkpoint(
+                run_dir / "best.pt",
+                kind="best",
+                epoch_num=epoch_num,
+                train_loss=train_loss,
+                train_acc=train_acc,
+                val_loss=val_loss,
+                val_acc=val_acc,
+                state_dict=best_state,
+                log=False,
             )
+            epoch_perf.add("checkpoint/best", time.perf_counter() - ckpt_started, where="I/O")
+            epoch_notes.append(f"saved best.pt (epoch {epoch_num})")
 
-            if epoch >= warmup_epochs:
-                scheduler.step(val_loss)
+        smoothed_stop = smoothed_tail(history[stop_metric_key], early_stopping_smooth_window)
+        if smoothed_stop is not None:
+            if early_stopping_metric == "loss":
+                stop_improved = smoothed_stop < best_smoothed_stop
+            else:
+                stop_improved = smoothed_stop > best_smoothed_stop
+            if stop_improved:
+                best_smoothed_stop = smoothed_stop
+                best_smoothed_stop_epoch = epoch_num
+                epochs_without_improve = 0
+            else:
+                epochs_without_improve += 1
 
-            test_loss, test_acc, test_loss_per_label, test_acc_per_label = evaluate_fusion_split(
-                model,
-                test_dl,
-                len(test_ds),
-                n_classes=n_classes,
-                idx_to_label=idx_to_label,
-                desc="test",
-                device=device,
-                perf=epoch_perf,
+        if save_interval > 0 and epoch_num % save_interval == 0:
+            ckpt_name = f"epoch_{epoch_num:04d}.pt"
+            ckpt_started = time.perf_counter()
+            write_checkpoint(
+                run_dir / ckpt_name,
+                kind="epoch",
+                epoch_num=epoch_num,
+                train_loss=train_loss,
+                train_acc=train_acc,
+                val_loss=val_loss,
+                val_acc=val_acc,
+                log=False,
             )
+            epoch_perf.add(f"checkpoint/{ckpt_name}", time.perf_counter() - ckpt_started, where="I/O")
+            epoch_notes.append(f"saved {ckpt_name}")
 
-            epoch_num = epoch + 1
-            epoch_notes: list[str] = []
+        epoch_time = time.perf_counter() - epoch_start
+        epoch_perf.add("epoch/overhead", max(0.0, epoch_time - epoch_perf.total_seconds()), where="CPU")
+        epoch_bar.write(epoch_perf.format_block(min_pct=1.0, max_rows=10))
+        epoch_bar.write(
+            format_epoch_summary(
+                epoch_num,
+                epochs,
+                train_loss=train_loss,
+                train_acc=train_acc,
+                val_loss=val_loss,
+                val_acc=val_acc,
+                test_loss=test_loss,
+                test_acc=test_acc,
+                best_acc=best_acc,
+                best_epoch=best_metrics["epoch"],
+                epoch_time=epoch_time,
+                epochs_without_improve=epochs_without_improve if early_stopping_patience > 0 else None,
+                early_stopping_patience=early_stopping_patience if early_stopping_patience > 0 else None,
+                smoothed_stop=smoothed_stop if early_stopping_patience > 0 else None,
+                notes=epoch_notes or None,
+            )
+        )
+        epoch_bar.write("")
+        epoch_bar.write("")
 
-            history["train_loss"].append(train_loss)
-            history["val_loss"].append(val_loss)
-            history["test_loss"].append(test_loss)
-            history["train_acc"].append(train_acc)
-            history["val_acc"].append(val_acc)
-            history["test_acc"].append(test_acc)
-            for label in label_to_idx:
-                history["train_loss_per_label"][label].append(train_loss_per_label[label])
-                history["val_loss_per_label"][label].append(val_loss_per_label[label])
-                history["test_loss_per_label"][label].append(test_loss_per_label[label])
-                history["train_acc_per_label"][label].append(train_acc_per_label[label])
-                history["val_acc_per_label"][label].append(val_acc_per_label[label])
-                history["test_acc_per_label"][label].append(test_acc_per_label[label])
-
-            if val_acc > best_acc:
-                best_acc = val_acc
-                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-                best_metrics = {
-                    "epoch": epoch_num,
-                    "train_loss": train_loss,
-                    "train_acc": train_acc,
-                    "val_loss": val_loss,
-                    "val_acc": val_acc,
-                }
-                ckpt_started = time.perf_counter()
-                write_checkpoint(
-                    run_dir / "best.pt",
-                    kind="best",
-                    epoch_num=epoch_num,
-                    train_loss=train_loss,
-                    train_acc=train_acc,
-                    val_loss=val_loss,
-                    val_acc=val_acc,
-                    state_dict=best_state,
-                    log=False,
-                )
-                epoch_perf.add("checkpoint/best", time.perf_counter() - ckpt_started, where="I/O")
-                epoch_notes.append(f"saved best.pt (epoch {epoch_num})")
-
-            smoothed_stop = smoothed_tail(history[stop_metric_key], early_stopping_smooth_window)
-            if smoothed_stop is not None:
-                if early_stopping_metric == "loss":
-                    stop_improved = smoothed_stop < best_smoothed_stop
-                else:
-                    stop_improved = smoothed_stop > best_smoothed_stop
-                if stop_improved:
-                    best_smoothed_stop = smoothed_stop
-                    best_smoothed_stop_epoch = epoch_num
-                    epochs_without_improve = 0
-                else:
-                    epochs_without_improve += 1
-
-            if save_interval > 0 and epoch_num % save_interval == 0:
-                ckpt_name = f"epoch_{epoch_num:04d}.pt"
-                ckpt_started = time.perf_counter()
-                write_checkpoint(
-                    run_dir / ckpt_name,
-                    kind="epoch",
-                    epoch_num=epoch_num,
-                    train_loss=train_loss,
-                    train_acc=train_acc,
-                    val_loss=val_loss,
-                    val_acc=val_acc,
-                    log=False,
-                )
-                epoch_perf.add(f"checkpoint/{ckpt_name}", time.perf_counter() - ckpt_started, where="I/O")
-                epoch_notes.append(f"saved {ckpt_name}")
-
-            epoch_time = time.perf_counter() - epoch_start
-            epoch_perf.add("epoch/overhead", max(0.0, epoch_time - epoch_perf.total_seconds()), where="CPU")
-            epoch_bar.write(epoch_perf.format_block(min_pct=1.0, max_rows=10))
+        if (
+            early_stopping_patience > 0
+            and smoothed_stop is not None
+            and epochs_without_improve >= early_stopping_patience
+        ):
+            metric_label = "val loss" if early_stopping_metric == "loss" else "val acc"
             epoch_bar.write(
-                format_epoch_summary(
-                    epoch_num,
-                    epochs,
-                    train_loss=train_loss,
-                    train_acc=train_acc,
-                    val_loss=val_loss,
-                    val_acc=val_acc,
-                    test_loss=test_loss,
-                    test_acc=test_acc,
-                    best_acc=best_acc,
-                    best_epoch=best_metrics["epoch"],
-                    epoch_time=epoch_time,
-                    epochs_without_improve=epochs_without_improve if early_stopping_patience > 0 else None,
-                    early_stopping_patience=early_stopping_patience if early_stopping_patience > 0 else None,
-                    smoothed_stop=smoothed_stop if early_stopping_patience > 0 else None,
-                    notes=epoch_notes or None,
-                )
+                f"early stopping at epoch {epoch_num}: "
+                f"no smoothed {metric_label} improvement for {early_stopping_patience} epochs "
+                f"(window={early_stopping_smooth_window}, "
+                f"best_smooth={best_smoothed_stop:.4f} @ epoch {best_smoothed_stop_epoch}; "
+                f"best_acc={best_acc:.4f} @ epoch {best_metrics['epoch']})"
             )
-            epoch_bar.write("")
-            epoch_bar.write("")
-
-            if (
-                early_stopping_patience > 0
-                and smoothed_stop is not None
-                and epochs_without_improve >= early_stopping_patience
-            ):
-                metric_label = "val loss" if early_stopping_metric == "loss" else "val acc"
-                epoch_bar.write(
-                    f"early stopping at epoch {epoch_num}: "
-                    f"no smoothed {metric_label} improvement for {early_stopping_patience} epochs "
-                    f"(window={early_stopping_smooth_window}, "
-                    f"best_smooth={best_smoothed_stop:.4f} @ epoch {best_smoothed_stop_epoch}; "
-                    f"best_acc={best_acc:.4f} @ epoch {best_metrics['epoch']})"
-                )
-                break
+            break
 
     compute_elapsed = time.perf_counter() - run_start
-    total_flops = flop_counter.get_total_flops()
+    total_flops = flops_per_step * train_steps
     epochs_completed = len(history["train_loss"])
 
     last_epoch = epochs_completed
