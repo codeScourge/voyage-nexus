@@ -1,12 +1,13 @@
 """Run full validation across a meta_train grid and aggregate results.
 
-For each experiment subfolder under a meta run directory, calls the same
-logic as ``val.py`` (per-run ``validation_report.md`` + optional UMAP),
-then writes meta-level comparison artifacts:
+For each experiment subfolder under a meta run directory, reuses existing
+per-run ``validation_report.md`` / ``validation_metrics.json`` when present
+(otherwise calls ``val.py``), then writes meta-level comparison artifacts:
 
     checkpoints/meta_<timestamp>_<id>/
       intermediate_fusion_eegnet_p033/
         validation_report.md      # per-experiment (from val.py)
+        validation_metrics.json   # structured cache (from val.py)
         embeddings_umap.png       # if embeddings enabled
       ...
       validation_comparison.md    # summary tables + concatenated reports
@@ -18,6 +19,7 @@ Examples::
     uv run meta_val.py
     uv run meta_val.py --meta-dir checkpoints/meta_2026-07-02_12-00-00_abc12345
     uv run meta_val.py --no-compare-best-vs-last --splits val test --no-embeddings
+    uv run meta_val.py --force-revalidate
 """
 
 from __future__ import annotations
@@ -35,13 +37,14 @@ import numpy as np
 from data import SPLITS_OUTPUT_DIR, load_dataset_splits
 from meta_train import META_DIR_NAME_RE
 from train import CHECKPOINT_DIR, SEED, seed_everything
-from val import (
+from eval import (
     _metrics_by_split,
     add_validation_option_args,
     checkpoint_paths_for_run,
     format_session_display,
     format_split_display,
     get_device,
+    load_cached_validation,
     validate_run_dir,
     validation_options_from_args,
     ValidationOptions,
@@ -261,6 +264,7 @@ def run_meta_validation(
     options: ValidationOptions,
     use_color: bool,
     seed: int,
+    force_revalidate: bool = False,
 ) -> list[ExperimentValidationResult]:
     experiment_dirs = discover_experiment_dirs(meta_dir)
     if not experiment_dirs:
@@ -287,16 +291,26 @@ def run_meta_validation(
         print(f"meta validation {idx}/{total}: {slug}")
         print("=" * 72)
 
-        outcome = validate_run_dir(
-            run_dir,
-            splits=splits,
-            options=options,
-            device=device,
-            use_color=use_color,
-            seed=seed,
-        )
-        if outcome["report_path"] is not None:
-            print(f"report: saved validation report to {outcome['report_path'].resolve()}")
+        outcome = None
+        if not force_revalidate:
+            outcome = load_cached_validation(run_dir, options=options)
+            if outcome is not None:
+                print(
+                    f"using cached validation artifacts from {run_dir.resolve()} "
+                    f"(report + metrics)"
+                )
+
+        if outcome is None:
+            outcome = validate_run_dir(
+                run_dir,
+                splits=splits,
+                options=options,
+                device=device,
+                use_color=use_color,
+                seed=seed,
+            )
+            if outcome["report_path"] is not None:
+                print(f"report: saved validation report to {outcome['report_path'].resolve()}")
 
         evaluated = outcome["evaluated"]
         if "best" not in evaluated:
@@ -779,6 +793,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--no-color", action="store_true")
+    parser.add_argument(
+        "--force-revalidate",
+        action="store_true",
+        help="re-run val.py even when validation_report.md / validation_metrics.json exist",
+    )
     add_validation_option_args(parser)
     return parser.parse_args()
 
@@ -809,6 +828,7 @@ def main() -> None:
         options=options,
         use_color=not args.no_color,
         seed=args.seed,
+        force_revalidate=args.force_revalidate,
     )
 
     save_validation_manifest(meta_dir, results, seed=args.seed, options=options)

@@ -33,14 +33,14 @@ from _preprocessors import (
 INCLUDE_UNKNOWN_WORD_LABEL = False
 
 INCLUDE_SILENCE_FROM_BREAKS = True
-INCLUDE_SILENCE_FROM_OCCASIONAL_WORD = False
-
 INCLUDE_TRANSITIONS_FROM_BREAKS = True
+
+INCLUDE_SILENCE_FROM_OCCASIONAL_WORD = False
 INCLUDE_TRANSITIONS_FROM_OCCASIONAL_WORD = False
 
 # When True, transition windows use silence (not word starting/ending) as the
 # non-word label, with the same soft word mass near the boundary.
-MERGE_TRANSITIONS_INTO_SILENCE = True
+MERGE_TRANSITIONS_INTO_SILENCE = False
 
 
 
@@ -1786,6 +1786,19 @@ def set_split_seed(seed: int) -> None:
     _rng = np.random.default_rng(seed)
 
 
+# Internal split keys: val=intra (early stopping / best.pt), test=extra (held-out sessions).
+SPLIT_KIND = {
+    "val": "intra",
+    "test": "extra",
+}
+EARLY_STOPPING_SPLIT = "val"
+
+
+def format_split_name(split_name: str) -> str:
+    """User-facing split label (val -> intra, test -> extra)."""
+    return SPLIT_KIND.get(split_name, split_name)
+
+
 @dataclass(frozen=True, slots=True)
 class DatasetSplits:
     dataset: SessionEventDataset
@@ -2532,10 +2545,11 @@ def print_split_summary(splits: DatasetSplits) -> None:
         f"train: {len(splits.train)} samples from {len(splits.train_sessions)} sessions"
     )
     print(
-        f"val:   {len(splits.val)} held-out intra-session events from train sessions"
+        f"intra: {len(splits.val)} held-out intra-session events from train sessions "
+        f"(early stopping, best.pt)"
     )
     print(
-        f"test:  {len(splits.test)} samples from {len(splits.test_sessions)} held-out sessions"
+        f"extra: {len(splits.test)} samples from {len(splits.test_sessions)} held-out sessions"
     )
     print(
         f"split balancing: {'stratified by label' if splits.stratified_label_split else 'random'}"
@@ -2553,8 +2567,8 @@ def print_split_summary(splits: DatasetSplits) -> None:
     print_label_coverage_summary(splits.dataset, name="all")
     for name, subset in (
         ("train", splits.train),
-        ("val", splits.val),
-        ("test", splits.test),
+        (format_split_name("val"), splits.val),
+        (format_split_name("test"), splits.test),
     ):
         counts = label_distribution(splits.dataset, subset.indices)
         print_label_distribution(name, counts, len(subset))

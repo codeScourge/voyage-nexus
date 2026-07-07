@@ -20,7 +20,13 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 from _perf import PerfReport, sync_device
-from data import default_label_to_idx, label_probs_to_vector, load_dataset_splits
+from data import (
+    EARLY_STOPPING_SPLIT,
+    default_label_to_idx,
+    format_split_name,
+    label_probs_to_vector,
+    load_dataset_splits,
+)
 
 # ---
 SEED = 56 # 42 always
@@ -37,58 +43,42 @@ if not USE_EEG and not USE_EMG:
 # --- channel selection (set False to exclude from training)
 
 # set 1
-EEG1 = 0
-EEG2 = 1
-EEG3 = 0
-EEG4 = 1
-EEG5 = 1
-EEG6 = 0
-EEG7 = 1
-EEG8 = 1
-EEG9 = 1
-EEG10 = 1
-EEG11 = 0
-EEG12 = 1
-EEG13 = 0
-EEG14 = 0
-EEG15 = 0
-EEG16 = 0
+# EMG1 = 1
+# EMG2 = 0
+# EMG3 = 1
+# EMG4 = 1
+# EMG5 = 0
+# EMG6 = 1
+# EMG7 = 0
+# EMG8 = 1
+# EMG9 = 0
+# EMG10 = 1
+# EMG11 = 0
+# EMG12 = 0
+# EMG13 = 0
+# EMG14 = 1
+# EMG15 = 0
+# EMG16 = 1
 
-EMG1 = 1
-EMG2 = 0
-EMG3 = 1
-EMG4 = 1
-EMG5 = 0
-EMG6 = 1
-EMG7 = 0
-EMG8 = 1
-EMG9 = 0
-EMG10 = 1
-EMG11 = 0
-EMG12 = 0
-EMG13 = 0
-EMG14 = 1
-EMG15 = 0
-EMG16 = 1
+# set 2
+# EMG1 = 1
+# EMG2 = 1
+# EMG3 = 1
+# EMG4 = 1
+# EMG5 = 1
+# EMG6 = 1
+# EMG7 = 1
+# EMG8 = 0
+# EMG9 = 0
+# EMG10 = 0
+# EMG11 = 0
+# EMG12 = 0
+# EMG13 = 0
+# EMG14 = 1
+# EMG15 = 0
+# EMG16 = 0
 
-# all
-# EEG1 = 1
-# EEG2 = 1
-# EEG3 = 1
-# EEG4 = 1
-# EEG5 = 1
-# EEG6 = 1
-# EEG7 = 1
-# EEG8 = 1
-# EEG9 = 1
-# EEG10 = 1
-# EEG11 = 1
-# EEG12 = 1
-# EEG13 = 1
-# EEG14 = 1
-# EEG15 = 1
-# EEG16 = 1
-
+# set 3
 # EMG1 = 1
 # EMG2 = 1
 # EMG3 = 1
@@ -99,12 +89,87 @@ EMG16 = 1
 # EMG8 = 1
 # EMG9 = 1
 # EMG10 = 1
-# EMG11 = 1
-# EMG12 = 1
+# EMG11 = 0
+# EMG12 = 0
+# EMG13 = 0
+# EMG14 = 1
+# EMG15 = 0
+# EMG16 = 0
+
+# set 4
+# EMG1 = 1
+# EMG2 = 1
+# EMG3 = 1
+# EMG4 = 1
+# EMG5 = 1
+# EMG6 = 1
+# EMG7 = 1
+# EMG8 = 1
+# EMG9 = 1
+# EMG10 = 1
+# EMG11 = 0
+# EMG12 = 0
 # EMG13 = 1
 # EMG14 = 1
 # EMG15 = 1
-# EMG16 = 1
+# EMG16 = 0
+
+# set 5
+# EMG1 = 0
+# EMG2 = 0
+# EMG3 = 0
+# EMG4 = 0
+# EMG5 = 1
+# EMG6 = 1
+# EMG7 = 1
+# EMG8 = 0
+# EMG9 = 0
+# EMG10 = 0
+# EMG11 = 0
+# EMG12 = 0
+# EMG13 = 1
+# EMG14 = 1
+# EMG15 = 1
+# EMG16 = 0
+
+
+# emg all
+EMG1 = 1
+EMG2 = 1
+EMG3 = 1
+EMG4 = 1
+EMG5 = 1
+EMG6 = 1
+EMG7 = 1
+EMG8 = 1
+EMG9 = 1
+EMG10 = 1
+EMG11 = 1
+EMG12 = 1
+EMG13 = 1
+EMG14 = 1
+EMG15 = 1
+EMG16 = 1
+
+# eeg all
+EEG1 = 1
+EEG2 = 1
+EEG3 = 1
+EEG4 = 1
+EEG5 = 1
+EEG6 = 1
+EEG7 = 1
+EEG8 = 1
+EEG9 = 1
+EEG10 = 1
+EEG11 = 1
+EEG12 = 1
+EEG13 = 1
+EEG14 = 1
+EEG15 = 1
+EEG16 = 1
+
+
 
 
 # ---
@@ -158,7 +223,7 @@ device = get_device()
 CHECKPOINT_DIR = Path(__file__).resolve().parent.parent / "checkpoints"
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 CHECKPOINT_SAVE_INTERVAL = 5
-EARLY_STOPPING_METRIC = "loss"  # "loss" or "acc" — stop signal only, not best.pt selection
+EARLY_STOPPING_METRIC = "loss"  # "loss" or "acc" on intra (splits.val); not best.pt selection
 EARLY_STOPPING_SMOOTH_WINDOW = 4
 MODEL_ARCHITECTURE = "atc_net"
 
@@ -429,11 +494,27 @@ def load_training_checkpoint(path: Path) -> tuple[nn.Module, dict, dict, dict]:
     return model, label_to_idx, model_config, resume_meta
 
 
-def latest_run_dir(root: Path = CHECKPOINT_DIR) -> Path | None:
+def list_run_dirs(root: Path = CHECKPOINT_DIR, *, newest_first: bool = True) -> list[Path]:
     runs = [p for p in root.iterdir() if p.is_dir() and RUN_DIR_NAME_RE.match(p.name)]
+    return sorted(runs, key=lambda p: p.name, reverse=newest_first)
+
+
+def latest_run_dir(root: Path = CHECKPOINT_DIR) -> Path | None:
+    runs = list_run_dirs(root)
+    return runs[0] if runs else None
+
+
+def run_dir_by_offset(offset: int = 0, *, root: Path = CHECKPOINT_DIR) -> Path | None:
+    """Pick a training run by age. 0=latest, -1=previous, -2=older, etc."""
+    if offset > 0:
+        raise ValueError("run offset must be <= 0 (0=latest, -1=previous, ...)")
+    runs = list_run_dirs(root)
     if not runs:
         return None
-    return max(runs, key=lambda p: p.name)
+    index = -offset
+    if index >= len(runs):
+        return None
+    return runs[index]
 
 
 def default_checkpoint_path(kind: str = "best", root: Path = CHECKPOINT_DIR) -> Path:
@@ -530,7 +611,9 @@ def format_epoch_summary(
     notes: list[str] | None = None,
 ) -> str:
     width = len(str(total_epochs))
-    split_width = max(len(name) for name in ("train", "val", "test"))
+    intra_name = format_split_name("val")
+    extra_name = format_split_name("test")
+    split_width = max(len(name) for name in ("train", intra_name, extra_name))
 
     def split_line(name: str, loss: float, acc: float) -> str:
         return f"{name:<{split_width}}  loss: {loss:.4f} --- acc: {acc:.4f}"
@@ -538,8 +621,8 @@ def format_epoch_summary(
     lines = [
         f"epoch {epoch_num:>{width}}/{total_epochs}",
         split_line("train", train_loss, train_acc),
-        split_line("val", val_loss, val_acc),
-        split_line("test", test_loss, test_acc),
+        split_line(intra_name, val_loss, val_acc),
+        split_line(extra_name, test_loss, test_acc),
         f"best {best_acc:.4f}@{best_epoch}",
     ]
     if epochs_without_improve is not None:
@@ -764,24 +847,26 @@ def plot_training_history(
             linestyle="--",
             linewidth=1.5,
             alpha=0.85,
-            label=f"best val acc (epoch {best_epoch})" if with_label else None,
+            label=f"best {format_split_name('val')} acc (epoch {best_epoch})" if with_label else None,
         )
 
+    intra_name = format_split_name("val")
+    extra_name = format_split_name("test")
     ax_loss.plot(epochs, history["train_loss"], label="train loss")
-    ax_loss.plot(epochs, history["val_loss"], label="val loss")
-    ax_loss.plot(epochs, history["test_loss"], label="test loss")
+    ax_loss.plot(epochs, history["val_loss"], label=f"{intra_name} loss")
+    ax_loss.plot(epochs, history["test_loss"], label=f"{extra_name} loss")
     ax_loss.set_xlabel("epoch")
     ax_loss.set_ylabel("loss")
-    ax_loss.set_title("Training, validation, and test loss")
+    ax_loss.set_title(f"Training, {intra_name}, and {extra_name} loss")
     ax_loss.legend()
     ax_loss.grid(True, alpha=0.3)
 
     ax_acc.plot(epochs, history["train_acc"], label="train acc")
-    ax_acc.plot(epochs, history["val_acc"], label="val acc")
-    ax_acc.plot(epochs, history["test_acc"], label="test acc")
+    ax_acc.plot(epochs, history["val_acc"], label=f"{intra_name} acc")
+    ax_acc.plot(epochs, history["test_acc"], label=f"{extra_name} acc")
     ax_acc.set_xlabel("epoch")
     ax_acc.set_ylabel("accuracy")
-    ax_acc.set_title("Training, validation, and test accuracy")
+    ax_acc.set_title(f"Training, {intra_name}, and {extra_name} accuracy")
     ax_acc.set_ylim(0.0, 1.0)
     ax_acc.grid(True, alpha=0.3)
 
@@ -801,25 +886,25 @@ def plot_training_history(
         ax_val_loss_label,
         epochs,
         history["val_loss_per_label"],
-        title="Per-label val loss",
+        title=f"Per-label {intra_name} loss",
     )
     _plot_per_label_acc_split(
         ax_val_acc_label,
         epochs,
         history["val_acc_per_label"],
-        title="Per-label val accuracy",
+        title=f"Per-label {intra_name} accuracy",
     )
     _plot_per_label_split(
         ax_test_loss_label,
         epochs,
         history["test_loss_per_label"],
-        title="Per-label test loss",
+        title=f"Per-label {extra_name} loss",
     )
     _plot_per_label_acc_split(
         ax_test_acc_label,
         epochs,
         history["test_acc_per_label"],
-        title="Per-label test accuracy",
+        title=f"Per-label {extra_name} accuracy",
     )
 
     for row in axes:
@@ -896,12 +981,15 @@ def train(
     idx_to_label = {idx: label for label, idx in label_to_idx.items()}
 
     materialize_started = time.perf_counter()
+    intra_name = format_split_name("val")
+    extra_name = format_split_name("test")
     train_ds = FusionDataset(splits.dataset, splits.train.indices, label_to_idx)
     val_ds = FusionDataset(splits.dataset, splits.val.indices, label_to_idx)
     test_ds = FusionDataset(splits.dataset, splits.test.indices, label_to_idx)
     print(
         f"materialized fusion tensors in {time.perf_counter() - materialize_started:.2f}s "
-        f"(train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)})"
+        f"(train={len(train_ds)}, {intra_name}={len(val_ds)}, {extra_name}={len(test_ds)}; "
+        f"early stopping on {intra_name})"
     )
 
     loader_kwargs = {
@@ -945,7 +1033,9 @@ def train(
         "test_acc_per_label": {label: [] for label in label_to_idx},
     }
     epochs_without_improve = 0
-    stop_metric_key = "val_loss" if early_stopping_metric == "loss" else "val_acc"
+    stop_metric_key = (
+        "val_loss" if early_stopping_metric == "loss" else "val_acc"
+    )  # intra split (splits.val)
     best_smoothed_stop = float("inf") if early_stopping_metric == "loss" else float("-inf")
     best_smoothed_stop_epoch = 0
 
@@ -1050,7 +1140,7 @@ def train(
             len(val_ds),
             n_classes=n_classes,
             idx_to_label=idx_to_label,
-            desc="val",
+            desc=intra_name,
             device=device,
             perf=epoch_perf,
             non_blocking=non_blocking,
@@ -1065,7 +1155,7 @@ def train(
             len(test_ds),
             n_classes=n_classes,
             idx_to_label=idx_to_label,
-            desc="test",
+            desc=extra_name,
             device=device,
             perf=epoch_perf,
             non_blocking=non_blocking,
@@ -1171,7 +1261,12 @@ def train(
             and smoothed_stop is not None
             and epochs_without_improve >= early_stopping_patience
         ):
-            metric_label = "val loss" if early_stopping_metric == "loss" else "val acc"
+            intra_label = format_split_name(EARLY_STOPPING_SPLIT)
+            metric_label = (
+                f"{intra_label} loss"
+                if early_stopping_metric == "loss"
+                else f"{intra_label} acc"
+            )
             epoch_bar.write(
                 f"early stopping at epoch {epoch_num}: "
                 f"no smoothed {metric_label} improvement for {early_stopping_patience} epochs "

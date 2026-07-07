@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -14,12 +15,24 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from collections import defaultdict
 
-from data import load_dataset_splits
+from data import (
+    COLLECTION_SAY_S,
+    SILENT_SPEECH_WORD_EVENT,
+    SPLIT_KIND,
+    TARGET_WORDS,
+    TRANSITION_EVENT_TYPES,
+    TRANSITION_PURE_PHASE_FRAC,
+    _parse_scramble_breaks_transition_event_id,
+    _sample_word_fraction,
+    format_split_name,
+    load_dataset_splits,
+)
 from models import get_embedding_taps
 from train import (
     CHECKPOINT_DIR,
@@ -28,7 +41,8 @@ from train import (
     build_model_from_config,
     fusion_dataset_kwargs,
     get_device,
-    latest_run_dir,
+    list_run_dirs,
+    run_dir_by_offset,
     seed_everything,
     soft_cross_entropy,
 )
@@ -66,14 +80,14 @@ SESSION_TOP_K = 7
 SESSION_MIN_SAMPLES = 3
 BATCH_SIZE = 32
 
-# val = intra-session holdout from train sessions; test = held-out extra sessions
-SPLIT_SESSION_KIND = {
-    "val": "intra",
-    "test": "extra",
-}
+# Word-coverage detection (transition / partial-word windows)
+SHOW_WORD_COVERAGE_DETECTION = True
+WORD_COVERAGE_BIN_NAMES = ("full", "partial_word", "transition", "silence_side")
+
 SPLIT_DISPLAY_WIDTH = 14
 SESSION_DISPLAY_WIDTH = 22
 VAL_REPORT_NAME = "validation_report.md"
+VAL_METRICS_NAME = "validation_metrics.json"
 
 ALL_SPLITS = ("train", "val", "test")
 ALL_CHECKPOINTS = ("best", "last")
@@ -102,6 +116,7 @@ class ValidationOptions:
     session_top_k: int = SESSION_TOP_K
     session_min_samples: int = SESSION_MIN_SAMPLES
     batch_size: int = BATCH_SIZE
+    show_word_coverage_detection: bool = SHOW_WORD_COVERAGE_DETECTION
     save_report: bool = True
 
     def resolved_checkpoints(self) -> tuple[str, ...]:
@@ -144,6 +159,7 @@ def validation_options_from_args(args: argparse.Namespace) -> ValidationOptions:
         session_top_k=args.session_top_k,
         session_min_samples=args.session_min_samples,
         batch_size=args.batch_size,
+        show_word_coverage_detection=args.word_coverage_detection,
     )
 
 
@@ -242,6 +258,12 @@ def add_validation_option_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=SESSION_MIN_SAMPLES,
         help="minimum samples required to include a session in rankings",
+    )
+    parser.add_argument(
+        "--word-coverage-detection",
+        action=argparse.BooleanOptionalAction,
+        default=SHOW_WORD_COVERAGE_DETECTION,
+        help="word detection rate by window word-coverage bin (transition splits)",
     )
 
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
@@ -373,6 +395,378 @@ def save_validation_report(
     return output_path
 
 
+def options_cache_payload(options: ValidationOptions) -> dict[str, Any]:
+    """Options that affect numeric validation results (not report formatting)."""
+    return {
+        "checkpoints": list(options.resolved_checkpoints()),
+        "splits": list(options.resolved_splits()),
+        "compare_best_vs_last": options.compare_best_vs_last,
+        "session_min_samples": options.session_min_samples,
+    }
+
+
+def options_cache_compatible(cached: dict[str, Any], options: ValidationOptions) -> bool:
+    current = options_cache_payload(options)
+    for key in ("checkpoints", "splits", "compare_best_vs_last", "session_min_samples"):
+        if cached.get(key) != current[key]:
+            return False
+    return True
+
+
+def _metrics_to_jsonable(metrics: dict) -> dict:
+    payload = dict(metrics)
+    confusion = payload.get("confusion_matrix")
+    if isinstance(confusion, np.ndarray):
+        payload["confusion_matrix"] = confusion.tolist()
+    return payload
+
+
+def _metrics_from_jsonable(payload: dict) -> dict:
+    metrics = dict(payload)
+    confusion = metrics.get("confusion_matrix")
+    if isinstance(confusion, list):
+        metrics["confusion_matrix"] = np.asarray(confusion, dtype=np.int64)
+    return metrics
+
+
+def _serialize_evaluated(
+    evaluated: dict[str, tuple[list[dict], dict[str, int], dict]],
+) -> dict[str, dict]:
+    serialized: dict[str, dict] = {}
+    for kind, (metrics_list, label_to_idx, ckpt_meta) in evaluated.items():
+        serialized[kind] = {
+            "metrics": [_metrics_to_jsonable(metrics) for metrics in metrics_list],
+            "label_to_idx": label_to_idx,
+            "ckpt_meta": {
+                key: ckpt_meta[key]
+                for key in ("kind", "epoch", "epochs", "val_acc", "best_acc")
+                if key in ckpt_meta
+            },
+        }
+    return serialized
+
+
+def _deserialize_evaluated(
+    payload: dict[str, dict],
+) -> dict[str, tuple[list[dict], dict[str, int], dict]]:
+    evaluated: dict[str, tuple[list[dict], dict[str, int], dict]] = {}
+    for kind, entry in payload.items():
+        metrics_list = [_metrics_from_jsonable(metrics) for metrics in entry["metrics"]]
+        evaluated[kind] = (metrics_list, entry["label_to_idx"], entry["ckpt_meta"])
+    return evaluated
+
+
+def validation_cache_fresh(
+    run_dir: Path,
+    *,
+    checkpoint_kinds: tuple[str, ...],
+    cache_path: Path,
+) -> bool:
+    if not cache_path.exists():
+        return False
+    cache_mtime = cache_path.stat().st_mtime
+    for kind in checkpoint_kinds:
+        checkpoint_path = run_dir / f"{kind}.pt"
+        if checkpoint_path.exists() and checkpoint_path.stat().st_mtime > cache_mtime:
+            return False
+    return True
+
+
+def save_validation_metrics(
+    run_dir: Path,
+    evaluated: dict[str, tuple[list[dict], dict[str, int], dict]],
+    *,
+    options: ValidationOptions,
+) -> Path:
+    payload = {
+        "generated_utc": datetime.now(UTC).isoformat(),
+        "options": options_cache_payload(options),
+        "checkpoints": _serialize_evaluated(evaluated),
+    }
+    output_path = run_dir / VAL_METRICS_NAME
+    output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return output_path
+
+
+def _split_name_from_display(display: str) -> str | None:
+    normalized = display.strip()
+    lowered = normalized.lower()
+    if lowered in ("summary", "best vs last"):
+        return None
+
+    for split_name in ALL_SPLITS:
+        if normalized == split_name or normalized == format_split_name(split_name):
+            return split_name
+        for kind in ("intra", "extra"):
+            if normalized == f"{split_name} [{kind}]":
+                return split_name
+
+    token = normalized.split()[0]
+    if token in ALL_SPLITS:
+        return token
+    if token in SPLIT_KIND.values():
+        return {"intra": "val", "extra": "test"}[token]
+    return None
+
+
+_CHECKPOINT_SECTION_RE = re.compile(
+    r"#{10,}\n# (?P<kind>BEST|LAST) CHECKPOINT\n#{10,}\n"
+    r"checkpoint: .+\n"
+    r"kind=(?P<kind_lower>\w+), epoch=(?P<epoch>\d+)/(?P<epochs>\d+), "
+    r"val_acc=(?P<val_acc>[\d.]+), best_acc@train-time=(?P<best_acc>[\d.]+)\n",
+    re.MULTILINE,
+)
+_SPLIT_SECTION_RE = re.compile(r"^=== (.+?) ===\n", re.MULTILINE)
+_METRIC_LINE_RE = re.compile(
+    r"^(samples|loss|accuracy|balanced_accuracy|macro_f1|weighted_f1):\s+([\d.]+)",
+    re.MULTILINE,
+)
+_PER_CLASS_ROW_RE = re.compile(
+    r"^(\S+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+(\d+)\s+",
+    re.MULTILINE,
+)
+_SESSION_ROW_RE = re.compile(
+    r"^(.+?)\s+([\d.]+)\s+[+-]?[\d.]+\s+\d+\s+(\d+)\s+",
+)
+
+
+def _load_label_to_idx_from_checkpoint(run_dir: Path, kind: str = "best") -> dict[str, int]:
+    checkpoint_path = run_dir / f"{kind}.pt"
+    if not checkpoint_path.exists():
+        for fallback in ALL_CHECKPOINTS:
+            checkpoint_path = run_dir / f"{fallback}.pt"
+            if checkpoint_path.exists():
+                break
+        else:
+            raise FileNotFoundError(f"No checkpoint found under {run_dir}")
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    return dict(ckpt["label_to_idx"])
+
+
+def _parse_split_sections(section_text: str) -> list[dict]:
+    metrics_list: list[dict] = []
+    matches = list(_SPLIT_SECTION_RE.finditer(section_text))
+    for idx, match in enumerate(matches):
+        split_display = match.group(1)
+        start = match.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(section_text)
+        block = section_text[start:end]
+
+        split_name = _split_name_from_display(split_display)
+        if split_name is None:
+            continue
+
+        metric_values: dict[str, float | int] = {}
+        for metric_match in _METRIC_LINE_RE.finditer(block):
+            key, raw_value = metric_match.groups()
+            if key == "samples":
+                metric_values[key] = int(raw_value)
+            else:
+                metric_values[key] = float(raw_value)
+
+        per_class: list[dict] = []
+        per_class_start = block.find("per-class:")
+        if per_class_start >= 0:
+            per_class_block = block[per_class_start:]
+            confusion_start = per_class_block.find("confusion matrix")
+            if confusion_start >= 0:
+                per_class_block = per_class_block[:confusion_start]
+            header_end = per_class_block.find("\n", per_class_block.find("label"))
+            if header_end >= 0:
+                for row_match in _PER_CLASS_ROW_RE.finditer(per_class_block[header_end:]):
+                    label, precision, recall, f1, support = row_match.groups()
+                    per_class.append(
+                        {
+                            "class_idx": len(per_class),
+                            "label": label,
+                            "precision": float(precision),
+                            "recall": float(recall),
+                            "f1": float(f1),
+                            "support": int(support),
+                        }
+                    )
+
+        per_session: list[dict] = []
+        session_start = block.find("per-session")
+        if session_start >= 0:
+            session_block = block[session_start:]
+            header_end = session_block.find("\n", session_block.find("session"))
+            if header_end >= 0:
+                seen_sessions: set[str] = set()
+                for line in session_block[header_end:].splitlines():
+                    stripped = line.strip()
+                    if not stripped or stripped.endswith("sessions:"):
+                        continue
+                    row_match = _SESSION_ROW_RE.match(stripped)
+                    if row_match is None:
+                        continue
+                    session, accuracy, n_samples = row_match.groups()
+                    if session in seen_sessions:
+                        continue
+                    seen_sessions.add(session)
+                    per_session.append(
+                        {
+                            "session": session,
+                            "accuracy": float(accuracy),
+                            "n_samples": int(n_samples),
+                            "n_correct": int(round(float(accuracy) * int(n_samples))),
+                        }
+                    )
+                per_session.sort(
+                    key=lambda row: (row["accuracy"], row["n_samples"]),
+                    reverse=True,
+                )
+
+        metrics_list.append(
+            {
+                "split": split_name,
+                "n_samples": int(metric_values.get("samples", 0)),
+                "loss": float(metric_values.get("loss", 0.0)),
+                "accuracy": float(metric_values.get("accuracy", 0.0)),
+                "balanced_accuracy": float(metric_values.get("balanced_accuracy", 0.0)),
+                "macro_f1": float(metric_values.get("macro_f1", 0.0)),
+                "weighted_f1": float(metric_values.get("weighted_f1", 0.0)),
+                "per_class": per_class,
+                "per_session": per_session,
+            }
+        )
+    return metrics_list
+
+
+def parse_validation_report(
+    run_dir: Path,
+    report_path: Path,
+    *,
+    options: ValidationOptions,
+) -> dict[str, tuple[list[dict], dict[str, int], dict]] | None:
+    """Rebuild evaluated metrics from a saved validation_report.md."""
+    body = report_path.read_text(encoding="utf-8")
+    text_match = re.search(r"```text\n(.*?)```", body, re.DOTALL)
+    if text_match is None:
+        return None
+    report_text = text_match.group(1)
+
+    evaluated: dict[str, tuple[list[dict], dict[str, int], dict]] = {}
+    sections = list(_CHECKPOINT_SECTION_RE.finditer(report_text))
+    if not sections:
+        return None
+
+    label_to_idx: dict[str, int] | None = None
+    for idx, match in enumerate(sections):
+        kind = match.group("kind_lower")
+        start = match.end()
+        end = sections[idx + 1].start() if idx + 1 < len(sections) else len(report_text)
+        metrics_list = _parse_split_sections(report_text[start:end])
+        if not metrics_list:
+            continue
+
+        if label_to_idx is None:
+            label_to_idx = _load_label_to_idx_from_checkpoint(run_dir, kind)
+        idx_to_label = {idx: label for label, idx in label_to_idx.items()}
+        for metrics in metrics_list:
+            for class_idx, class_row in enumerate(metrics.get("per_class", [])):
+                label = class_row.pop("label", None)
+                if label is not None:
+                    class_row["class_idx"] = label_to_idx.get(label, class_idx)
+                else:
+                    class_row["class_idx"] = class_idx
+                class_row.setdefault("class_idx", class_idx)
+
+        ckpt_meta = {
+            "kind": kind,
+            "epoch": int(match.group("epoch")),
+            "epochs": int(match.group("epochs")),
+            "val_acc": float(match.group("val_acc")),
+            "best_acc": float(match.group("best_acc")),
+        }
+        evaluated[kind] = (metrics_list, label_to_idx, ckpt_meta)
+
+    if not evaluated or label_to_idx is None:
+        return None
+
+    required_kinds = [kind for kind in options.resolved_checkpoints() if kind in evaluated]
+    if "best" not in evaluated:
+        return None
+    if options.compare_best_vs_last and "last" in options.resolved_checkpoints() and "last" not in evaluated:
+        return None
+    if not required_kinds:
+        return None
+
+    required_splits = set(options.resolved_splits())
+    for kind in required_kinds:
+        split_names = {metrics["split"] for metrics in evaluated[kind][0]}
+        if not required_splits.issubset(split_names):
+            return None
+
+    return evaluated
+
+
+def load_cached_validation(
+    run_dir: Path,
+    *,
+    options: ValidationOptions,
+) -> dict[str, Any] | None:
+    """Load validate_run_dir-compatible results from on-disk artifacts."""
+    run_dir = Path(run_dir)
+    report_path = run_dir / VAL_REPORT_NAME
+    if not report_path.exists():
+        return None
+
+    metrics_path = run_dir / VAL_METRICS_NAME
+    if metrics_path.exists():
+        payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+        cached_options = payload.get("options", {})
+        if options_cache_compatible(cached_options, options):
+            checkpoint_kinds = tuple(payload.get("checkpoints", {}).keys())
+            if validation_cache_fresh(
+                run_dir,
+                checkpoint_kinds=checkpoint_kinds,
+                cache_path=metrics_path,
+            ):
+                evaluated = _deserialize_evaluated(payload["checkpoints"])
+                if _evaluated_covers_options(evaluated, options):
+                    return {
+                        "run_dir": run_dir,
+                        "evaluated": evaluated,
+                        "report_path": report_path,
+                        "options": options,
+                        "from_cache": True,
+                    }
+
+    evaluated = parse_validation_report(run_dir, report_path, options=options)
+    if evaluated is None or not _evaluated_covers_options(evaluated, options):
+        return None
+
+    save_validation_metrics(run_dir, evaluated, options=options)
+
+    return {
+        "run_dir": run_dir,
+        "evaluated": evaluated,
+        "report_path": report_path,
+        "options": options,
+        "from_cache": True,
+    }
+
+
+def _evaluated_covers_options(
+    evaluated: dict[str, tuple[list[dict], dict[str, int], dict]],
+    options: ValidationOptions,
+) -> bool:
+    if "best" not in evaluated:
+        return False
+    for kind in options.resolved_checkpoints():
+        if kind not in evaluated:
+            return False
+    required_splits = set(options.resolved_splits())
+    for kind in options.resolved_checkpoints():
+        if kind not in evaluated:
+            continue
+        split_names = {metrics["split"] for metrics in evaluated[kind][0]}
+        if not required_splits.issubset(split_names):
+            return False
+    return True
+
+
 def session_name(session_dir: str | Path) -> str:
     return Path(session_dir).name
 
@@ -393,10 +787,7 @@ def format_session_display(name: str, *, width: int = 14) -> str:
 
 
 def format_split_display(split_name: str) -> str:
-    kind = SPLIT_SESSION_KIND.get(split_name)
-    if kind:
-        return f"{split_name} [{kind}]"
-    return split_name
+    return format_split_name(split_name)
 
 
 def format_session_display_for_split(
@@ -405,7 +796,7 @@ def format_session_display_for_split(
     *,
     width: int = SESSION_DISPLAY_WIDTH,
 ) -> str:
-    kind = SPLIT_SESSION_KIND.get(split_name)
+    kind = SPLIT_KIND.get(split_name)
     suffix = f" [{kind}]" if kind else ""
     inner_width = max(1, width - len(suffix))
     return f"{format_session_display(name, width=inner_width)}{suffix}"
@@ -575,6 +966,238 @@ def load_checkpoint(path: Path, device: torch.device) -> tuple[nn.Module, dict, 
     return model, label_to_idx, meta
 
 
+_WORD_COVERAGE_EPS = 1e-9
+
+
+def _word_coverage_bin(word_frac: float) -> str:
+    if word_frac >= 1.0 - _WORD_COVERAGE_EPS:
+        return "full"
+    if word_frac >= TRANSITION_PURE_PHASE_FRAC:
+        return "partial_word"
+    if word_frac >= 1.0 - TRANSITION_PURE_PHASE_FRAC:
+        return "transition"
+    return "silence_side"
+
+
+def _word_coverage_bin_label(bin_name: str, *, window_s: float) -> str:
+    tau = TRANSITION_PURE_PHASE_FRAC
+    ramp_s = window_s * (1.0 - tau)
+    labels = {
+        "full": f"full (phi_w=1.0, whole window in word)",
+        "partial_word": (
+            f"partial word ({tau:.0%}<=phi_w<1.0, ~{tau * window_s:.2f}-{window_s:.2f}s word in window)"
+        ),
+        "transition": (
+            f"transition ({1.0 - tau:.0%}<=phi_w<{tau:.0%}, ~{ramp_s:.2f}-{tau * window_s:.2f}s word)"
+        ),
+        "silence_side": (
+            f"silence side (phi_w<{1.0 - tau:.0%}, <{ramp_s:.2f}s word in window)"
+        ),
+    }
+    return labels.get(bin_name, bin_name)
+
+
+def _sample_target_word(
+    event_type: str,
+    event_id: str,
+    hard_label: str,
+) -> str | None:
+    if event_type == SILENT_SPEECH_WORD_EVENT:
+        return hard_label if hard_label in TARGET_WORDS else None
+    if event_type in TRANSITION_EVENT_TYPES:
+        parsed = _parse_scramble_breaks_transition_event_id(event_id)
+        if parsed is None:
+            return None
+        word = parsed[1]
+        return word if word in TARGET_WORDS else None
+    return None
+
+
+def _empty_word_coverage_bin() -> dict[str, float | int]:
+    return {"n": 0, "correct": 0, "detection_rate": 0.0, "avg_word_frac": 0.0}
+
+
+def compute_word_coverage_detection(
+    dataset: FusionDataset,
+    y_pred: np.ndarray,
+    *,
+    label_to_idx: dict[str, int],
+) -> dict[str, Any]:
+    """Lexical word hit rate stratified by how much of the window overlaps the word."""
+    bins: dict[str, dict[str, float | int]] = {
+        name: _empty_word_coverage_bin() for name in WORD_COVERAGE_BIN_NAMES
+    }
+    per_word: dict[str, dict[str, dict[str, float | int]]] = {
+        word: {name: _empty_word_coverage_bin() for name in WORD_COVERAGE_BIN_NAMES}
+        for word in TARGET_WORDS
+    }
+    word_frac_sums: dict[str, float] = defaultdict(float)
+    n_transition_samples = 0
+    n_word_event_samples = 0
+
+    for dataset_idx, pred_idx in enumerate(y_pred.tolist()):
+        base_idx = dataset.indices[dataset_idx]
+        raw = dataset.base[base_idx]
+        event_type = str(raw.get("event_type", ""))
+        event_id = str(raw.get("event_id", ""))
+        hard_label = str(raw.get("label", ""))
+
+        target_word = _sample_target_word(event_type, event_id, hard_label)
+        if target_word is None or target_word not in label_to_idx:
+            continue
+
+        word_frac = _sample_word_fraction(event_type, event_id)
+        bin_name = _word_coverage_bin(word_frac)
+        correct = int(pred_idx == label_to_idx[target_word])
+
+        if event_type in TRANSITION_EVENT_TYPES:
+            n_transition_samples += 1
+        elif event_type == SILENT_SPEECH_WORD_EVENT:
+            n_word_event_samples += 1
+
+        for bucket in (bins, per_word[target_word]):
+            row = bucket[bin_name]
+            row["n"] = int(row["n"]) + 1
+            row["correct"] = int(row["correct"]) + correct
+            word_frac_sums[bin_name] += word_frac
+
+    for bin_name, row in bins.items():
+        n = int(row["n"])
+        if n > 0:
+            row["detection_rate"] = int(row["correct"]) / n
+            row["avg_word_frac"] = word_frac_sums[bin_name] / n
+        for word in TARGET_WORDS:
+            word_row = per_word[word][bin_name]
+            word_n = int(word_row["n"])
+            if word_n > 0:
+                word_row["detection_rate"] = int(word_row["correct"]) / word_n
+
+    partial_n = sum(int(bins[name]["n"]) for name in ("partial_word", "transition", "silence_side"))
+    partial_correct = sum(
+        int(bins[name]["correct"]) for name in ("partial_word", "transition", "silence_side")
+    )
+    full_row = bins["full"]
+    partial_word_row = bins["partial_word"]
+    full_n = int(full_row["n"])
+    partial_word_n = int(partial_word_row["n"])
+    full_rate = float(full_row["detection_rate"]) if full_n else 0.0
+    partial_word_rate = float(partial_word_row["detection_rate"]) if partial_word_n else 0.0
+    partial_rate = partial_correct / partial_n if partial_n else 0.0
+
+    return {
+        "window_s": COLLECTION_SAY_S,
+        "pure_phase_frac": TRANSITION_PURE_PHASE_FRAC,
+        "bins": bins,
+        "per_word": per_word,
+        "n_transition_samples": n_transition_samples,
+        "n_word_event_samples": n_word_event_samples,
+        "comparisons": {
+            "full_vs_partial_word": {
+                "full_rate": full_rate,
+                "partial_word_rate": partial_word_rate,
+                "delta": full_rate - partial_word_rate,
+                "full_n": full_n,
+                "partial_word_n": partial_word_n,
+            },
+            "full_vs_all_partial": {
+                "full_rate": full_rate,
+                "partial_rate": partial_rate,
+                "delta": full_rate - partial_rate,
+                "full_n": full_n,
+                "partial_n": partial_n,
+            },
+        },
+    }
+
+
+def print_word_coverage_detection(
+    metrics: dict,
+    *,
+    use_color: bool = True,
+) -> None:
+    coverage = metrics.get("word_coverage_detection")
+    if not coverage or coverage.get("n_transition_samples", 0) <= 0:
+        return
+
+    split_name = metrics["split"]
+    window_s = float(coverage["window_s"])
+    comparisons = coverage["comparisons"]
+    full_vs_partial = comparisons["full_vs_partial_word"]
+    full_vs_all = comparisons["full_vs_all_partial"]
+
+    print(f"\nword coverage detection ({format_split_display(split_name)}):")
+    print(
+        "  lexical hit = model predicts the associated target word "
+        "(not hard transition/silence label)"
+    )
+    print(
+        f"  window={window_s:.2f}s, pure-transition band "
+        f"phi_w in [{1.0 - coverage['pure_phase_frac']:.1f}, {coverage['pure_phase_frac']:.1f})"
+    )
+    print(
+        f"{'bin':<52} {'detect':>10} {'n':>8} {'avg_phi_w':>10}"
+    )
+    for bin_name in WORD_COVERAGE_BIN_NAMES:
+        row = coverage["bins"][bin_name]
+        n = int(row["n"])
+        if n <= 0:
+            continue
+        rate = float(row["detection_rate"])
+        detect = _format_colored_value(
+            f"{rate:.4f}",
+            bg=_score_bg(rate),
+            use_color=use_color,
+            width=10,
+        )
+        label = _word_coverage_bin_label(bin_name, window_s=window_s)
+        print(
+            f"  {label:<50} {detect} {n:>8d} {float(row['avg_word_frac']):>10.3f}"
+        )
+
+    if int(full_vs_partial["full_n"]) > 0 and int(full_vs_partial["partial_word_n"]) > 0:
+        delta = float(full_vs_partial["delta"])
+        print(
+            f"\n  full vs partial-word (phi_w>={coverage['pure_phase_frac']:.0%}): "
+            f"{full_vs_partial['full_rate']:.4f} vs {full_vs_partial['partial_word_rate']:.4f} "
+            f"(delta {delta:+.4f}, "
+            f"n={full_vs_partial['full_n']}/{full_vs_partial['partial_word_n']})"
+        )
+    if int(full_vs_all["full_n"]) > 0 and int(full_vs_all["partial_n"]) > 0:
+        delta = float(full_vs_all["delta"])
+        print(
+            f"  full vs all non-full: "
+            f"{full_vs_all['full_rate']:.4f} vs {full_vs_all['partial_rate']:.4f} "
+            f"(delta {delta:+.4f}, "
+            f"n={full_vs_all['full_n']}/{full_vs_all['partial_n']})"
+        )
+
+    per_word_rows = []
+    for word in TARGET_WORDS:
+        word_bins = coverage["per_word"][word]
+        full = word_bins["full"]
+        partial = word_bins["partial_word"]
+        full_n = int(full["n"])
+        partial_n = int(partial["n"])
+        if full_n == 0 and partial_n == 0:
+            continue
+        full_rate = float(full["detection_rate"]) if full_n else float("nan")
+        partial_rate = float(partial["detection_rate"]) if partial_n else float("nan")
+        delta = full_rate - partial_rate if full_n and partial_n else float("nan")
+        per_word_rows.append((word, full_rate, full_n, partial_rate, partial_n, delta))
+
+    if per_word_rows:
+        print("\n  per-word full vs partial-word:")
+        print(f"  {'word':<14} {'full':>10} {'n':>6} {'partial':>10} {'n':>6} {'delta':>10}")
+        for word, full_rate, full_n, partial_rate, partial_n, delta in per_word_rows:
+            full_text = f"{full_rate:.4f}" if full_n else "n/a"
+            partial_text = f"{partial_rate:.4f}" if partial_n else "n/a"
+            delta_text = f"{delta:+.4f}" if full_n and partial_n else "n/a"
+            print(
+                f"  {word:<14} {full_text:>10} {full_n:>6d} "
+                f"{partial_text:>10} {partial_n:>6d} {delta_text:>10}"
+            )
+
+
 @torch.no_grad()
 def evaluate_split(
     model: nn.Module,
@@ -593,6 +1216,7 @@ def evaluate_split(
     session_dirs: list[str] = []
     running_loss = 0.0
     total = 0
+    class_loss_sum = np.zeros(n_classes, dtype=np.float64)
 
     sample_offset = 0
     for eeg, emg, y_soft, y_hard in tqdm(loader, desc=split_name, leave=False):
@@ -601,6 +1225,9 @@ def evaluate_split(
         y_hard = y_hard.to(device)
         logits = model(eeg, emg)
         running_loss += soft_cross_entropy(logits, y_soft).item() * y_hard.size(0)
+        loss_per_sample = F.cross_entropy(logits, y_hard, reduction="none")
+        for class_idx, loss_val in zip(y_hard.tolist(), loss_per_sample.tolist(), strict=True):
+            class_loss_sum[class_idx] += loss_val
         batch_preds = logits.argmax(1).cpu().tolist()
         batch_true = y_hard.cpu().tolist()
         y_true.extend(batch_true)
@@ -632,12 +1259,16 @@ def evaluate_split(
             cm[class_idx],
             true_class_idx=class_idx,
         )
+        class_loss = (
+            float(class_loss_sum[class_idx] / support) if support > 0 else 0.0
+        )
         per_class.append(
             {
                 "precision": precision,
                 "recall": recall,
                 "f1": f1,
                 "support": int(support),
+                "class_loss": class_loss,
                 "most_confused_with_idx": confused_idx,
                 "most_confused_with_count": confused_count,
                 "most_confused_with_fraction": confused_frac,
@@ -664,6 +1295,12 @@ def evaluate_split(
         min_samples=session_min_samples,
     )
 
+    word_coverage_detection = compute_word_coverage_detection(
+        dataset,
+        y_pred_arr,
+        label_to_idx=dataset.label_to_idx,
+    )
+
     return {
         "split": split_name,
         "n_samples": total,
@@ -676,6 +1313,7 @@ def evaluate_split(
         "per_class": per_class,
         "per_session": per_session,
         "session_min_samples": session_min_samples,
+        "word_coverage_detection": word_coverage_detection,
     }
 
 
@@ -923,12 +1561,27 @@ def _print_cross_split_session_rankings(
     print_rows(f"worst {len(worst)} sessions", worst)
 
 
-def resolve_run_dir(checkpoint: Path | None, *, root: Path = CHECKPOINT_DIR) -> Path:
+def resolve_run_dir(
+    checkpoint: Path | None,
+    *,
+    root: Path = CHECKPOINT_DIR,
+    run_offset: int = 0,
+) -> Path:
     if checkpoint is not None:
+        if run_offset != 0:
+            print("warning: --run-offset ignored when --checkpoint is set")
         return checkpoint.resolve().parent
-    run_dir = latest_run_dir(root)
-    if run_dir is None:
+
+    runs = list_run_dirs(root)
+    if not runs:
         raise FileNotFoundError(f"No run directories found under {root}")
+
+    run_dir = run_dir_by_offset(run_offset, root=root)
+    if run_dir is None:
+        raise FileNotFoundError(
+            f"run offset {run_offset} out of range ({len(runs)} run(s) under {root}); "
+            f"0=latest ({runs[0].name}), oldest={runs[-1].name}"
+        )
     return run_dir
 
 
@@ -941,6 +1594,14 @@ def checkpoint_paths_for_run(run_dir: Path) -> dict[str, Path]:
     if not paths:
         raise FileNotFoundError(f"No best.pt or last.pt found in {run_dir}")
     return paths
+
+
+SECTION_GAP_LINES = 4
+
+
+def _print_section_gap() -> None:
+    for _ in range(SECTION_GAP_LINES):
+        print()
 
 
 def print_checkpoint_banner(
@@ -1093,7 +1754,7 @@ def print_model_comparison_meta(
                     tie_recall_wins += 1
             print(f"{label[:20]:<20}{''.join(cells)}")
         print(
-            f"\nper-class recall head-to-head (val [extra]+test [intra], support>0): "
+            f"\nper-class recall head-to-head ({format_split_display('val')}+{format_split_display('test')}, support>0): "
             f"best={best_recall_wins}, last={last_recall_wins}, tie={tie_recall_wins}"
         )
 
@@ -1123,6 +1784,35 @@ def print_model_comparison_meta(
                 f"  {split_label}: n={len(common)}, mean Δacc={mean_delta:+.4f}, "
                 f"last wins={last_wins}, best wins={best_wins}, tie={ties}"
             )
+
+
+def _print_per_label_loss_acc_table(
+    by_split: dict[str, dict],
+    *,
+    idx_to_label: dict[int, str],
+    split_names: list[str],
+) -> None:
+    n_classes = len(next(iter(by_split.values()))["per_class"])
+    split_width = max(
+        len(format_split_display(name)) for name in split_names
+    )
+
+    def split_line(split_name: str, loss: float, acc: float) -> str:
+        return (
+            f"{format_split_display(split_name):<{split_width}}  "
+            f"loss: {loss:.4f} --- acc: {acc:.4f}"
+        )
+
+    print("\nper-label loss and accuracy:")
+    for class_idx in range(n_classes):
+        label = idx_to_label.get(class_idx, str(class_idx))
+        print(f"\n{label}")
+        for split_name in split_names:
+            row = by_split[split_name]["per_class"][class_idx]
+            if row["support"] <= 0:
+                print(f"  {format_split_display(split_name):<{split_width}}  n/a")
+                continue
+            print(f"  {split_line(split_name, row['class_loss'], row['recall'])}")
 
 
 def print_summary_table(
@@ -1156,9 +1846,18 @@ def print_summary_table(
         return
 
     if show_per_class:
+        _print_per_label_loss_acc_table(
+            by_split,
+            idx_to_label=idx_to_label,
+            split_names=split_names,
+        )
+
         n_classes = len(next(iter(by_split.values()))["per_class"])
         confusion_width = 22
-        print("\nper-class recall and top confusion (train vs val [extra] vs test [intra]):")
+        print(
+            "\nper-class recall and top confusion "
+            f"(train vs {format_split_display('val')} vs {format_split_display('test')}):"
+        )
         if use_color:
             print(
                 "  (recall: red=low, green=high, bold=worst split; "
@@ -1264,6 +1963,11 @@ def evaluate_checkpoint_report(
                 metrics,
                 idx_to_label=idx_to_label,
                 top_k=options.session_top_k,
+            )
+        if options.show_word_coverage_detection:
+            print_word_coverage_detection(
+                metrics,
+                use_color=use_color,
             )
 
     if options.show_summary:
@@ -1616,6 +2320,9 @@ def validate_run_dir(
                 print(f"\nwarning: {kind}.pt not found in {run_dir}, skipping")
                 continue
 
+            if evaluated:
+                _print_section_gap()
+
             checkpoint_path = available[kind]
             if (
                 kind == "last"
@@ -1640,6 +2347,7 @@ def validate_run_dir(
 
         if options.compare_best_vs_last:
             if "best" in evaluated and "last" in evaluated:
+                _print_section_gap()
                 best_metrics, _best_label_to_idx, best_meta = evaluated["best"]
                 last_metrics, _last_label_to_idx, last_meta = evaluated["last"]
                 idx_to_label = {idx: label for label, idx in _best_label_to_idx.items()}
@@ -1679,6 +2387,7 @@ def validate_run_dir(
             buffer=report_buffer,
             checkpoint_hint=checkpoint_hint,
         )
+        save_validation_metrics(run_dir, evaluated, options=options)
 
     return {
         "run_dir": run_dir,
@@ -1697,6 +2406,13 @@ def main() -> None:
         type=Path,
         default=None,
         help="Path to any checkpoint in a run dir (default: latest run)",
+    )
+    parser.add_argument(
+        "--run-offset",
+        type=int,
+        default=0,
+        metavar="N",
+        help="select run by age when --checkpoint is omitted: 0=latest, -1=previous, -2=...",
     )
     parser.add_argument(
         "--splits-dir",
@@ -1718,7 +2434,7 @@ def main() -> None:
 
     seed_everything(args.seed)
 
-    run_dir = resolve_run_dir(args.checkpoint)
+    run_dir = resolve_run_dir(args.checkpoint, run_offset=args.run_offset)
     splits = load_dataset_splits(args.splits_dir)
 
     result = validate_run_dir(
