@@ -162,15 +162,34 @@ def _summarize_samples(samples: Sequence[dict[str, Any]]) -> dict[str, int]:
     return counts
 
 
-def _break_transition_flags(manifest_path: Path) -> tuple[Optional[bool], Optional[bool], Optional[bool]]:
+def _transition_flags(manifest_path: Path) -> dict[str, Optional[bool]]:
     if not manifest_path.exists():
-        return None, None, None
+        return {}
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    return (
-        manifest.get("include_transitions_from_breaks_train"),
-        manifest.get("include_transitions_from_breaks_val"),
-        manifest.get("include_transitions_from_breaks_test"),
+    keys = (
+        "include_transitions_train",
+        "include_transitions_val",
+        "include_transitions_test",
+        "include_transitions_from_breaks",
+        "include_transitions_from_occasional_word",
+        # legacy manifest keys
+        "include_transitions_from_breaks_train",
+        "include_transitions_from_breaks_val",
+        "include_transitions_from_breaks_test",
     )
+    out: dict[str, Optional[bool]] = {}
+    for key in keys:
+        if key in manifest:
+            out[key] = manifest[key]
+    return out
+
+
+def _split_transition_flag(flags: dict[str, Optional[bool]], split_name: str) -> Optional[bool]:
+    key = f"include_transitions_{split_name}"
+    if key in flags:
+        return flags[key]
+    legacy = f"include_transitions_from_breaks_{split_name}"
+    return flags.get(legacy)
 
 
 def _evenly_pick(group: Sequence[dict[str, Any]], n: int) -> list[dict[str, Any]]:
@@ -285,16 +304,17 @@ def print_split_inspection(
     summary = _summarize_samples(samples)
     picked = _pick_samples(samples, n=n)
 
-    train_flag, val_flag, test_flag = _break_transition_flags(manifest_path)
-    split_flag = {
-        "train": train_flag,
-        "val": val_flag,
-        "test": test_flag,
-    }.get(split_name)
+    flags = _transition_flags(manifest_path)
+    split_flag = _split_transition_flag(flags, split_name)
 
     print(f"=== {display_name} ({split_name}) — {summary['total']} samples ===")
     if split_flag is not None:
-        print(f"include_transitions_from_breaks_{split_name}={split_flag}")
+        print(f"include_transitions_{split_name}={split_flag}")
+    if "include_transitions_from_breaks" in flags:
+        print(
+            f"sources: breaks={flags['include_transitions_from_breaks']}, "
+            f"occasional={flags.get('include_transitions_from_occasional_word')}"
+        )
     print(
         f"MERGE_TRANSITIONS_INTO_SILENCE={MERGE_TRANSITIONS_INTO_SILENCE}  "
         f"window={COLLECTION_SAY_S:.1f}s"
@@ -310,7 +330,7 @@ def print_split_inspection(
     )
     if summary["transitions"] == 0 and split_flag is False:
         print(
-            "no break transitions (expected — flag is False); "
+            "no transitions in this split (include_transitions=False); "
             "only word events here, so no soft labels"
         )
     elif summary["transitions"] > 0:

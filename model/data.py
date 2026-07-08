@@ -2325,7 +2325,7 @@ def build_dataset_splits(
         val_indices,
         test_indices,
         break_transition_dropped,
-    ) = _apply_break_transition_split_filters(
+    ) = _apply_transition_split_filters(
         train_indices,
         val_indices,
         test_indices,
@@ -2335,7 +2335,7 @@ def build_dataset_splits(
     )
     if perf is not None:
         perf.add(
-            "break_transition_split_filters",
+            "transition_split_filters",
             time.perf_counter() - filter_started,
             where="CPU",
         )
@@ -2384,7 +2384,9 @@ def save_dataset_splits(output_dir: Path, splits: DatasetSplits) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     batch = splits.dataset.batch
-    np.savez_compressed(
+    # Uncompressed: per-sample z-scored float32 windows do not compress meaningfully,
+    # and np.savez_compressed was ~85x slower than np.savez on ~3.4GB payloads.
+    np.savez(
         output_dir / SPLITS_WINDOWS_NAME,
         x=batch.x,
         center_sample_index=batch.center_sample_index,
@@ -2419,9 +2421,11 @@ def save_dataset_splits(output_dir: Path, splits: DatasetSplits) -> None:
         "label_max_fractions": splits.label_max_fractions,
         "label_cap_dropped": list(splits.label_cap_dropped),
         "break_transition_dropped": list(splits.break_transition_dropped),
-        "include_transitions_from_breaks_train": INCLUDE_TRANSITIONS_FROM_BREAKS_TRAIN,
-        "include_transitions_from_breaks_val": INCLUDE_TRANSITIONS_FROM_BREAKS_VAL,
-        "include_transitions_from_breaks_test": INCLUDE_TRANSITIONS_FROM_BREAKS_TEST,
+        "include_transitions_from_breaks": INCLUDE_TRANSITIONS_FROM_BREAKS,
+        "include_transitions_from_occasional_word": INCLUDE_TRANSITIONS_FROM_OCCASIONAL_WORD,
+        "include_transitions_train": INCLUDE_TRANSITIONS_TRAIN,
+        "include_transitions_val": INCLUDE_TRANSITIONS_VAL,
+        "include_transitions_test": INCLUDE_TRANSITIONS_TEST,
         "sample_rate_hz": batch.sample_rate_hz,
         "pre_samples": batch.pre_samples,
         "post_samples": batch.post_samples,
@@ -2739,13 +2743,15 @@ def print_split_summary(splits: DatasetSplits) -> None:
     break_dropped = splits.break_transition_dropped
     if any(break_dropped):
         print(
-            "break transitions per split: "
-            f"train={INCLUDE_TRANSITIONS_FROM_BREAKS_TRAIN}, "
-            f"val={INCLUDE_TRANSITIONS_FROM_BREAKS_VAL}, "
-            f"test={INCLUDE_TRANSITIONS_FROM_BREAKS_TEST}"
+            "transitions per split: "
+            f"train={INCLUDE_TRANSITIONS_TRAIN}, "
+            f"val={INCLUDE_TRANSITIONS_VAL}, "
+            f"test={INCLUDE_TRANSITIONS_TEST}  "
+            f"(sources: breaks={INCLUDE_TRANSITIONS_FROM_BREAKS}, "
+            f"occasional={INCLUDE_TRANSITIONS_FROM_OCCASIONAL_WORD})"
         )
         print(
-            f"dropped by break-transition filters: "
+            f"dropped by transition split filters: "
             f"train={break_dropped[0]}, val={break_dropped[1]}, test={break_dropped[2]}"
         )
     print()
