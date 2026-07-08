@@ -35,12 +35,16 @@ INCLUDE_UNKNOWN_WORD_LABEL = False
 INCLUDE_SILENCE_FROM_BREAKS = True
 INCLUDE_TRANSITIONS_FROM_BREAKS = True
 
+INCLUDE_TRANSITIONS_TRAIN = False
+INCLUDE_TRANSITIONS_VAL = False
+INCLUDE_TRANSITIONS_TEST = True
+
 INCLUDE_SILENCE_FROM_OCCASIONAL_WORD = False
 INCLUDE_TRANSITIONS_FROM_OCCASIONAL_WORD = False
 
 # When True, transition windows use silence (not word starting/ending) as the
 # non-word label, with the same soft word mass near the boundary.
-MERGE_TRANSITIONS_INTO_SILENCE = False
+MERGE_TRANSITIONS_INTO_SILENCE = True
 
 
 
@@ -102,12 +106,34 @@ SCRAMBLE_BREAKS_BLOCK_START_EVENT = "silent_speech_scramble_start"
 
 # --- helpers
 
+def _transitions_for_split(split_name: str) -> bool:
+    if split_name == "train":
+        return INCLUDE_TRANSITIONS_TRAIN
+    if split_name == "val":
+        return INCLUDE_TRANSITIONS_VAL
+    if split_name == "test":
+        return INCLUDE_TRANSITIONS_TEST
+    raise ValueError(f"Unknown split name: {split_name!r}")
+
+
+def _transitions_any_split() -> bool:
+    return INCLUDE_TRANSITIONS_TRAIN or INCLUDE_TRANSITIONS_VAL or INCLUDE_TRANSITIONS_TEST
+
+
 def _validate_label_source_config() -> None:
-    if INCLUDE_TRANSITIONS_FROM_BREAKS and not INCLUDE_SILENCE_FROM_BREAKS:
+    if (
+        INCLUDE_TRANSITIONS_FROM_BREAKS
+        and _transitions_any_split()
+        and not INCLUDE_SILENCE_FROM_BREAKS
+    ):
         raise ValueError(
             "INCLUDE_TRANSITIONS_FROM_BREAKS requires INCLUDE_SILENCE_FROM_BREAKS"
         )
-    if INCLUDE_TRANSITIONS_FROM_OCCASIONAL_WORD and not INCLUDE_SILENCE_FROM_OCCASIONAL_WORD:
+    if (
+        INCLUDE_TRANSITIONS_FROM_OCCASIONAL_WORD
+        and _transitions_any_split()
+        and not INCLUDE_SILENCE_FROM_OCCASIONAL_WORD
+    ):
         raise ValueError(
             "INCLUDE_TRANSITIONS_FROM_OCCASIONAL_WORD requires INCLUDE_SILENCE_FROM_OCCASIONAL_WORD"
         )
@@ -117,7 +143,9 @@ _validate_label_source_config()
 
 
 def _transitions_in_label_space() -> bool:
-    return INCLUDE_TRANSITIONS_FROM_BREAKS or INCLUDE_TRANSITIONS_FROM_OCCASIONAL_WORD
+    breaks = INCLUDE_TRANSITIONS_FROM_BREAKS and _transitions_any_split()
+    occasional = INCLUDE_TRANSITIONS_FROM_OCCASIONAL_WORD and _transitions_any_split()
+    return breaks or occasional
 
 
 def _silence_in_label_space() -> bool:
@@ -1403,7 +1431,7 @@ def build_event_windows(
         collection_block_ids.append(_payload_block_id(payload))
         center_samples.append(start_idx)
 
-    if INCLUDE_TRANSITIONS_FROM_BREAKS:
+    if INCLUDE_TRANSITIONS_FROM_BREAKS and _transitions_any_split():
         skipped += _append_scramble_breaks_transition_windows(
             channels=channels,
             events=events,
@@ -1436,7 +1464,7 @@ def build_event_windows(
             center_samples=center_samples,
         )
 
-    if INCLUDE_TRANSITIONS_FROM_OCCASIONAL_WORD:
+    if INCLUDE_TRANSITIONS_FROM_OCCASIONAL_WORD and _transitions_any_split():
         skipped += _append_occasional_word_transition_windows(
             channels=channels,
             events=events,
@@ -1818,6 +1846,7 @@ class DatasetSplits:
     stratified_label_split: bool = False
     label_max_fractions: Optional[dict[str, float]] = None
     label_cap_dropped: tuple[int, int, int] = (0, 0, 0)
+    break_transition_dropped: tuple[int, int, int] = (0, 0, 0)
 
 
 def _pick_redundant_index_to_drop(
@@ -2061,6 +2090,122 @@ def _split_session_train_test(
     return train_indices, test_indices
 
 
+def _transition_block_ids_from_batch(
+    event_types: Sequence[str],
+    event_ids: Sequence[str],
+    collection_block_ids: Sequence[str],
+    *,
+    transition_event_type: str,
+) -> frozenset[str]:
+    block_ids: set[str] = set()
+    for event_type, event_id, block_id in zip(
+        event_types,
+        event_ids,
+        collection_block_ids,
+        strict=True,
+    ):
+        if event_type != transition_event_type:
+            continue
+        if block_id:
+            block_ids.add(block_id)
+            continue
+        parsed_block_id = _block_id_from_event_id(event_id)
+        if parsed_block_id:
+            block_ids.add(parsed_block_id)
+    return frozenset(block_ids)
+
+
+def _should_drop_transition_sample_for_split(
+    index: int,
+    *,
+    split_name: str,
+    per_sample_event_types: Sequence[str],
+    per_sample_collection_block_ids: Sequence[str],
+    breaks_block_ids: frozenset[str],
+    occasional_block_ids: frozenset[str],
+) -> bool:
+    include_transitions = _transitions_for_split(split_name)
+    event_type = per_sample_event_types[index]
+    block_id = per_sample_collection_block_ids[index]
+
+    if event_type == SCRAMBLE_BREAKS_TRANSITION_EVENT:
+        if not INCLUDE_TRANSITIONS_FROM_BREAKS:
+            return False
+        return not include_transitions
+    if event_type == OCCASIONAL_WORD_TRANSITION_EVENT:
+        if not INCLUDE_TRANSITIONS_FROM_OCCASIONAL_WORD:
+            return False
+        return not include_transitions
+    if event_type != SILENT_SPEECH_WORD_EVENT or not include_transitions:
+        return False
+    if INCLUDE_TRANSITIONS_FROM_BREAKS and block_id in breaks_block_ids:
+        return True
+    if INCLUDE_TRANSITIONS_FROM_OCCASIONAL_WORD and block_id in occasional_block_ids:
+        return True
+    return False
+
+
+def _apply_transition_split_filters(
+    train_indices: np.ndarray,
+    val_indices: np.ndarray,
+    test_indices: np.ndarray,
+    *,
+    per_sample_event_types: Sequence[str],
+    per_sample_event_ids: Sequence[str],
+    per_sample_collection_block_ids: Sequence[str],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int, int]]:
+    use_breaks = INCLUDE_TRANSITIONS_FROM_BREAKS and _transitions_any_split()
+    use_occasional = INCLUDE_TRANSITIONS_FROM_OCCASIONAL_WORD and _transitions_any_split()
+    if not use_breaks and not use_occasional:
+        return train_indices, val_indices, test_indices, (0, 0, 0)
+
+    breaks_block_ids = (
+        _transition_block_ids_from_batch(
+            per_sample_event_types,
+            per_sample_event_ids,
+            per_sample_collection_block_ids,
+            transition_event_type=SCRAMBLE_BREAKS_TRANSITION_EVENT,
+        )
+        if use_breaks
+        else frozenset()
+    )
+    occasional_block_ids = (
+        _transition_block_ids_from_batch(
+            per_sample_event_types,
+            per_sample_event_ids,
+            per_sample_collection_block_ids,
+            transition_event_type=OCCASIONAL_WORD_TRANSITION_EVENT,
+        )
+        if use_occasional
+        else frozenset()
+    )
+
+    def _filter(indices: np.ndarray, split_name: str) -> np.ndarray:
+        kept = [
+            int(index)
+            for index in indices
+            if not _should_drop_transition_sample_for_split(
+                int(index),
+                split_name=split_name,
+                per_sample_event_types=per_sample_event_types,
+                per_sample_collection_block_ids=per_sample_collection_block_ids,
+                breaks_block_ids=breaks_block_ids,
+                occasional_block_ids=occasional_block_ids,
+            )
+        ]
+        return np.asarray(kept, dtype=np.int64)
+
+    filtered_train = _filter(train_indices, "train")
+    filtered_val = _filter(val_indices, "val")
+    filtered_test = _filter(test_indices, "test")
+    dropped = (
+        len(train_indices) - len(filtered_train),
+        len(val_indices) - len(filtered_val),
+        len(test_indices) - len(filtered_test),
+    )
+    return filtered_train, filtered_val, filtered_test, dropped
+
+
 def split_sample_indices(
     sessions: list[Path],
     per_sample_sessions: Sequence[Path],
@@ -2174,6 +2319,26 @@ def build_dataset_splits(
     block_ids = dataset.batch.collection_block_ids or tuple(
         _block_id_from_event_id(event_id) for event_id in dataset.batch.event_ids
     )
+    filter_started = time.perf_counter()
+    (
+        train_indices,
+        val_indices,
+        test_indices,
+        break_transition_dropped,
+    ) = _apply_break_transition_split_filters(
+        train_indices,
+        val_indices,
+        test_indices,
+        per_sample_event_types=dataset.batch.event_types,
+        per_sample_event_ids=dataset.batch.event_ids,
+        per_sample_collection_block_ids=block_ids,
+    )
+    if perf is not None:
+        perf.add(
+            "break_transition_split_filters",
+            time.perf_counter() - filter_started,
+            where="CPU",
+        )
     cap_started = time.perf_counter()
     (
         train_indices,
@@ -2210,6 +2375,7 @@ def build_dataset_splits(
         stratified_label_split=stratified_label_split,
         label_max_fractions=label_max_fractions,
         label_cap_dropped=label_cap_dropped,
+        break_transition_dropped=break_transition_dropped,
     )
 
 
@@ -2252,6 +2418,10 @@ def save_dataset_splits(output_dir: Path, splits: DatasetSplits) -> None:
         "stratified_label_split": splits.stratified_label_split,
         "label_max_fractions": splits.label_max_fractions,
         "label_cap_dropped": list(splits.label_cap_dropped),
+        "break_transition_dropped": list(splits.break_transition_dropped),
+        "include_transitions_from_breaks_train": INCLUDE_TRANSITIONS_FROM_BREAKS_TRAIN,
+        "include_transitions_from_breaks_val": INCLUDE_TRANSITIONS_FROM_BREAKS_VAL,
+        "include_transitions_from_breaks_test": INCLUDE_TRANSITIONS_FROM_BREAKS_TEST,
         "sample_rate_hz": batch.sample_rate_hz,
         "pre_samples": batch.pre_samples,
         "post_samples": batch.post_samples,
@@ -2385,6 +2555,9 @@ def load_dataset_splits(splits_dir: Path) -> DatasetSplits:
         stratified_label_split=bool(manifest.get("stratified_label_split", False)),
         label_max_fractions=manifest.get("label_max_fractions"),
         label_cap_dropped=tuple(manifest.get("label_cap_dropped", (0, 0, 0))),
+        break_transition_dropped=tuple(
+            manifest.get("break_transition_dropped", (0, 0, 0))
+        ),
     )
 
 
@@ -2562,6 +2735,18 @@ def print_split_summary(splits: DatasetSplits) -> None:
         )
         print(
             f"dropped by caps: train={dropped[0]}, val={dropped[1]}, test={dropped[2]}"
+        )
+    break_dropped = splits.break_transition_dropped
+    if any(break_dropped):
+        print(
+            "break transitions per split: "
+            f"train={INCLUDE_TRANSITIONS_FROM_BREAKS_TRAIN}, "
+            f"val={INCLUDE_TRANSITIONS_FROM_BREAKS_VAL}, "
+            f"test={INCLUDE_TRANSITIONS_FROM_BREAKS_TEST}"
+        )
+        print(
+            f"dropped by break-transition filters: "
+            f"train={break_dropped[0]}, val={break_dropped[1]}, test={break_dropped[2]}"
         )
     print()
     print_label_coverage_summary(splits.dataset, name="all")

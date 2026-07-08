@@ -1561,6 +1561,24 @@ def _print_cross_split_session_rankings(
     print_rows(f"worst {len(worst)} sessions", worst)
 
 
+_RUN_OFFSET_ARG_RE = re.compile(r"^-(\d+)$")
+
+
+def _pop_run_offset_from_argv(argv: list[str]) -> tuple[list[str], int]:
+    """Extract `-1`, `-2`, ... from argv before argparse (0 = latest)."""
+    run_offset = 0
+    kept: list[str] = []
+    for arg in argv:
+        match = _RUN_OFFSET_ARG_RE.fullmatch(arg)
+        if match:
+            if run_offset != 0:
+                raise SystemExit("only one run offset (-1, -2, ...) allowed")
+            run_offset = -int(match.group(1))
+            continue
+        kept.append(arg)
+    return kept, run_offset
+
+
 def resolve_run_dir(
     checkpoint: Path | None,
     *,
@@ -1569,7 +1587,7 @@ def resolve_run_dir(
 ) -> Path:
     if checkpoint is not None:
         if run_offset != 0:
-            print("warning: --run-offset ignored when --checkpoint is set")
+            print("warning: run offset (-1, -2, ...) ignored when --checkpoint is set")
         return checkpoint.resolve().parent
 
     runs = list_run_dirs(root)
@@ -2398,21 +2416,18 @@ def validate_run_dir(
 
 
 def main() -> None:
+    argv_tail, run_offset = _pop_run_offset_from_argv(sys.argv[1:])
+    sys.argv = [sys.argv[0], *argv_tail]
+
     parser = argparse.ArgumentParser(
         description="Evaluate checkpoints from a training run.",
+        epilog="Pass -1, -2, ... to pick an older run (latest is default).",
     )
     parser.add_argument(
         "--checkpoint",
         type=Path,
         default=None,
         help="Path to any checkpoint in a run dir (default: latest run)",
-    )
-    parser.add_argument(
-        "--run-offset",
-        type=int,
-        default=0,
-        metavar="N",
-        help="select run by age when --checkpoint is omitted: 0=latest, -1=previous, -2=...",
     )
     parser.add_argument(
         "--splits-dir",
@@ -2434,7 +2449,7 @@ def main() -> None:
 
     seed_everything(args.seed)
 
-    run_dir = resolve_run_dir(args.checkpoint, run_offset=args.run_offset)
+    run_dir = resolve_run_dir(args.checkpoint, run_offset=run_offset)
     splits = load_dataset_splits(args.splits_dir)
 
     result = validate_run_dir(
