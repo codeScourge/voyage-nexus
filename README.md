@@ -9,7 +9,7 @@ TODO
 
 ### using
 1) put the firmware one that will start talking over USB
-cd firmaware && pio run -t upload
+cd firmware && pio run -t upload
 
 
 2) open the collection client that starts listening on USB
