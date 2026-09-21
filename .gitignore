@@ -2,13 +2,13 @@ client/recordings/*
 !client/recordings/.gitkeep
 
 client/recordings_unused/*
-!client/recording_unused/.gitkeep
+!client/recordings_unused/.gitkeep
 
 model/splits/*
 !model/splits/.gitkeep
 
 model/checkpoints/*
-!model/splits/.checkpoints
+!model/checkpoints/.gitkeep
 
 # macOS
 .DS_Store
@@ -51,7 +51,14 @@ labels.csv
 *.tar.gz
 
 # === Regenerable caches (~2 GB, rebuilt by the model scripts) ===
+# NOTE: `model/*.npz` matches only direct children of model/, so cache
+# subdirectories need their own rules -- see below.
 model/*.npz
+model/**/*.npz
+model/.cache_tmspd_probe/
+
+# Tooling output
+.claude-flow/
 
 # Always keep directory placeholders
 !.gitkeep
