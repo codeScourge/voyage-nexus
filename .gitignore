@@ -1,14 +1,43 @@
+# ---- Recorded data: never committed (raw EMG/EEG is personal data) ----
+client/recordings/*
+!client/recordings/.gitkeep
+client/recordings_unused/*
+!client/recordings_unused/.gitkeep
 recordings/*
 !recordings/.gitkeep
-
 recordings_unused/*
 !recordings_unused/.gitkeep
 
+# Session artefacts wherever they land (belt and braces for the rules above).
+# A sample session ever needed as a test fixture gets an explicit !path/ exception.
+*.bin
+**/session_meta.json
+**/events.csv
+
+# ---- Model outputs / caches ----
+model/splits/*
+!model/splits/.gitkeep
+model/checkpoints/*
+!model/checkpoints/.gitkeep
 splits/*
 !splits/.gitkeep
-
 checkpoints/*
 !checkpoints/.gitkeep
+model/*.npz
+model/**/*.npz
+model/.cache_tmspd_probe/
+
+# ---- T-MSPD raw dataset (fetched via download_tmspd.py), never committed ----
+*.cdt
+*.ceo
+*.dpo
+*.bdf
+*.wav
+*.pkf
+*.tar.gz
+
+# Tooling output
+.claude-flow/
 
 # macOS
 .DS_Store
@@ -39,3 +68,6 @@ labels.csv
 # IDE/editor
 .vscode/
 .idea/
+
+# Always keep directory placeholders
+!.gitkeep
