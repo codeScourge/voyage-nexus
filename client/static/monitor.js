@@ -1851,7 +1851,7 @@ const resizeObserver = new ResizeObserver(() => {
 resizeObserver.observe(els.plotArea);
 
 
-const sessionUi = { optionsLoaded: false, lastSessionKey: null, validateBusy: false };
+const sessionUi = { optionsLoaded: false, lastSessionKey: null, bumpedFor: null, validateBusy: false };
 
 function fillSelect(select, values, selected) {
   if (!select || select.options.length) return;
@@ -1947,8 +1947,14 @@ function updateSessionUi(status) {
   }
   if (recording && status.session_dir) {
     sessionUi.lastSessionKey = status.session_dir;
-  } else if (!recording && sessionUi.lastSessionKey) {
+  } else if (
+    !recording &&
+    sessionUi.lastSessionKey &&
+    status.last_session_dir === sessionUi.lastSessionKey &&
+    sessionUi.bumpedFor !== sessionUi.lastSessionKey
+  ) {
     if (els.sfDonning) els.sfDonning.value = String((Number(els.sfDonning.value) || 1) + 1);
+    sessionUi.bumpedFor = sessionUi.lastSessionKey;
     sessionUi.lastSessionKey = null;
   }
 }
