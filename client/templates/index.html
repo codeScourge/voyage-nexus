@@ -10,8 +10,31 @@
     <header class="top-bar">
       <div id="status-text" class="status-text">Connecting…</div>
       <div id="rail-text" class="rail-text rail-waiting">Rail warning: waiting for data</div>
+      <div id="condition-text" class="condition-text condition-idle">Condition: not recording</div>
       <div id="trial-text" class="trial-text">Collection: start recording</div>
     </header>
+
+    <section id="session-panel" class="session-panel">
+      <div class="session-head">
+        <h4 class="collect-subhead">Session</h4>
+        <p class="collect-subhint">Filled in before <em>Start Session Recording</em>; written to <code>session_meta.json</code>. A session without a participant code is a lost session.</p>
+        <p id="session-summary" class="session-summary"></p>
+      </div>
+      <form id="session-form" class="session-form" autocomplete="off" onsubmit="return false;">
+        <label>Participant <input type="text" id="sf-participant" placeholder="P001" pattern="P\d{3}" maxlength="8" /></label>
+        <label>Donning <input type="number" id="sf-donning" min="1" max="20" value="1" /></label>
+        <label>Perturbation <select id="sf-perturbation"></select></label>
+        <label>Fit <select id="sf-fit"></select></label>
+        <label>Board <select id="sf-board"></select></label>
+        <label>Rig <input type="text" id="sf-rig" placeholder="laptop-A" maxlength="32" /></label>
+        <label>Operator <input type="text" id="sf-operator" placeholder="initials" maxlength="32" /></label>
+        <label>Firmware <input type="text" id="sf-firmware" placeholder="git hash" maxlength="64" /></label>
+        <label>Electrode set <input type="text" id="sf-electrode-set" placeholder="v1-analog-2026-09-23" maxlength="64" /></label>
+        <label>Run <input type="text" id="sf-run" placeholder="sep24" maxlength="32" /></label>
+        <label class="session-notes">Notes <input type="text" id="sf-notes" placeholder="glasses on, adjusted left pad…" maxlength="400" /></label>
+        <button type="button" id="btn-session-update" class="session-update-btn" disabled>Update notes / fit</button>
+      </form>
+    </section>
 
     <section class="controls-row">
       <span class="page-label">32-channel monitor</span>
@@ -22,9 +45,18 @@
         <output id="amplitude-val" for="amplitude-slider">per graph</output>
       </label>
       <button type="button" id="btn-record" class="primary">Start Session Recording</button>
+      <button type="button" id="btn-validate">Validate last session</button>
       <button type="button" id="btn-alignment-test">Alignment Test</button>
       <button type="button" id="btn-model-test">Test Model</button>
       <button type="button" id="btn-model-use">Use Model</button>
+    </section>
+
+    <section id="validate-result" class="validate-result hidden" aria-live="polite">
+      <div class="validate-result-head">
+        <h2 id="validate-result-verdict">Validation</h2>
+        <button type="button" id="btn-validate-dismiss">Dismiss</button>
+      </div>
+      <pre id="validate-result-body" class="validate-result-body"></pre>
     </section>
 
     <section id="collect-panel" class="collect-panel hidden">
@@ -53,6 +85,18 @@
           </div>
         </label>
         <p class="collect-subhint">Chance an off-list word appears instead of a collection word (scramble + occasional word modes)</p>
+      </div>
+
+      <div class="collect-section blocks-section">
+        <h4 class="collect-subhead">Rest · activities · overt</h4>
+        <p class="collect-subhint">Rest and activity blocks label everything until <em>Stop block</em> (rest stops itself after the timer). Speech block = mic on; word prompts started inside it are stamped <code>overt</code>.</p>
+        <div class="blocks-row">
+          <button type="button" id="btn-rest" class="block-btn rest-btn">Rest 30 s</button>
+          <span id="activity-buttons" class="activity-buttons"></span>
+          <button type="button" id="btn-block-stop" class="block-btn block-stop-btn" disabled>Stop block</button>
+          <button type="button" id="btn-speech" class="block-btn speech-btn">Start speech block (overt)</button>
+          <span id="block-status" class="block-status"></span>
+        </div>
       </div>
 
       <div class="collect-modes-row">

@@ -132,10 +132,49 @@ Outputs in the session directory:
 
 ## Session validator (GUI)
 
-Use `Validate Session` in the GUI to run integrity checks on the current/last session:
+Use `Validate last session` in the GUI (or `python validate_session.py <session_dir>`) to run integrity checks on the
+last stopped session:
 - required files exist (`session_meta.json`, `eeg_frames.bin`, `events.csv`)
-- EEG binary size matches frame record size
-- thinking trial start/end pairing
-- speech block start/end pairing
-- referenced speech audio files exist and are non-empty
-- basic `speech_word` sample interval sanity checks
+- `participant_id` present (FAIL) and of the form `P###` (warn); donning / board / perturbation set (warn)
+- EEG binary size is a whole number of `<QQ32f` records; >= 20 s; `sample_index` monotonic; dropped-sample % (FAIL > 1 %)
+- flat or railed channels (FAIL on EMG, warn on EEG)
+- `silent_speech_word` counts per word x condition; every word window inside the recording; `--min-per-word`
+- rest / activity / speech blocks start-end pairing; speech audio present
+
+Exit code 0 = PASS, 1 = FAIL, 2 = unreadable. `python validate_session.py --selftest` needs no hardware.
+
+## Collection sessions (`china_collecting`)
+
+The session form above the collection panel is filled in **before** `Start Session Recording` and lands in
+`session_meta.json`:
+
+- top-level `participant_id` (what `voyage_protocols.py` reads to group sessions by person — a session without it
+  is a lost session; the GUI refuses to start without one, use `P000` for bench tests)
+- `collection`: `donning_index`, `perturbation` (`none | shift_fwd_1cm | shift_back_1cm | tilt_10deg | other`),
+  `fit` (`tight | ok | loose`), `board` (`analog | digital`), `rig_id`, `operator`, `firmware_hash`,
+  `electrode_set`, `collection_run`, `notes`, plus `rail_at_start`, `active_words` / `word_weights`, the timing
+  constants, and at stop `duration_s`, `rail_at_stop`
+- `client`: `version`, `git_commit`, `git_branch`, host, `test_mode`, `serial_port`, and both EEG swap flags
+  (`app.EEG_SWAP_HALVES`, `_protocol.SWAP_EEG_DAISY_HALVES`) so the montage in force at record time is on disk
+
+`Update notes / fit` pushes edits mid-session (`POST /session/meta`, logs `session_info_updated`). The donning
+counter advances by one after every stop.
+
+Conditions. Every `silent_speech_word` event carries `payload_json.condition`:
+
+- `silent` — default
+- `overt` — the prompt fired inside an open speech block (`Start speech block (overt)`; mic on, Whisper runs at
+  stop). Scrambles are allowed inside a speech block; ending the block mid-scramble is refused.
+- `rest` / `activity:<label>` — no prompts fire here; these blocks label everything between their start and end
+  events (`rest_block_start/end`, `activity_block_start/end`, labels `chew swallow talk head yawn_cough walk other`).
+  `Rest 30 s` stops itself (`reason: timer`); activities run until `Stop block` or the next activity button
+  (`reason: superseded`). Collection is refused while a rest/activity block is open.
+
+Endpoints: `POST /recording/start {session_info}`, `POST /session/meta`, `GET /session/options`,
+`GET /session/validate[?dir=]`, `POST /blocks/rest/start {duration_s}`, `POST /blocks/activity/start {activity}`,
+`POST /blocks/stop`, `POST /trials/speech/start|stop`.
+
+End of day: `python pack_sessions.py --recordings recordings --dest <export> --zip` copies every session with a
+`participant_id` into `<export>/<participant_id>/<session_dir>/`, validates each, writes sha256 manifests and
+`<participant_id>.zip`; `python pack_sessions.py --verify <export>/P001` re-hashes a copy. The laptop copy stays
+until the manifest verifies on the receiving side.

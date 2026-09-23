@@ -79,6 +79,31 @@ const els = {
   modelUseMeta: document.getElementById("model-use-meta"),
   modelUsePrediction: document.getElementById("model-use-prediction"),
   modelUseBars: document.getElementById("model-use-bars"),
+  condition: document.getElementById("condition-text"),
+  sessionForm: document.getElementById("session-form"),
+  sessionSummary: document.getElementById("session-summary"),
+  sessionUpdateBtn: document.getElementById("btn-session-update"),
+  sfParticipant: document.getElementById("sf-participant"),
+  sfDonning: document.getElementById("sf-donning"),
+  sfPerturbation: document.getElementById("sf-perturbation"),
+  sfFit: document.getElementById("sf-fit"),
+  sfBoard: document.getElementById("sf-board"),
+  sfRig: document.getElementById("sf-rig"),
+  sfOperator: document.getElementById("sf-operator"),
+  sfFirmware: document.getElementById("sf-firmware"),
+  sfElectrodeSet: document.getElementById("sf-electrode-set"),
+  sfRun: document.getElementById("sf-run"),
+  sfNotes: document.getElementById("sf-notes"),
+  restBtn: document.getElementById("btn-rest"),
+  activityButtons: document.getElementById("activity-buttons"),
+  blockStopBtn: document.getElementById("btn-block-stop"),
+  speechBtn: document.getElementById("btn-speech"),
+  blockStatus: document.getElementById("block-status"),
+  validateBtn: document.getElementById("btn-validate"),
+  validateResult: document.getElementById("validate-result"),
+  validateVerdict: document.getElementById("validate-result-verdict"),
+  validateBody: document.getElementById("validate-result-body"),
+  validateDismiss: document.getElementById("btn-validate-dismiss"),
 };
 
 const MARGIN = { left: 44, right: 6, top: 3, bottom: 16 };
@@ -1546,6 +1571,8 @@ function updateControls(status) {
   updateModelTestUi(status);
   updateModelUseUi(status);
   syncAlignmentStatusPolling(status);
+  updateSessionUi(status);
+  updateBlocksUi(status);
 }
 
 function updateStatusBar(status) {
@@ -1635,10 +1662,14 @@ document.getElementById("btn-record").addEventListener("click", async () => {
   try {
     if (recording) {
       const body = await post("/recording/stop");
-      showToast(`Stopped: ${body.session_dir || "session"}`);
+      showToast(`Stopped: ${body.session_dir || "session"} — run Validate before the participant leaves`);
     } else {
-      const body = await post("/recording/start", {});
-      showToast(`Recording: ${body.session_dir}`);
+      const sessionInfo = readSessionForm();
+      if (!sessionInfo.participant_id) {
+        throw new Error("Participant code is required (P000 for bench tests)");
+      }
+      const body = await post("/recording/start", { session_info: sessionInfo });
+      showToast(`Recording ${sessionInfo.participant_id} donning ${sessionInfo.donning_index || "?"}: ${body.session_dir}`);
     }
     await refreshStatus();
   } catch (err) {
@@ -1818,5 +1849,241 @@ const resizeObserver = new ResizeObserver(() => {
   window.requestAnimationFrame(redrawIfReady);
 });
 resizeObserver.observe(els.plotArea);
+
+
+const sessionUi = { optionsLoaded: false, lastSessionKey: null, validateBusy: false };
+
+function fillSelect(select, values, selected) {
+  if (!select || select.options.length) return;
+  for (const v of values) {
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = v;
+    if (v === selected) opt.selected = true;
+    select.appendChild(opt);
+  }
+}
+
+function ensureSessionOptions(status) {
+  const opts = status.collection_options;
+  if (sessionUi.optionsLoaded || !opts) return;
+  fillSelect(els.sfPerturbation, opts.perturbations || [], "none");
+  fillSelect(els.sfFit, ["", ...(opts.fits || [])], "");
+  fillSelect(els.sfBoard, ["", ...(opts.boards || [])], "");
+  if (els.sfRun && !els.sfRun.value) els.sfRun.value = opts.collection_run_default || "";
+  if (els.restBtn && opts.rest_block_default_s) els.restBtn.textContent = `Rest ${opts.rest_block_default_s} s`;
+  if (els.activityButtons && !els.activityButtons.children.length) {
+    for (const activity of opts.activities || []) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "block-btn activity-btn";
+      btn.dataset.activity = activity;
+      btn.textContent = activity.replace("_", " / ");
+      btn.addEventListener("click", async () => {
+        try {
+          await post("/blocks/activity/start", { activity });
+          await refreshStatus();
+        } catch (err) {
+          showToast(err.message, true);
+        }
+      });
+      els.activityButtons.appendChild(btn);
+    }
+  }
+  sessionUi.optionsLoaded = true;
+}
+
+function readSessionForm() {
+  return {
+    participant_id: (els.sfParticipant?.value || "").trim().toUpperCase(),
+    donning_index: (els.sfDonning?.value || "").trim(),
+    perturbation: els.sfPerturbation?.value || "none",
+    fit: els.sfFit?.value || "",
+    board: els.sfBoard?.value || "",
+    rig_id: (els.sfRig?.value || "").trim(),
+    operator: (els.sfOperator?.value || "").trim(),
+    firmware_hash: (els.sfFirmware?.value || "").trim(),
+    electrode_set: (els.sfElectrodeSet?.value || "").trim(),
+    collection_run: (els.sfRun?.value || "").trim(),
+    notes: (els.sfNotes?.value || "").trim(),
+  };
+}
+
+function setSessionFormLocked(locked) {
+  if (!els.sessionForm) return;
+  for (const el of els.sessionForm.querySelectorAll("input, select")) {
+    const mutable = el === els.sfNotes || el === els.sfFit || el === els.sfFirmware || el === els.sfElectrodeSet;
+    el.disabled = locked && !mutable;
+  }
+  if (els.sessionUpdateBtn) els.sessionUpdateBtn.disabled = !locked;
+}
+
+function updateSessionUi(status) {
+  ensureSessionOptions(status);
+  const recording = !!status.recording_enabled;
+  setSessionFormLocked(recording);
+  const info = status.session_info;
+  if (els.sessionSummary) {
+    if (recording && info) {
+      const elapsed = status.session_elapsed_s != null ? ` · ${Math.floor(status.session_elapsed_s)} s` : "";
+      els.sessionSummary.textContent =
+        `Recording ${info.participant_id} · donning ${info.donning_index ?? "?"} · ${info.perturbation || "none"}` +
+        ` · fit ${info.fit || "?"} · board ${info.board || "?"} · run ${info.collection_run || "?"}${elapsed}`;
+    } else if (status.last_session_dir) {
+      els.sessionSummary.textContent = `Last session: ${status.last_session_dir.split(/[\\/]/).pop()} — validate it, then bump Donning for the next one`;
+    } else {
+      els.sessionSummary.textContent = "";
+    }
+  }
+  if (els.condition) {
+    const cond = recording ? status.condition || "silent" : null;
+    els.condition.textContent = cond ? `Condition: ${cond}` : "Condition: not recording";
+    els.condition.className = "condition-text";
+    if (!cond) els.condition.classList.add("condition-idle");
+    else if (cond === "silent") els.condition.classList.add("condition-silent");
+    else if (cond === "overt") els.condition.classList.add("condition-overt");
+    else if (cond === "rest") els.condition.classList.add("condition-rest");
+    else els.condition.classList.add("condition-activity");
+  }
+  if (recording && status.session_dir) {
+    sessionUi.lastSessionKey = status.session_dir;
+  } else if (!recording && sessionUi.lastSessionKey) {
+    if (els.sfDonning) els.sfDonning.value = String((Number(els.sfDonning.value) || 1) + 1);
+    sessionUi.lastSessionKey = null;
+  }
+}
+
+function updateBlocksUi(status) {
+  const recording = !!status.recording_enabled;
+  const collect = status.collect || { phase: "disabled" };
+  const collectBusy = ["countdown", "say", "still"].includes(collect.phase);
+  const block = status.labelled_block;
+  const speechOn = status.trial_state === "speech_active";
+  const trialFree = status.trial_state === "idle" || speechOn;
+
+  if (els.restBtn) els.restBtn.disabled = !recording || collectBusy || !trialFree;
+  for (const btn of els.activityButtons?.querySelectorAll("button") || []) {
+    btn.disabled = !recording || collectBusy || !trialFree;
+    btn.classList.toggle("active", !!block && block.kind === "activity" && block.label === btn.dataset.activity);
+  }
+  els.restBtn?.classList.toggle("active", !!block && block.kind === "rest");
+  if (els.blockStopBtn) els.blockStopBtn.disabled = !block;
+  if (els.speechBtn) {
+    els.speechBtn.textContent = speechOn ? "Stop speech block" : "Start speech block (overt)";
+    els.speechBtn.disabled = !recording || (speechOn ? collectBusy : status.trial_state !== "idle");
+    els.speechBtn.classList.toggle("active", speechOn);
+  }
+  if (els.blockStatus) {
+    if (block) {
+      const total = block.auto_stop_s ? ` / ${Math.round(block.auto_stop_s)}` : "";
+      els.blockStatus.textContent = `${block.kind === "rest" ? "rest" : block.label}: ${Math.floor(block.elapsed_s)}${total} s`;
+    } else if (speechOn) {
+      els.blockStatus.textContent = "mic on — prompts are overt";
+    } else {
+      els.blockStatus.textContent = "";
+    }
+  }
+  if (els.validateBtn) {
+    els.validateBtn.disabled = recording || !status.last_session_dir || sessionUi.validateBusy;
+  }
+}
+
+function renderValidateResult(result) {
+  if (!els.validateResult) return;
+  const info = result.info || {};
+  const lines = [];
+  lines.push(`${result.session_dir}`);
+  lines.push(
+    `participant ${info.participant_id || "-"}  donning ${info.donning_index ?? "-"}  perturbation ${info.perturbation || "-"}  board ${info.board || "-"}  client ${info.client_version || "-"}`
+  );
+  if (info.n_records != null) {
+    lines.push(
+      `${info.n_records} records = ${info.duration_s} s; dropped ${info.dropped_samples ?? 0} (${info.dropped_pct ?? 0} %); flat ${(info.flat_channels || []).join(",") || "-"}; railed ${(info.railed_channels || []).join(",") || "-"}`
+    );
+  }
+  for (const [cond, counts] of Object.entries(info.word_counts_by_condition || {})) {
+    lines.push(`${cond.padStart(10)}: ` + Object.entries(counts).map(([w, c]) => `${w} ${c}`).join(", "));
+  }
+  lines.push(`blocks ${info.collection_blocks ?? 0}, rest ${info.rest_blocks ?? 0}, activities ${(info.activity_labels || []).join(",") || "-"}`);
+  for (const f of result.fails || []) lines.push(`FAIL  ${f}`);
+  for (const w of result.warns || []) lines.push(`warn  ${w}`);
+  els.validateVerdict.textContent = `Validation: ${result.verdict}`;
+  els.validateVerdict.className = result.verdict === "PASS" ? "verdict-pass" : "verdict-fail";
+  els.validateBody.textContent = lines.join("\n");
+  els.validateResult.classList.remove("hidden");
+}
+
+if (els.sessionUpdateBtn) {
+  els.sessionUpdateBtn.addEventListener("click", async () => {
+    try {
+      const form = readSessionForm();
+      await post("/session/meta", {
+        notes: form.notes,
+        fit: form.fit,
+        firmware_hash: form.firmware_hash,
+        electrode_set: form.electrode_set,
+      });
+      showToast("Session notes / fit updated");
+      await refreshStatus();
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
+}
+
+if (els.restBtn) {
+  els.restBtn.addEventListener("click", async () => {
+    try {
+      await post("/blocks/rest/start", {});
+      await refreshStatus();
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
+}
+
+if (els.blockStopBtn) {
+  els.blockStopBtn.addEventListener("click", async () => {
+    try {
+      await post("/blocks/stop");
+      await refreshStatus();
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
+}
+
+if (els.speechBtn) {
+  els.speechBtn.addEventListener("click", async () => {
+    const stopping = els.speechBtn.textContent.startsWith("Stop");
+    try {
+      await post(stopping ? "/trials/speech/stop" : "/trials/speech/start");
+      showToast(stopping ? "Speech block ended — transcription runs in the background" : "Speech block started: prompts are now overt");
+      await refreshStatus();
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
+}
+
+if (els.validateBtn) {
+  els.validateBtn.addEventListener("click", async () => {
+    sessionUi.validateBusy = true;
+    els.validateBtn.disabled = true;
+    try {
+      const result = await api("/session/validate");
+      renderValidateResult(result);
+      showToast(`Validation: ${result.verdict}`, result.verdict !== "PASS");
+    } catch (err) {
+      showToast(err.message, true);
+    } finally {
+      sessionUi.validateBusy = false;
+    }
+  });
+}
+
+if (els.validateDismiss) {
+  els.validateDismiss.addEventListener("click", () => els.validateResult?.classList.add("hidden"));
+}
 
 startPolling();

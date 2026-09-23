@@ -3,10 +3,14 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
+import platform
 import queue
 import random
 import signal
+import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -174,6 +178,27 @@ RAIL_WARN_PERCENT = 10.0
 DEFAULT_FIXED_SCALE_UV = 150.0
 DEFAULT_HTTP_PORT = 5050
 EEG_SWAP_HALVES = False
+CLIENT_VERSION = "china_collecting-1.0.0"
+COLLECTION_RUN_DEFAULT = "sep24"
+PERTURBATIONS = ("none", "shift_fwd_1cm", "shift_back_1cm", "tilt_10deg", "other")
+FITS = ("tight", "ok", "loose")
+BOARDS = ("analog", "digital", "unknown")
+ACTIVITIES = ("chew", "swallow", "talk", "head", "yawn_cough", "walk", "other")
+REST_BLOCK_DEFAULT_S = 30
+SESSION_INFO_KEYS = (
+    "participant_id",
+    "operator",
+    "rig_id",
+    "board",
+    "firmware_hash",
+    "donning_index",
+    "perturbation",
+    "fit",
+    "notes",
+    "collection_run",
+    "electrode_set",
+)
+SESSION_INFO_MUTABLE_KEYS = ("notes", "fit", "firmware_hash", "electrode_set", "rig_id", "operator", "board")
 BAND_FRAME_SAMPLES = 512
 BAND_HOP_SAMPLES = 128
 BAND_PLOT_POINTS = 80
@@ -211,6 +236,71 @@ def new_session_dir_name(now: datetime | None = None) -> str:
     uid = uuid.uuid4().hex[:8]
     stamp = when.strftime("%Y-%m-%d_%H-%M-%S")
     return f"{stamp}_session_{uid}"
+
+
+def _git_info() -> dict[str, str]:
+    info = {"commit": "", "branch": ""}
+    for key, args in (("commit", ("rev-parse", "--short=12", "HEAD")), ("branch", ("rev-parse", "--abbrev-ref", "HEAD"))):
+        try:
+            out = subprocess.run(
+                ["git", *args], cwd=str(_REPO_ROOT), capture_output=True, text=True, timeout=2.0, check=False
+            )
+            if out.returncode == 0:
+                info[key] = out.stdout.strip()
+        except Exception:
+            pass
+    return info
+
+
+def _protocol_swap_flag() -> Optional[bool]:
+    try:
+        import _protocol as _proto
+
+        return bool(getattr(_proto, "SWAP_EEG_DAISY_HALVES", None))
+    except Exception:
+        return None
+
+
+def clean_session_info(raw: dict[str, Any] | None) -> dict[str, Any]:
+    raw = raw or {}
+    info: dict[str, Any] = {}
+    for key in SESSION_INFO_KEYS:
+        val = raw.get(key, "")
+        info[key] = "" if val is None else str(val).strip()
+    info["participant_id"] = info["participant_id"].upper()
+    if info["perturbation"] and info["perturbation"] not in PERTURBATIONS:
+        raise RuntimeError(f"perturbation must be one of {', '.join(PERTURBATIONS)}")
+    if info["fit"] and info["fit"] not in FITS:
+        raise RuntimeError(f"fit must be one of {', '.join(FITS)}")
+    if info["board"] and info["board"] not in BOARDS:
+        raise RuntimeError(f"board must be one of {', '.join(BOARDS)}")
+    if info["donning_index"]:
+        try:
+            info["donning_index"] = int(info["donning_index"])
+        except ValueError as exc:
+            raise RuntimeError("donning_index must be an integer") from exc
+        if info["donning_index"] < 1:
+            raise RuntimeError("donning_index starts at 1")
+    else:
+        info["donning_index"] = None
+    if not info["collection_run"]:
+        info["collection_run"] = COLLECTION_RUN_DEFAULT
+    if not info["perturbation"]:
+        info["perturbation"] = "none"
+    return info
+
+
+def collection_options() -> dict[str, Any]:
+    return {
+        "client_version": CLIENT_VERSION,
+        "perturbations": list(PERTURBATIONS),
+        "fits": list(FITS),
+        "boards": list(BOARDS),
+        "activities": list(ACTIVITIES),
+        "rest_block_default_s": REST_BLOCK_DEFAULT_S,
+        "collection_run_default": COLLECTION_RUN_DEFAULT,
+        "participant_id_pattern": "P\\d{3}",
+    }
 
 
 def bands_for_channel(channel_idx: int) -> tuple[dict[str, Any], ...]:
@@ -495,7 +585,28 @@ class SessionRecorder:
         with self._lock:
             return self._session_dir
 
-    def start(self, base_dir: Path) -> Path:
+    @staticmethod
+    def _write_meta(session_dir: Path, meta: dict[str, Any]) -> None:
+        target = session_dir / "session_meta.json"
+        tmp = session_dir / "session_meta.json.tmp"
+        tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        os.replace(tmp, target)
+
+    def update_meta(self, patch: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            session_dir = self._session_dir
+            if session_dir is None:
+                raise RuntimeError("Recording disabled")
+            meta = json.loads((session_dir / "session_meta.json").read_text(encoding="utf-8"))
+            for key, value in patch.items():
+                if isinstance(value, dict) and isinstance(meta.get(key), dict):
+                    meta[key].update(value)
+                else:
+                    meta[key] = value
+            self._write_meta(session_dir, meta)
+            return meta
+
+    def start(self, base_dir: Path, extra_meta: Optional[dict[str, Any]] = None) -> Path:
         with self._lock:
             if self._eeg_handle is not None and self._events_writer is not None:
                 if not self._session_dir:
@@ -521,7 +632,9 @@ class SessionRecorder:
                 "files": {"eeg_frames": "eeg_frames.bin", "events": "events.csv"},
                 "eeg_record_format": EEG_RECORD_FORMAT,
             }
-            (session_dir / "session_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            if extra_meta:
+                meta.update(extra_meta)
+            self._write_meta(session_dir, meta)
 
             self._session_dir = session_dir
             self._eeg_handle = (session_dir / "eeg_frames.bin").open("wb")
@@ -714,6 +827,10 @@ class AcquisitionService:
         self._last_session_dir: Optional[Path] = None
         self._thinking_countdown_deadline_ns: Optional[int] = None
         self._pending_asr_jobs = 0
+        self._serial_port = serial_port if not test_mode else None
+        self._session_info: dict[str, Any] = {}
+        self._session_started_ns: Optional[int] = None
+        self._labelled_block: Optional[dict[str, Any]] = None
 
         self._collect_phase = "disabled"
         self._collect_mode = "single"
@@ -795,6 +912,7 @@ class AcquisitionService:
                 self._tick_alignment_test()
                 self._tick_model_test()
                 self._tick_model_use()
+                self._tick_labelled_block()
                 continue
             self._push_frame(rx_frame)
             self._tick_countdown()
@@ -802,6 +920,7 @@ class AcquisitionService:
             self._tick_alignment_test()
             self._tick_model_test()
             self._tick_model_use()
+            self._tick_labelled_block()
 
         while True:
             try:
@@ -1196,8 +1315,18 @@ class AcquisitionService:
                         "collection_block_id": finished_block,
                         "word": finished_word,
                         "mode": finished_mode,
+                        "condition": self._current_condition(),
+                        "speech_block_id": self._speech_block_id,
                     },
                 )
+
+    def _current_condition(self) -> str:
+        block = self._labelled_block
+        if block is not None:
+            return "rest" if block["kind"] == "rest" else f"activity:{block['label']}"
+        if self._trial_state == TrialState.SPEECH_ACTIVE:
+            return "overt"
+        return "silent"
 
     def _tick_collect(self) -> None:
         if self._collect_phase not in ("countdown", "say", "still"):
@@ -1276,6 +1405,10 @@ class AcquisitionService:
                 "is_off_list": self._collect_word_is_off_list,
                 "set_index": self._collect_set_idx if self._is_scramble_mode(self._collect_mode) else None,
                 "sets_total": self._collect_set_total if self._is_scramble_mode(self._collect_mode) else None,
+                "condition": self._current_condition(),
+                "speech_block_id": self._speech_block_id,
+                "participant_id": self._session_info.get("participant_id", ""),
+                "donning_index": self._session_info.get("donning_index"),
             },
         )
 
@@ -1305,8 +1438,10 @@ class AcquisitionService:
             raise RuntimeError("Start session recording first")
         if self._collect_phase != "pick_word":
             raise RuntimeError("Finish the current collection before choosing another")
-        if self._trial_state != TrialState.IDLE:
+        if self._trial_state not in (TrialState.IDLE, TrialState.SPEECH_ACTIVE):
             raise RuntimeError("Another trial is already active")
+        if self._labelled_block is not None:
+            raise RuntimeError("Stop the rest/activity block before collecting words")
         if not SCRAMBLE_REP_MIN <= repetitions <= SCRAMBLE_REP_MAX:
             raise RuntimeError(f"rep must be between {SCRAMBLE_REP_MIN} and {SCRAMBLE_REP_MAX}")
         word = word.strip().lower()
@@ -1346,8 +1481,10 @@ class AcquisitionService:
             raise RuntimeError("Start session recording first")
         if self._collect_phase != "pick_word":
             raise RuntimeError("Finish the current collection before starting another")
-        if self._trial_state != TrialState.IDLE:
+        if self._trial_state not in (TrialState.IDLE, TrialState.SPEECH_ACTIVE):
             raise RuntimeError("Another trial is already active")
+        if self._labelled_block is not None:
+            raise RuntimeError("Stop the rest/activity block before collecting words")
         if not SCRAMBLE_SET_MIN <= set_count <= SCRAMBLE_SET_MAX:
             raise RuntimeError(f"set must be between {SCRAMBLE_SET_MIN} and {SCRAMBLE_SET_MAX}")
         if not SCRAMBLE_REP_MIN <= rep_count <= SCRAMBLE_REP_MAX:
@@ -1386,6 +1523,8 @@ class AcquisitionService:
                 "repetitions_per_set": rep_count,
                 "word_weights": dict(self._collect_word_weights),
                 "negative_word_rate": self._collect_negative_word_rate,
+                "condition": self._current_condition(),
+                "speech_block_id": self._speech_block_id,
             },
         )
         self._log_scramble_word()
@@ -2040,6 +2179,16 @@ class AcquisitionService:
             "session_dir": str(self._recorder.session_dir) if self._recorder.session_dir else None,
             "last_session_dir": str(self._last_session_dir) if self._last_session_dir else None,
             "pending_asr_jobs": self._pending_asr_jobs,
+            "speech_block_id": self._speech_block_id,
+            "condition": self._current_condition() if self._recorder.enabled else None,
+            "labelled_block": self._labelled_block_status(),
+            "session_info": dict(self._session_info) if self._recorder.enabled else None,
+            "session_elapsed_s": (
+                (time.perf_counter_ns() - self._session_started_ns) / 1e9
+                if self._recorder.enabled and self._session_started_ns is not None
+                else None
+            ),
+            "collection_options": collection_options(),
             "latest_sample_index": latest_sample,
             "total_frames": total_frames,
             "rail_warning": rail,
@@ -2136,13 +2285,55 @@ class AcquisitionService:
             ),
         }
 
-    def start_recording(self, base_dir: Path) -> Path:
+    def _session_extra_meta(self, info: dict[str, Any]) -> dict[str, Any]:
+        git = _git_info()
+        return {
+            "participant_id": info["participant_id"],
+            "collection": {
+                **info,
+                "started_at_iso": datetime.now(timezone.utc).isoformat(),
+                "rail_at_start": self._rail_warning(),
+                "collection_words": list(COLLECTION_WORDS),
+                "word_weights": dict(self._collect_word_weights),
+                "active_words": [
+                    w for w in COLLECTION_WORDS if clamp_collection_word_weight(self._collect_word_weights.get(w, 0.0)) > 0.0
+                ],
+                "negative_word_rate": self._collect_negative_word_rate,
+                "timing_s": {
+                    "before": COLLECTION_BEFORE_S,
+                    "between": COLLECTION_BETWEEN_S,
+                    "say": COLLECTION_SAY_S,
+                    "rest_block_default": REST_BLOCK_DEFAULT_S,
+                },
+            },
+            "client": {
+                "version": CLIENT_VERSION,
+                "git_commit": git["commit"],
+                "git_branch": git["branch"],
+                "hostname": socket.gethostname(),
+                "platform": platform.platform(),
+                "python": sys.version.split()[0],
+                "test_mode": self._test_mode,
+                "serial_port": self._serial_port,
+                "swap_flags": {
+                    "app_EEG_SWAP_HALVES": EEG_SWAP_HALVES,
+                    "protocol_SWAP_EEG_DAISY_HALVES": _protocol_swap_flag(),
+                },
+            },
+        }
+
+    def start_recording(self, base_dir: Path, session_info: Optional[dict[str, Any]] = None) -> Path:
         if self._alignment_test_busy():
             raise RuntimeError("Wait for alignment test to finish before recording")
         if self._model_test_busy():
             raise RuntimeError("Wait for model test to finish before recording")
+        info = clean_session_info(session_info)
+        if session_info is not None and not info["participant_id"]:
+            raise RuntimeError("participant_id is required (use P000 for bench / test sessions)")
         _event_host_ns, aligned_float, aligned_idx, method = self._aligned_sample_now()
-        session_dir = self._recorder.start(base_dir)
+        session_dir = self._recorder.start(base_dir, extra_meta=self._session_extra_meta(info))
+        self._session_info = info
+        self._session_started_ns = time.perf_counter_ns()
         self._last_session_dir = session_dir
         if aligned_idx is not None:
             self._recorder.log_event(
@@ -2150,7 +2341,14 @@ class AcquisitionService:
                 sample_index_start=aligned_idx,
                 sample_index_start_float=aligned_float,
                 alignment_method=method,
-                payload={"source": "flask"},
+                payload={
+                    "source": "flask",
+                    "participant_id": info["participant_id"],
+                    "donning_index": info["donning_index"],
+                    "perturbation": info["perturbation"],
+                    "collection_run": info["collection_run"],
+                    "client_version": CLIENT_VERSION,
+                },
             )
         self._collect_phase = "pick_word"
         return session_dir
@@ -2162,6 +2360,7 @@ class AcquisitionService:
             raise RuntimeError("Finish the current collection before stopping recording")
         if self._pending_asr_jobs > 0:
             raise RuntimeError("Wait for speech transcription to finish before stopping")
+        self._close_labelled_block(reason="recording_stopped")
         _event_host_ns, aligned_float, aligned_idx, method = self._aligned_sample_now()
         if aligned_idx is not None:
             self._recorder.log_event(
@@ -2172,11 +2371,164 @@ class AcquisitionService:
                 payload={"source": "flask"},
             )
         session_dir = self._recorder.session_dir
+        try:
+            self._recorder.update_meta(
+                {
+                    "collection": {
+                        "stopped_at_iso": datetime.now(timezone.utc).isoformat(),
+                        "duration_s": (
+                            (time.perf_counter_ns() - self._session_started_ns) / 1e9
+                            if self._session_started_ns is not None
+                            else None
+                        ),
+                        "rail_at_stop": self._rail_warning(),
+                        "last_sample_index": aligned_idx,
+                    }
+                }
+            )
+        except Exception:
+            pass
         self._recorder.stop()
         self._reset_collect()
+        self._session_info = {}
+        self._session_started_ns = None
         if session_dir:
             self._last_session_dir = session_dir
         return session_dir
+
+    def update_session_info(self, patch: dict[str, Any]) -> dict[str, Any]:
+        if not self._recorder.enabled:
+            raise RuntimeError("Recording disabled")
+        clean = {k: ("" if v is None else str(v).strip()) for k, v in patch.items() if k in SESSION_INFO_MUTABLE_KEYS}
+        if not clean:
+            raise RuntimeError(f"nothing to update; editable keys: {', '.join(SESSION_INFO_MUTABLE_KEYS)}")
+        if clean.get("fit") and clean["fit"] not in FITS:
+            raise RuntimeError(f"fit must be one of {', '.join(FITS)}")
+        if clean.get("board") and clean["board"] not in BOARDS:
+            raise RuntimeError(f"board must be one of {', '.join(BOARDS)}")
+        self._session_info.update(clean)
+        self._recorder.update_meta({"collection": clean})
+        _event_host_ns, aligned_float, aligned_idx, method = self._aligned_sample_now()
+        if aligned_idx is not None:
+            self._recorder.log_event(
+                event_type="session_info_updated",
+                sample_index_start=aligned_idx,
+                sample_index_start_float=aligned_float,
+                alignment_method=method,
+                payload=clean,
+            )
+        return dict(self._session_info)
+
+    def _labelled_block_status(self) -> Optional[dict[str, Any]]:
+        block = self._labelled_block
+        if block is None:
+            return None
+        return {
+            "block_id": block["block_id"],
+            "kind": block["kind"],
+            "label": block["label"],
+            "elapsed_s": (time.perf_counter_ns() - block["started_ns"]) / 1e9,
+            "auto_stop_s": block.get("auto_stop_s"),
+        }
+
+    def _tick_labelled_block(self) -> None:
+        block = self._labelled_block
+        if block is None or not block.get("auto_stop_s"):
+            return
+        if (time.perf_counter_ns() - block["started_ns"]) / 1e9 >= float(block["auto_stop_s"]):
+            self._close_labelled_block(reason="timer")
+
+    def start_labelled_block(
+        self, kind: str, label: str = "", note: str = "", duration_s: Optional[float] = None
+    ) -> dict[str, Any]:
+        if not self._recorder.enabled:
+            raise RuntimeError("Start session recording first")
+        kind = (kind or "").strip().lower()
+        if kind not in ("rest", "activity"):
+            raise RuntimeError("kind must be rest or activity")
+        label = "rest" if kind == "rest" else (label or "").strip().lower()
+        if kind == "activity" and label not in ACTIVITIES:
+            raise RuntimeError(f"activity must be one of {', '.join(ACTIVITIES)}")
+        if self._collect_phase in ("countdown", "say", "still"):
+            raise RuntimeError("Finish the current collection before starting a rest/activity block")
+        _event_host_ns, aligned_float, aligned_idx, method = self._aligned_sample_now()
+        if aligned_idx is None:
+            raise RuntimeError("No samples yet")
+        if self._labelled_block is not None:
+            self._close_labelled_block(reason="superseded")
+        block = {
+            "block_id": uuid.uuid4().hex,
+            "kind": kind,
+            "label": label,
+            "note": (note or "").strip(),
+            "started_ns": time.perf_counter_ns(),
+            "sample_index_start": aligned_idx,
+            "sample_index_start_float": aligned_float,
+            "auto_stop_s": float(duration_s) if duration_s else None,
+        }
+        self._labelled_block = block
+        self._recorder.log_event(
+            event_type=f"{kind}_block_start",
+            label_text=label,
+            sample_index_start=aligned_idx,
+            sample_index_start_float=aligned_float,
+            alignment_method=method,
+            payload={
+                "block_id": block["block_id"],
+                "kind": kind,
+                "label": label,
+                "note": block["note"],
+                "auto_stop_s": block["auto_stop_s"],
+                "condition": self._current_condition(),
+                "speech_block_id": self._speech_block_id,
+            },
+        )
+        return {"labelled_block": self._labelled_block_status()}
+
+    def _close_labelled_block(self, reason: str = "stopped") -> Optional[dict[str, Any]]:
+        block = self._labelled_block
+        if block is None:
+            return None
+        self._labelled_block = None
+        _event_host_ns, aligned_float, aligned_idx, method = self._aligned_sample_now()
+        if aligned_idx is None:
+            aligned_idx, aligned_float, method = block["sample_index_start"], block["sample_index_start_float"], "no_new_samples"
+        self._recorder.log_event(
+            event_type=f"{block['kind']}_block_end",
+            label_text=block["label"],
+            sample_index_start=block["sample_index_start"],
+            sample_index_start_float=block["sample_index_start_float"],
+            sample_index_end=aligned_idx,
+            sample_index_end_float=aligned_float,
+            alignment_method=method,
+            payload={
+                "block_id": block["block_id"],
+                "kind": block["kind"],
+                "label": block["label"],
+                "reason": reason,
+                "duration_s": (time.perf_counter_ns() - block["started_ns"]) / 1e9,
+            },
+        )
+        return block
+
+    def stop_labelled_block(self) -> dict[str, Any]:
+        if self._labelled_block is None:
+            raise RuntimeError("No rest/activity block is running")
+        block = self._close_labelled_block(reason="stopped")
+        return {"labelled_block": None, "closed": {"kind": block["kind"], "label": block["label"]} if block else None}
+
+    def validate_session(self, session_dir: Optional[str] = None) -> dict[str, Any]:
+        from validate_session import validate_session_dir
+
+        if session_dir:
+            target = Path(session_dir)
+        else:
+            if self._recorder.enabled and self._last_session_dir == self._recorder.session_dir:
+                raise RuntimeError("Stop the recording first, then validate")
+            if self._last_session_dir is None:
+                raise RuntimeError("No session recorded yet")
+            target = self._last_session_dir
+        return validate_session_dir(target)
 
     def log_marker(self, label: str, source: str = "api") -> int:
         if not self._recorder.enabled:
@@ -2271,6 +2623,8 @@ class AcquisitionService:
     def stop_speech_block(self) -> str:
         if self._trial_state != TrialState.SPEECH_ACTIVE or not self._speech_block_id:
             raise RuntimeError("No active speech block")
+        if self._collect_phase in ("countdown", "say", "still"):
+            raise RuntimeError("Finish (or stop) the current collection before ending the speech block")
         _event_host_ns, aligned_float, aligned_idx, method = self._aligned_sample_now()
         if aligned_idx is None:
             raise RuntimeError("No samples yet")
@@ -2414,13 +2768,48 @@ def create_app(service: AcquisitionService) -> Flask:
     def start_recording() -> Any:
         payload = request.get_json(silent=True) or {}
         base_dir = Path(payload.get("base_dir", DEFAULT_RECORDINGS_DIR))
-        session_dir = service.start_recording(base_dir)
-        return jsonify({"session_dir": str(session_dir)})
+        session_info = payload.get("session_info")
+        if session_info is not None and not isinstance(session_info, dict):
+            return jsonify({"error": "session_info must be an object"}), 400
+        session_dir = service.start_recording(base_dir, session_info=session_info)
+        return jsonify({"session_dir": str(session_dir), "session_info": service.status()["session_info"]})
 
     @app.post("/recording/stop")
     def stop_recording() -> Any:
         session_dir = service.stop_recording()
         return jsonify({"session_dir": str(session_dir) if session_dir else None})
+
+    @app.post("/session/meta")
+    def session_meta() -> Any:
+        payload = request.get_json(silent=True) or {}
+        return jsonify({"session_info": service.update_session_info(payload)})
+
+    @app.get("/session/validate")
+    def session_validate() -> Any:
+        return jsonify(service.validate_session(request.args.get("dir") or None))
+
+    @app.post("/blocks/rest/start")
+    def rest_block_start() -> Any:
+        payload = request.get_json(silent=True) or {}
+        duration = payload.get("duration_s", REST_BLOCK_DEFAULT_S)
+        try:
+            duration_s = float(duration) if duration not in (None, "", 0, "0") else None
+        except (TypeError, ValueError):
+            return jsonify({"error": "duration_s must be a number"}), 400
+        return jsonify(service.start_labelled_block("rest", note=str(payload.get("note", "")), duration_s=duration_s))
+
+    @app.post("/blocks/activity/start")
+    def activity_block_start() -> Any:
+        payload = request.get_json(silent=True) or {}
+        return jsonify(
+            service.start_labelled_block(
+                "activity", label=str(payload.get("activity", "")), note=str(payload.get("note", ""))
+            )
+        )
+
+    @app.post("/blocks/stop")
+    def labelled_block_stop() -> Any:
+        return jsonify(service.stop_labelled_block())
 
     @app.post("/collect/word")
     def collect_word() -> Any:
